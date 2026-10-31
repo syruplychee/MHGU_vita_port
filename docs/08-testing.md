@@ -145,3 +145,20 @@ python tools/shader/verify_static_package.py <package-dir>
 3. 构建并运行全部宿主测试。
 
 CI 不构建 Vita VPK（需要 VitaSDK 和游戏输入），也不运行 Vita3K。
+
+## 9. 本快照验证记录（2026-10-31）
+
+新仓库初始化时执行过：
+
+| 项目 | 结果 | 范围 |
+|---|---|---|
+| 输入身份 | 通过 | 锁定 1.4.0 ExeFS + NACP；未扫 RomFS |
+| VPK 构建 | 通过 | VitaSDK GCC 15.2.0；SELF `d6d210cd…`；VPK 因 zip 时间戳每次不同 |
+| 宿主测试（Windows） | 26/26 | MSVC 19.51.36252 / Release |
+| POSIX 宿主测试 | 4/4 | WSL Ubuntu 24.04 / GCC 13.3.0，手动编译 |
+| Python 语法 | 通过 | `compileall`（缓存写盘受限时用 `PYTHONPYCACHEPREFIX`） |
+| 静态包校验 | 通过 | 既有 B118 包：abi=2 stages=2402 variants=364 gxp=364 |
+| Vita3K 运行 | 未执行 | 初始化时有既有会话占用 Vita3K；不打断用户运行 |
+
+这些结果只证明对应层级；不代表真机、完整玩法或当前工作树之外的行为。
+
