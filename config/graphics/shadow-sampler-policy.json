@@ -1,0 +1,262 @@
+{
+  "schema": 1,
+  "policy": "vp-shadow-policy-2",
+  "tsc_layout": {
+    "word0": {
+      "wrap_u": [
+        0,
+        3
+      ],
+      "wrap_v": [
+        3,
+        3
+      ],
+      "wrap_p": [
+        6,
+        3
+      ],
+      "compare_enabled": [
+        9,
+        1
+      ],
+      "compare_func": [
+        10,
+        3
+      ],
+      "srgb_conversion": [
+        13,
+        1
+      ],
+      "max_anisotropy": [
+        20,
+        3
+      ]
+    },
+    "word1": {
+      "mag_filter": [
+        0,
+        2
+      ],
+      "min_filter": [
+        4,
+        2
+      ],
+      "mipmap_filter": [
+        6,
+        2
+      ],
+      "cubemap_anisotropy": [
+        8,
+        1
+      ],
+      "cubemap_interface_filtering": [
+        9,
+        1
+      ],
+      "reduction_filter": [
+        10,
+        2
+      ],
+      "mip_lod_bias": [
+        12,
+        13
+      ],
+      "float_coord_normalization": [
+        25,
+        1
+      ],
+      "trilinear_optimization": [
+        26,
+        5
+      ]
+    },
+    "word2": {
+      "min_lod_clamp": [
+        0,
+        12
+      ],
+      "max_lod_clamp": [
+        12,
+        12
+      ]
+    },
+    "word3": {
+      "srgb_border_color_g": [
+        12,
+        8
+      ],
+      "srgb_border_color_b": [
+        20,
+        8
+      ]
+    },
+    "word4": "border_color_r_float32",
+    "word5": "border_color_g_float32",
+    "word6": "border_color_b_float32",
+    "word7": "border_color_a_float32"
+  },
+  "accepted": {
+    "glsl_call": "textureLod(sampler2DShadow, vec3(uv, ref), literal 0.0)",
+    "return_type": "float",
+    "texture_type": 2,
+    "depth_flag": 1,
+    "compare_enabled": 1,
+    "compare_func": [
+      0,
+      7
+    ],
+    "wrap_u": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "wrap_v": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "min_filter_equals_mag_filter": true,
+    "filter": [
+      "point",
+      "linear"
+    ],
+    "mipmap_filter": [
+      "none",
+      "nearest",
+      "linear"
+    ],
+    "max_mip_level": 0,
+    "reduction_filter": 0,
+    "max_anisotropy": 0,
+    "mip_lod_bias": 0,
+    "min_lod_clamp": 0,
+    "float_coord_normalization": 0,
+    "trilinear_optimization": 0,
+    "inert_for_2d_depth": {
+      "srgb_conversion": "depth-format TIC has no sRGB transfer; helper reads .r raw",
+      "cubemap_anisotropy": "cube-only bit; the accepted view is 2D",
+      "cubemap_interface_filtering": "cube-only bit; the accepted view is 2D",
+      "evidence": "B36 village shadow TSC w0=0x00027292 w1=0x000003a2 on TIC Z32 1024x3072; policy-1 refused every shadow receiver"
+    },
+    "border_depth": {
+      "used_when": "wrap_u == Border or wrap_v == Border",
+      "source": "TSC word4 as float32 (R component)",
+      "range": [
+        0.0,
+        1.0
+      ],
+      "finite": true
+    }
+  },
+  "rejected": {
+    "glsl_calls": [
+      "texture",
+      "textureOffset",
+      "textureLodOffset",
+      "non-literal LOD",
+      "non-zero LOD"
+    ],
+    "shadow_sampler_types": [
+      "samplerCubeShadow",
+      "sampler2DArrayShadow",
+      "sampler3DShadow"
+    ],
+    "texture_type_not_2": true,
+    "depth_flag_not_1": true,
+    "compare_disabled": true,
+    "wrap_u_v": [
+      4,
+      5,
+      6,
+      7
+    ],
+    "filter_mismatch_min_mag": true,
+    "invalid_filter_enum": [
+      0,
+      3
+    ],
+    "invalid_mipmap_enum": [
+      0
+    ],
+    "max_mip_level_nonzero_or_unknown": true,
+    "non_weighted_reduction": true,
+    "anisotropy_nonzero": true,
+    "lod_bias_nonzero": true,
+    "min_lod_clamp_nonzero": true,
+    "float_coord_normalization_set": true,
+    "trilinear_optimization_set": true,
+    "border_depth_nonfinite_or_out_of_range_when_used": true
+  },
+  "abi": {
+    "sampler": {
+      "source_glsl_type": "sampler2DShadow",
+      "cg_type": "sampler2D",
+      "depth_component": "r",
+      "native_state": {
+        "min_filter": "point",
+        "mag_filter": "point",
+        "mip_filter": "none",
+        "compare_mode": "none",
+        "wrap_u": "clamp-to-edge",
+        "wrap_v": "clamp-to-edge"
+      },
+      "why_native_clamp": "the helper wraps integer texel coordinates; a second native wrap would alias the tap"
+    },
+    "uniforms": [
+      {
+        "suffix": "_shadow_extent",
+        "cg_type": "float4",
+        "layout": [
+          "width",
+          "height",
+          "inv_width",
+          "inv_height"
+        ]
+      },
+      {
+        "suffix": "_shadow_state",
+        "cg_type": "float4",
+        "layout": [
+          "compare_func",
+          "filter_code",
+          "wrap_u",
+          "wrap_v"
+        ]
+      },
+      {
+        "suffix": "_shadow_border",
+        "cg_type": "float4",
+        "layout": [
+          "border_depth",
+          "0",
+          "0",
+          "0"
+        ]
+      }
+    ],
+    "filter_code": {
+      "point": 0.0,
+      "linear": 1.0
+    },
+    "vector_count_per_sampler": 3,
+    "extent_source": "TIC width and height of the bound depth view"
+  },
+  "semantics": {
+    "compare_direction": "ref OP depth",
+    "point": "index = floor(uv * size); read texel centre (index + 0.5) / size",
+    "linear": "t = uv * size - 0.5; i = floor(t); f = t - i; compare four taps individually, then bilinear mix (never filter depth first)",
+    "repeat": "positive modulo period (mod n)",
+    "mirror": "period 2n; fold indices >= n with 2n - 1 - index",
+    "clamp_to_edge": "clamp index to [0, n-1]",
+    "border": "any out-of-range tap compares ref against border_depth"
+  },
+  "evidence": {
+    "tsc_layout": "yuzu src/video_core/textures/texture.h TSCEntry",
+    "border_and_compare_state": "yuzu src/video_core/renderer_opengl/gl_texture_cache.cpp Sampler::Sampler lines 1271-1300; GL_TEXTURE_BORDER_COLOR at 1297",
+    "border_color_source": "yuzu src/video_core/textures/texture.cpp TSCEntry::BorderColor returns the four float32 words; R is the depth comparison border",
+    "depth_component": "GL depth texture sampling exposes depth in R; the B18 depth-view usage audit only proves .r, so G/B/A are never selected",
+    "limits": "host tests do not claim target NaN/subnormal preservation or hardware equivalence of float operations"
+  }
+}

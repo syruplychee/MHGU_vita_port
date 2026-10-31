@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "purpose": "Controlled DT_INIT diagnostic; stop before unavailable SDK DSO registration",
+  "module": "sdk",
+  "build_id": "cb8e7f9a74a4a854ff013489ecc1e8b0def23a75000000000000000000000000",
+  "source_sha256": "9a9b7035266637ee693a32da6b0fde54bda00e897bef05b1c8d8cda30f8ac8b0",
+  "symbol": "__nnmusl_init_dso",
+  "module_offset": 4429908,
+  "state": "ARM",
+  "expected_original_bytes": "f04f2de9",
+  "function_bytes": 1324,
+  "function_sha256": "f6a9e2358e66d434878dbf0bd9b326458b3aa231776ce81063caffa4f0fc0d61",
+  "abi": "A32 AAPCS, preserve complete guest frame; report service 0x226 and abort current invocation to saved host frame",
+  "side_effects": "No guest DSO allocation, no constructors, no guest continuation; SDK init wrapper has written arguments only to its owned stack",
+  "entry_module_offset": 36,
+  "guards": [
+    {"module_offset": 8791892, "expected_linked_value": 0, "purpose": "SDK DSO initialization flag starts zero"},
+    {"module_offset": 8726136, "expected_target_offset": 4429908, "purpose": "init wrapper PLT binds the intercepted DSO function"}
+  ],
+  "not_a_service_implementation": true,
+  "hardware_tested": false
+}

@@ -1,0 +1,169 @@
+{
+  "schema": 1,
+  "module": "sdk",
+  "source_sha256": "9a9b7035266637ee693a32da6b0fde54bda00e897bef05b1c8d8cda30f8ac8b0",
+  "build_id": "cb8e7f9a74a4a854ff013489ecc1e8b0def23a75000000000000000000000000",
+  "purpose": "Vita3K original DSO/TLS and exception-runtime execution; original nnosInitialize with native SVC services; constructor gate retained",
+  "patches": [
+    {
+      "name": "dso_enter",
+      "offset": 4429908,
+      "state": "ARM",
+      "expected_original_bytes": "f04f2de9",
+      "function_bytes": 1324,
+      "sha256": "f6a9e2358e66d434878dbf0bd9b326458b3aa231776ce81063caffa4f0fc0d61",
+      "abi": "Observe r0-r3 plus 17 stack words, preserve LR/SP/guest frame, resume displaced PUSH and untouched original DSO body; never synthesize a DSO result"
+    },
+    {
+      "name": "ctor_gate",
+      "offset": 380,
+      "state": "ARM",
+      "expected_original_bytes": "8c009fe5",
+      "function_bytes": 4,
+      "sha256": "1a2f2b5a9557abb1b55d14fde94321431b1a90fa0e78c3f32dad98868c3ba22a",
+      "abi": "Abort before the first SDK constructor dispatch with bridge error -4/service 0x230; do not return to guest or mark constructors complete"
+    },
+    {
+      "name": "lock",
+      "offset": 4423980,
+      "state": "ARM",
+      "expected_original_bytes": "3a6000ea",
+      "function_bytes": 4,
+      "sha256": "81ef07aa29cfa379d2e2c873daaa24b67a880fd8c7ab0d5690f5f1b67cc157d7",
+      "abi": "r0=owned guest lock address; real SceKernelMutex acquire on owner thread, timeout is an error; no generic success"
+    },
+    {
+      "name": "unlock",
+      "offset": 4423984,
+      "state": "ARM",
+      "expected_original_bytes": "3c6000ea",
+      "function_bytes": 4,
+      "sha256": "a655eda0bf18485ae73857bbf4818815394ed74f69550e886ae4829a367bfcf1",
+      "abi": "r0=owned held guest lock address; real SceKernelMutex release; unknown/unowned mutex is an error"
+    },
+    {
+      "name": "exception_info",
+      "offset": 676172,
+      "state": "ARM",
+      "expected_original_bytes": "f04f2de9",
+      "function_bytes": 656,
+      "sha256": "2e074c7909d8ada4c2094f22710ff72a5e7ff0e2924d92402418379b11befbab",
+      "abi": "r0=owned 16-byte ExceptionInfo output, r1=PC; return bool r0; native module metadata only"
+    },
+    {
+      "name": "tls_normal",
+      "offset": 644968,
+      "state": "ARM",
+      "expected_original_bytes": "00482de9",
+      "function_bytes": 60,
+      "sha256": "ecba6e272868eadeff9de7978242818814e11ad151fce5c321772bc1aef22ff1",
+      "abi": "Original nn::os TLS slot API; real 32-slot pool, per-guest-thread values, normal limit 16, SDK searches downward"
+    },
+    {
+      "name": "tls_private",
+      "offset": 645028,
+      "state": "ARM",
+      "expected_original_bytes": "00482de9",
+      "function_bytes": 60,
+      "sha256": "80b3ace88849791ccb45570ad06e1dd431b53148170645e293f1ee454a9770be",
+      "abi": "Original nn::os TLS slot API; real 32-slot pool, per-guest-thread values, normal limit 16, SDK searches downward"
+    },
+    {
+      "name": "tls_free",
+      "offset": 645088,
+      "state": "ARM",
+      "expected_original_bytes": "0010a0e1",
+      "function_bytes": 24,
+      "sha256": "b595985502094ec5ef22e3583b23aa9cc1e7b1dd7d79237a045617dafb1ac8df",
+      "abi": "Original nn::os TLS slot API; real 32-slot pool, per-guest-thread values, normal limit 16, SDK searches downward"
+    },
+    {
+      "name": "tls_get",
+      "offset": 645112,
+      "state": "ARM",
+      "expected_original_bytes": "701f1dee",
+      "function_bytes": 20,
+      "sha256": "9221ab840cefca7b4fb269eef52dc3d04b68fd6222361f1c2cfa007275c9d0cc",
+      "abi": "Original nn::os TLS slot API; real 32-slot pool, per-guest-thread values, normal limit 16, SDK searches downward"
+    },
+    {
+      "name": "tls_set",
+      "offset": 645132,
+      "state": "ARM",
+      "expected_original_bytes": "702f1dee",
+      "function_bytes": 20,
+      "sha256": "43112e52771de1525f71e19ce0d7d98c4f656208abd6035706a28ac6b3da298b",
+      "abi": "Original nn::os TLS slot API; real 32-slot pool, per-guest-thread values, normal limit 16, SDK searches downward"
+    },
+    {
+      "name": "critical_enter",
+      "offset": 669332,
+      "state": "ARM",
+      "expected_original_bytes": "30482de9",
+      "function_bytes": 120,
+      "sha256": "ece0392cf5b3ddd7933e612c44316ea02e2daac3274c46b020e8102a6bba5a0e",
+      "abi": "Typed native mutex enter/leave/try/is-owned; owner-thread scope, no Switch ThreadType access"
+    },
+    {
+      "name": "critical_leave",
+      "offset": 669508,
+      "state": "ARM",
+      "expected_original_bytes": "701f1dee",
+      "function_bytes": 64,
+      "sha256": "404985c9581a2b909aa933ebb504890195a2da604d81559c2814c1c3b86ca527",
+      "abi": "Typed native mutex enter/leave/try/is-owned; owner-thread scope, no Switch ThreadType access"
+    },
+    {
+      "name": "critical_try",
+      "offset": 669452,
+      "state": "ARM",
+      "expected_original_bytes": "701f1dee",
+      "function_bytes": 56,
+      "sha256": "f0b5227e7d97e8d56f17485228efb6b3d03f0a494efa074376a8d9005c755900",
+      "abi": "Typed native mutex enter/leave/try/is-owned; owner-thread scope, no Switch ThreadType access"
+    },
+    {
+      "name": "critical_owned",
+      "offset": 669572,
+      "state": "ARM",
+      "expected_original_bytes": "701f1dee",
+      "function_bytes": 36,
+      "sha256": "410bedf2982207ea8c524171741bef2811965471ac9d7aff6504b1356751c5e3",
+      "abi": "Typed native mutex enter/leave/try/is-owned; owner-thread scope, no Switch ThreadType access"
+    }
+  ],
+  "providers": [
+    {
+      "slot": 8726836,
+      "symbol": "malloc",
+      "original_module": "main",
+      "service": 565
+    },
+    {
+      "slot": 8726840,
+      "symbol": "free",
+      "original_module": "main",
+      "service": 566
+    },
+    {
+      "slot": 8768580,
+      "symbol": "free",
+      "original_module": "main",
+      "service": 566
+    }
+  ],
+  "start_window": {
+    "offset": 494976,
+    "bytes": 80,
+    "sha256": "e9138e982e48d91329bb4765747f20954af83452eafec3d0f19848174f0d0874",
+    "synthetic_inputs_only": false,
+    "launch_block": "0x9000-byte NSO argument block (allocated size, string size, 0x18 reserved, command line); parsed by the original nnosInitialize"
+  },
+  "exception_index_policy": {
+    "source_tables_unchanged": true,
+    "sorted_view": "function address ascending, original-record offset as stable secondary key",
+    "prel31": "rebase function and non-inline extab fields into private owned arena; preserve extab/personality targets",
+    "duplicates": "last original record at equal start, matching locked SDK observation; diagnostic source lookup still rejects ambiguity",
+    "cantunwind": "use checked unw_get_proc_info; _Unwind_Find_FDE discards errors and is not a negative-case oracle"
+  }
+}

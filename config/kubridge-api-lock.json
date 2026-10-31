@@ -1,0 +1,21 @@
+{
+  "hardware_tested": false,
+  "exports_sha256_utf8": "2ac02d248cc796a839a25431b99ed3ee7acb5dbc98605f217830b978a4d5c95d",
+  "source_copied": false,
+  "kernel_plugin_installed": false,
+  "commit": "417ddde9a744eba98d769382c1c1372b8e119139",
+  "repository": "https://github.com/bythos14/kubridge",
+  "ref": "exceptions_mprotect",
+  "note": "Optional adapter compiled only. Import stub and installed compatible kernel plugin required; no plugin implementation redistributed.",
+  "exports_url": "https://raw.githubusercontent.com/bythos14/kubridge/417ddde9a744eba98d769382c1c1372b8e119139/exports.yml",
+  "header_url": "https://raw.githubusercontent.com/bythos14/kubridge/417ddde9a744eba98d769382c1c1372b8e119139/kubridge.h",
+  "api_facts": {
+    "kuKernelMemProtect": "int (void*, SceSize, SceUInt32)",
+    "kuKernelFlushCaches": "void (const void*, SceSize)",
+    "execute": 16,
+    "write": 32,
+    "read": 64
+  },
+  "header_sha256_utf8": "881cd9c2da0246dcf90a65ef7431ffe4cae5c642e11b725b6bf2f7a0602f1d75",
+  "schema": 1
+}

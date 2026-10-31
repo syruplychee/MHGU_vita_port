@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "maxwell_frontend": {
+    "repository": "https://github.com/DCNick3/shader-compiler-rs",
+    "commit": "f9f0fbc998279a663d0bc98937a0bde880efc8db",
+    "backend": "vendored Hades GLSL backend, direct offline C++ adapter",
+    "license_note": "Repository LICENSE is MPL-2.0; actual vendored compiler files include GPL-2.0-or-later and MPL-2.0. Review per-file licenses; adapter is GPL-2.0-or-later."
+  },
+  "shacc": {
+    "repository": "https://github.com/shoui520/Vita3K-Shacc",
+    "reviewed_commit": "cec711d4bcb1cb77279d186e5919f1b88e2fe1ab",
+    "release_url": "https://github.com/shoui520/Vita3K-Shacc/releases/tag/release",
+    "windows_archive_sha256": "b6dc166a703694753599598cd57f652d25b879cda642d3a172af34e6156959fc",
+    "executable_sha256": "8f13b52af31dfc0bb2d2658044376fccf5ee1df6b438008905a4441ffe232b5b",
+    "service_vpk_sha256": "568284169d694b6a9c44dc51be0ec905c372e0ccf51a2e0e10b478b2e1d7fe52",
+    "license": "GPL-2.0; see upstream COPYING.txt",
+    "source_binary_reproducibility_verified": false,
+    "flags": ["-O0"],
+    "compiler_root": "separate local root; never use the live emulator filesystem for requests"
+  },
+  "libshacccg": {
+    "repository": "https://github.com/AnimMouse/SceShaccCg",
+    "commit": "f9511fc20ce905704f384b3a99a17c5e97f9a92c",
+    "sha256": "188adb8c34c3983d63244c32d981fd7b518a8dcfd200f5886233fface6b5fa40",
+    "reported_version": "SDK 3.0.0, shacc r13225, sys r85995",
+    "license_note": "Upstream LICENSE refers to Sony's OLP; public availability is not a redistribution grant. Binary is local only."
+  },
+  "distribution": "No third-party source checkout, compiler binary, firmware, game shader, or generated GXP is stored in Git."
+}

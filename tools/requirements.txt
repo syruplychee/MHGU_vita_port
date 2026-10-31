@@ -1,0 +1,3 @@
+# Runtime and build-time Python dependencies.
+# Install with: python -m pip install -r tools/requirements.txt
+lz4>=4.0

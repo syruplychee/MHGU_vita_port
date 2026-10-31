@@ -1,0 +1,4 @@
+{
+  "emulator": "../Vita3K/Vita3K.exe",
+  "static_shader_source": "local/shader-package"
+}

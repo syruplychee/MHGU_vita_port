@@ -1,0 +1,111 @@
+{
+ "schema": 1,
+ "date": "2026-10-17",
+ "kind": "sdk-barrier-sites",
+ "purpose": "Rewrite legacy ARMv6 DSB encodings to architectural DSB sy; never execute MCR p15,c7,c10,5",
+ "module": "sdk",
+ "source_sha256": "9a9b7035266637ee693a32da6b0fde54bda00e897bef05b1c8d8cda30f8ac8b0",
+ "build_id": "cb8e7f9a74a4a854ff013489ecc1e8b0def23a75000000000000000000000000",
+ "text_bytes": 4548468,
+ "site_count": 12,
+ "replacement_word": 4118802511,
+ "apply_ready": true,
+ "sites": [
+  {
+   "offset": 2708416,
+   "expected_word": 3993489338,
+   "state": "ARM",
+   "bytes": 4,
+   "replacement_word": 4118802511,
+   "abi": "MCR p15,0,Rt,c7,c10,5 is the legacy ARMv6 drain-write-buffer encoding of DSB; rewrite in place to architectural DSB sy; no register, memory or control-flow side effect"
+  },
+  {
+   "offset": 2708436,
+   "expected_word": 3993489338,
+   "state": "ARM",
+   "bytes": 4,
+   "replacement_word": 4118802511,
+   "abi": "MCR p15,0,Rt,c7,c10,5 is the legacy ARMv6 drain-write-buffer encoding of DSB; rewrite in place to architectural DSB sy; no register, memory or control-flow side effect"
+  },
+  {
+   "offset": 2708464,
+   "expected_word": 3993489338,
+   "state": "ARM",
+   "bytes": 4,
+   "replacement_word": 4118802511,
+   "abi": "MCR p15,0,Rt,c7,c10,5 is the legacy ARMv6 drain-write-buffer encoding of DSB; rewrite in place to architectural DSB sy; no register, memory or control-flow side effect"
+  },
+  {
+   "offset": 2708484,
+   "expected_word": 3993489338,
+   "state": "ARM",
+   "bytes": 4,
+   "replacement_word": 4118802511,
+   "abi": "MCR p15,0,Rt,c7,c10,5 is the legacy ARMv6 drain-write-buffer encoding of DSB; rewrite in place to architectural DSB sy; no register, memory or control-flow side effect"
+  },
+  {
+   "offset": 2708508,
+   "expected_word": 3993452474,
+   "state": "ARM",
+   "bytes": 4,
+   "replacement_word": 4118802511,
+   "abi": "MCR p15,0,Rt,c7,c10,5 is the legacy ARMv6 drain-write-buffer encoding of DSB; rewrite in place to architectural DSB sy; no register, memory or control-flow side effect"
+  },
+  {
+   "offset": 2708528,
+   "expected_word": 3993452474,
+   "state": "ARM",
+   "bytes": 4,
+   "replacement_word": 4118802511,
+   "abi": "MCR p15,0,Rt,c7,c10,5 is the legacy ARMv6 drain-write-buffer encoding of DSB; rewrite in place to architectural DSB sy; no register, memory or control-flow side effect"
+  },
+  {
+   "offset": 2708548,
+   "expected_word": 3993452474,
+   "state": "ARM",
+   "bytes": 4,
+   "replacement_word": 4118802511,
+   "abi": "MCR p15,0,Rt,c7,c10,5 is the legacy ARMv6 drain-write-buffer encoding of DSB; rewrite in place to architectural DSB sy; no register, memory or control-flow side effect"
+  },
+  {
+   "offset": 2708572,
+   "expected_word": 3993452474,
+   "state": "ARM",
+   "bytes": 4,
+   "replacement_word": 4118802511,
+   "abi": "MCR p15,0,Rt,c7,c10,5 is the legacy ARMv6 drain-write-buffer encoding of DSB; rewrite in place to architectural DSB sy; no register, memory or control-flow side effect"
+  },
+  {
+   "offset": 2708700,
+   "expected_word": 3993452474,
+   "state": "ARM",
+   "bytes": 4,
+   "replacement_word": 4118802511,
+   "abi": "MCR p15,0,Rt,c7,c10,5 is the legacy ARMv6 drain-write-buffer encoding of DSB; rewrite in place to architectural DSB sy; no register, memory or control-flow side effect"
+  },
+  {
+   "offset": 2708720,
+   "expected_word": 3993452474,
+   "state": "ARM",
+   "bytes": 4,
+   "replacement_word": 4118802511,
+   "abi": "MCR p15,0,Rt,c7,c10,5 is the legacy ARMv6 drain-write-buffer encoding of DSB; rewrite in place to architectural DSB sy; no register, memory or control-flow side effect"
+  },
+  {
+   "offset": 2709004,
+   "expected_word": 3993452474,
+   "state": "ARM",
+   "bytes": 4,
+   "replacement_word": 4118802511,
+   "abi": "MCR p15,0,Rt,c7,c10,5 is the legacy ARMv6 drain-write-buffer encoding of DSB; rewrite in place to architectural DSB sy; no register, memory or control-flow side effect"
+  },
+  {
+   "offset": 2709024,
+   "expected_word": 3993452474,
+   "state": "ARM",
+   "bytes": 4,
+   "replacement_word": 4118802511,
+   "abi": "MCR p15,0,Rt,c7,c10,5 is the legacy ARMv6 drain-write-buffer encoding of DSB; rewrite in place to architectural DSB sy; no register, memory or control-flow side effect"
+  }
+ ]
+}

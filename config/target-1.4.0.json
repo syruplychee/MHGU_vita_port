@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "profile": "update-1.4.0",
+  "program_id": "0100770008DD8000",
+  "patch_id": "0100770008DD8800",
+  "cnmt_version": 262144,
+  "display_version": "1.4.0",
+  "architecture": "AArch32",
+  "modules": [
+    {
+      "name": "rtld",
+      "build_id": "e74a8d1013372a3a1088ab5458807fb7f87925d1000000000000000000000000",
+      "sha256": "5352efcb0c4d0e023fe76b78155aa12ca093087096bbc1a1e6db14efbbb6204f",
+      "size": 7004
+    },
+    {
+      "name": "main",
+      "build_id": "fb08f1d20fd1204fe7070672777f869b00000000000000000000000000000000",
+      "sha256": "b3935415499549adaf4c0e89822831daa175cfd456a7990791c79be3997645ef",
+      "size": 14291042
+    },
+    {
+      "name": "subsdk0",
+      "build_id": "c2774fa4cace9ecc6a712bfc839214c19515f36e000000000000000000000000",
+      "sha256": "75fb812705612ec68cd0760640183a140a32d4d07181a40355cc002c52096245",
+      "size": 3276847
+    },
+    {
+      "name": "sdk",
+      "build_id": "cb8e7f9a74a4a854ff013489ecc1e8b0def23a75000000000000000000000000",
+      "sha256": "9a9b7035266637ee693a32da6b0fde54bda00e897bef05b1c8d8cda30f8ac8b0",
+      "size": 4139430
+    }
+  ],
+  "npdm": {
+    "size": 1476,
+    "sha256": "bbd9ecdfc0d9787d4b9c9500f88c43eb5176ec357ac3ff59e140f18b8ae09d93"
+  },
+  "nacp": {
+    "size": 16384,
+    "sha256": "256e00a473af6df8f628bdce943bfdf975184b48b3f2456c36ce9f9c24737083"
+  },
+  "source": "mhgu-runtime/docs/mhgu/UPDATE.md and local update-manifest.json; see reference-lock.json"
+}

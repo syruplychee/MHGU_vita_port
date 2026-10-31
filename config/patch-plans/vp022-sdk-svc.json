@@ -1,0 +1,520 @@
+{
+ "schema": 1,
+ "date": "2026-10-17",
+ "kind": "sdk-svc-sites",
+ "purpose": "Route every original AArch32 SVC site through a bound native service; never execute a Vita kernel call",
+ "module": "sdk",
+ "source_sha256": "9a9b7035266637ee693a32da6b0fde54bda00e897bef05b1c8d8cda30f8ac8b0",
+ "build_id": "cb8e7f9a74a4a854ff013489ecc1e8b0def23a75000000000000000000000000",
+ "text_bytes": 4548468,
+ "site_count": 56,
+ "svc_ids": [
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  17,
+  18,
+  19,
+  20,
+  21,
+  22,
+  23,
+  24,
+  25,
+  26,
+  27,
+  28,
+  29,
+  31,
+  33,
+  34,
+  35,
+  37,
+  38,
+  39,
+  40,
+  41,
+  42,
+  47,
+  50,
+  51,
+  52,
+  53,
+  64,
+  65,
+  67,
+  68,
+  69,
+  80,
+  81,
+  82,
+  83,
+  95,
+  112,
+  114
+ ],
+ "apply_ready": true,
+ "sites": [
+  {
+   "offset": 788072,
+   "expected_word": 4009754625,
+   "svc": 1,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788092,
+   "expected_word": 4009754626,
+   "svc": 2,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788100,
+   "expected_word": 4009754627,
+   "svc": 3,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788108,
+   "expected_word": 4009754628,
+   "svc": 4,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788116,
+   "expected_word": 4009754629,
+   "svc": 5,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788128,
+   "expected_word": 4009754630,
+   "svc": 6,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788148,
+   "expected_word": 4009754631,
+   "svc": 7,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788168,
+   "expected_word": 4009754632,
+   "svc": 8,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788192,
+   "expected_word": 4009754633,
+   "svc": 9,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788200,
+   "expected_word": 4009754634,
+   "svc": 10,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788208,
+   "expected_word": 4009754635,
+   "svc": 11,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788220,
+   "expected_word": 4009754636,
+   "svc": 12,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788240,
+   "expected_word": 4009754637,
+   "svc": 13,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788252,
+   "expected_word": 4009754638,
+   "svc": 14,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788288,
+   "expected_word": 4009754639,
+   "svc": 15,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788296,
+   "expected_word": 4009754640,
+   "svc": 16,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788304,
+   "expected_word": 4009754641,
+   "svc": 17,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788312,
+   "expected_word": 4009754642,
+   "svc": 18,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788320,
+   "expected_word": 4009754643,
+   "svc": 19,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788328,
+   "expected_word": 4009754644,
+   "svc": 20,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788340,
+   "expected_word": 4009754645,
+   "svc": 21,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788360,
+   "expected_word": 4009754646,
+   "svc": 22,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788368,
+   "expected_word": 4009754647,
+   "svc": 23,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788388,
+   "expected_word": 4009754648,
+   "svc": 24,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788408,
+   "expected_word": 4009754649,
+   "svc": 25,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788416,
+   "expected_word": 4009754650,
+   "svc": 26,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788424,
+   "expected_word": 4009754651,
+   "svc": 27,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788444,
+   "expected_word": 4009754652,
+   "svc": 28,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788456,
+   "expected_word": 4009754653,
+   "svc": 29,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788468,
+   "expected_word": 4009754655,
+   "svc": 31,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788488,
+   "expected_word": 4009754657,
+   "svc": 33,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788496,
+   "expected_word": 4009754658,
+   "svc": 34,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788508,
+   "expected_word": 4009754659,
+   "svc": 35,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788532,
+   "expected_word": 4009754661,
+   "svc": 37,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788556,
+   "expected_word": 4009754662,
+   "svc": 38,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788564,
+   "expected_word": 4009754663,
+   "svc": 39,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788572,
+   "expected_word": 4009754664,
+   "svc": 40,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788592,
+   "expected_word": 4009754665,
+   "svc": 41,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788616,
+   "expected_word": 4009754666,
+   "svc": 42,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788628,
+   "expected_word": 4009754671,
+   "svc": 47,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788680,
+   "expected_word": 4009754674,
+   "svc": 50,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788688,
+   "expected_word": 4009754675,
+   "svc": 51,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788708,
+   "expected_word": 4009754676,
+   "svc": 52,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788720,
+   "expected_word": 4009754677,
+   "svc": 53,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788732,
+   "expected_word": 4009754704,
+   "svc": 80,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788752,
+   "expected_word": 4009754705,
+   "svc": 81,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788760,
+   "expected_word": 4009754706,
+   "svc": 82,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788772,
+   "expected_word": 4009754707,
+   "svc": 83,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788804,
+   "expected_word": 4009754719,
+   "svc": 95,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788820,
+   "expected_word": 4009754688,
+   "svc": 64,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788852,
+   "expected_word": 4009754689,
+   "svc": 65,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788884,
+   "expected_word": 4009754691,
+   "svc": 67,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788928,
+   "expected_word": 4009754692,
+   "svc": 68,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788956,
+   "expected_word": 4009754693,
+   "svc": 69,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 788992,
+   "expected_word": 4009754736,
+   "svc": 112,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  },
+  {
+   "offset": 789024,
+   "expected_word": 4009754738,
+   "svc": 114,
+   "state": "ARM",
+   "bytes": 4,
+   "abi": "Original registers forwarded; kernel return in r0 and r1:r2; continuation is site+4"
+  }
+ ]
+}

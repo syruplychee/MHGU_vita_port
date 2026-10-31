@@ -1,0 +1,34 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "vita-release",
+      "displayName": "PS Vita native loader (Release)",
+      "description": "Builds build/vita/vita_port_native_loader.vpk. Requires VITASDK, MHGU_EXEFS and Ninja on PATH.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/vita",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VITASDK}/share/vita.toolchain.cmake",
+        "VITA_PORT_EXEFS": "$env{MHGU_EXEFS}",
+        "VITA_PORT_KUBRIDGE_LIBRARY": "$env{MHGU_KUBRIDGE_LIB}",
+        "VITA_PORT_BUILD_NATIVE_LOADER": "ON",
+        "VITA_PORT_NATIVE_SDK_DSO": "ON"
+      }
+    },
+    {
+      "name": "vita-debug",
+      "displayName": "PS Vita native loader (RelWithDebInfo)",
+      "inherits": "vita-release",
+      "binaryDir": "${sourceDir}/build/vita-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "vita-release", "configurePreset": "vita-release" },
+    { "name": "vita-debug", "configurePreset": "vita-debug" }
+  ]
+}

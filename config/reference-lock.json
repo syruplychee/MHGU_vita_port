@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "recorded_date": "2026-10-14",
+  "project": "../mhgu-runtime",
+  "commit": "b409ca15f80d2a00e6c74c788b73b3ab1dfc3160",
+  "worktree_clean": true,
+  "files": [
+    {
+      "path": "docs/mhgu/README.md",
+      "sha256": "e1708373491cab253bb17f2174b9674d40f4dd40220b35757932df87678c0b98"
+    },
+    {
+      "path": "docs/mhgu/UPDATE.md",
+      "sha256": "09f3360f6ea7b6a17e335f23d12b34356c85d926ec4ec0a16a3e09621c1cbde8"
+    },
+    {
+      "path": "docs/mhgu/SUPPORTED_BUILD.md",
+      "sha256": "828a86e2d9f34836ed620be31ef578492f3168410b087bf4da6b5d7becf4cfc1"
+    },
+    {
+      "path": "docs/mhgu/MEMORY_THREAD_BACKENDS.md",
+      "sha256": "682c4f79f23c79662fefb6a89352c800e40af8bd810bf0bb0eb89597c18af69c"
+    },
+    {
+      "path": "docs/mhgu/MT_ENTRY_ROUTES.md",
+      "sha256": "2d00e7bddae929ff3a0d830c0ad5ae7e2d8d50628467382d1f29420429234417"
+    },
+    {
+      "path": "docs/mhgu/VITA_TARGET_BUILD.md",
+      "sha256": "adaf349a89d66588692d75ab06f12f3594c2d953b104a7ed50f4731e5395c94a"
+    },
+    {
+      "path": "build-support/vitasdk.lock.json",
+      "sha256": "b3693514a22f1e50ea6a398558e6911bb8e73c8bd8fca37bc7d32bedf268c11b"
+    }
+  ],
+  "local_manifest": {
+    "path": "../unpacked/update-mhgu/update-manifest.json",
+    "sha256": "ee0e07b6a188e4425cc49598dfd37c15863871e9e70f52fb0889ca4c66cd03bd"
+  },
+  "local_isa_probe": {
+    "path": "../analysis/update-main-audit/isa-probe-vita-cortex-a9.txt",
+    "sha256": "52055689ff72ac99f8de268fe37c97f6f1e96f1f12d0184f347ef76d953f60a4"
+  },
+  "reused_source_files": [],
+  "note": "Metadata and research summaries only; historical evidence is not Vita execution proof."
+}

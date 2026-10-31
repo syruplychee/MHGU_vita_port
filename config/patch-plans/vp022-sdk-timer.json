@@ -1,0 +1,303 @@
+{
+ "schema": 1,
+ "date": "2026-10-17",
+ "kind": "sdk-timer-sites",
+ "purpose": "Replace AArch32 generic-timer reads with a bound host monotonic tick service; never execute MRRC p15,c14",
+ "module": "sdk",
+ "source_sha256": "9a9b7035266637ee693a32da6b0fde54bda00e897bef05b1c8d8cda30f8ac8b0",
+ "build_id": "cb8e7f9a74a4a854ff013489ecc1e8b0def23a75000000000000000000000000",
+ "text_bytes": 4548468,
+ "site_count": 32,
+ "tick_frequency_hz": 19200000,
+ "apply_ready": true,
+ "sites": [
+  {
+   "offset": 629976,
+   "expected_word": 3965153038,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 6,
+   "rt2": 7,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 630988,
+   "expected_word": 3965153038,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 6,
+   "rt2": 7,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 632392,
+   "expected_word": 3965292302,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 8,
+   "rt2": 9,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 632500,
+   "expected_word": 3965153038,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 6,
+   "rt2": 7,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 634036,
+   "expected_word": 3964874510,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 2,
+   "rt2": 3,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 634208,
+   "expected_word": 3964874510,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 2,
+   "rt2": 3,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 634468,
+   "expected_word": 3964874510,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 2,
+   "rt2": 3,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 634640,
+   "expected_word": 3964874510,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 2,
+   "rt2": 3,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 634896,
+   "expected_word": 3964874510,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 2,
+   "rt2": 3,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 634992,
+   "expected_word": 3965153038,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 6,
+   "rt2": 7,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 635328,
+   "expected_word": 3964874510,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 2,
+   "rt2": 3,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 637040,
+   "expected_word": 3965153038,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 6,
+   "rt2": 7,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 637276,
+   "expected_word": 3964735246,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 0,
+   "rt2": 1,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 637740,
+   "expected_word": 3965153038,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 6,
+   "rt2": 7,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 637980,
+   "expected_word": 3964735246,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 0,
+   "rt2": 1,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 638440,
+   "expected_word": 3965153038,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 6,
+   "rt2": 7,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 638680,
+   "expected_word": 3964735246,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 0,
+   "rt2": 1,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 638992,
+   "expected_word": 3965153038,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 6,
+   "rt2": 7,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 639160,
+   "expected_word": 3964735246,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 0,
+   "rt2": 1,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 641580,
+   "expected_word": 3965013774,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 4,
+   "rt2": 5,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 641988,
+   "expected_word": 3965153038,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 6,
+   "rt2": 7,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 642972,
+   "expected_word": 3965153038,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 6,
+   "rt2": 7,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 643132,
+   "expected_word": 3964735246,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 0,
+   "rt2": 1,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 645172,
+   "expected_word": 3964874510,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 2,
+   "rt2": 3,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 655388,
+   "expected_word": 3965013774,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 4,
+   "rt2": 5,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 656536,
+   "expected_word": 3964874510,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 2,
+   "rt2": 3,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 656608,
+   "expected_word": 3964874510,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 2,
+   "rt2": 3,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 656908,
+   "expected_word": 3964874510,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 2,
+   "rt2": 3,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 656964,
+   "expected_word": 3964874510,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 2,
+   "rt2": 3,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 657188,
+   "expected_word": 3964874510,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 2,
+   "rt2": 3,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 665548,
+   "expected_word": 3965153038,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 6,
+   "rt2": 7,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  },
+  {
+   "offset": 666656,
+   "expected_word": 3965153038,
+   "state": "ARM",
+   "bytes": 4,
+   "rt": 6,
+   "rt2": 7,
+   "abi": "MRRC p15,0,Rt,Rt2,c14 reads the 64-bit generic timer; host writes the 64-bit monotonic tick to Rt:Rt2 and resumes at site+4; no guest memory is accessed"
+  }
+ ]
+}

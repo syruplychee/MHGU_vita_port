@@ -1,0 +1,84 @@
+cmake_minimum_required(VERSION 3.20)
+project(mhgu_vita_port_host_tests LANGUAGES C)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS ON)
+
+enable_testing()
+
+set(VP_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../src")
+set(VP_INCLUDES
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${VP_SRC}/platform"
+    "${VP_SRC}/loader"
+    "${VP_SRC}/bridge"
+    "${CMAKE_CURRENT_SOURCE_DIR}/stubs")
+
+find_package(Threads)
+
+function(vp_host_test name)
+    add_executable(${name} "${CMAKE_CURRENT_SOURCE_DIR}/${name}.c" ${ARGN})
+    target_include_directories(${name} PRIVATE ${VP_INCLUDES})
+    target_compile_definitions(${name} PRIVATE _CRT_SECURE_NO_WARNINGS)
+    if(MSVC)
+        target_compile_options(${name} PRIVATE /W4 /UNDEBUG)
+    else()
+        target_compile_options(${name} PRIVATE -Wall -Wextra -UNDEBUG)
+    endif()
+    if(UNIX)
+        target_link_libraries(${name} PRIVATE m)
+    endif()
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+vp_host_test(audio_downmix)
+vp_host_test(audio_ipc "${VP_SRC}/platform/audio_ipc.c")
+vp_host_test(batch_policy)
+# audio_auto_catchup needs MAP_32BIT and is built in the UNIX block below.
+vp_host_test(clear_fusion "${VP_SRC}/platform/gxm_depth.c")
+vp_host_test(float_bits_numeric)
+vp_host_test(gpu_command_buffer "${VP_SRC}/platform/gpu_stream.c")
+vp_host_test(gpu_effective_rt "${VP_SRC}/platform/gpu_stream.c")
+vp_host_test(gpu_indices)
+vp_host_test(gpu_stream "${VP_SRC}/platform/gpu_stream.c")
+vp_host_test(gpu_texture_decode "${VP_SRC}/platform/gpu_texture.c")
+vp_host_test(gpu_uniform_state "${VP_SRC}/platform/gpu_stream.c")
+vp_host_test(gxm_depth "${VP_SRC}/platform/gxm_depth.c")
+vp_host_test(gxm_depth_view
+    "${VP_SRC}/platform/gxm_depth_view.c"
+    "${VP_SRC}/platform/gxm_resource_layout.c"
+    "${VP_SRC}/platform/gxm_shadow_sampler.c"
+    "${VP_SRC}/platform/static_shader_index.c")
+vp_host_test(gxm_depth_view_shadow
+    "${VP_SRC}/platform/gxm_depth_view.c"
+    "${VP_SRC}/platform/gxm_resource_layout.c"
+    "${VP_SRC}/platform/gxm_shadow_sampler.c"
+    "${VP_SRC}/platform/static_shader_index.c")
+vp_host_test(gxm_resource_layout
+    "${VP_SRC}/platform/gxm_resource_layout.c"
+    "${VP_SRC}/platform/static_shader_index.c")
+vp_host_test(gxm_sampler_slots)
+vp_host_test(gxm_shadow_sampler "${VP_SRC}/platform/gxm_shadow_sampler.c")
+vp_host_test(memory_attributes "${VP_SRC}/platform/memory_attributes.c")
+vp_host_test(nvmap_table "${VP_SRC}/platform/nvmap_table.c")
+vp_host_test(pair_cache_policy)
+vp_host_test(render_resolution)
+vp_host_test(static_shader_index "${VP_SRC}/platform/static_shader_index.c")
+vp_host_test(texture_snapshot)
+vp_host_test(time_calendar)
+vp_host_test(vertex_format "${VP_SRC}/platform/vertex_format.c")
+vp_host_test(vertex_window "${VP_SRC}/platform/vertex_window.c")
+
+# These two use POSIX-only memory and pthread facilities; CI runs them on Linux.
+if(UNIX)
+    vp_host_test(audio_auto_catchup "${VP_SRC}/platform/audio_ipc.c")
+    vp_host_test(audio_wave_progress "${VP_SRC}/platform/audio_ipc.c")
+
+    vp_host_test(guest_storage)
+
+    if(Threads_FOUND)
+        vp_host_test(log_sink "${VP_SRC}/platform/log_sink.c")
+        target_link_libraries(log_sink PRIVATE Threads::Threads)
+    endif()
+endif()
