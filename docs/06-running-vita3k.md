@@ -133,8 +133,8 @@ build/vita3k-pref/ux0/data/mhgu-vita-port/
 - 分辨率：540p（`config/render-resolution.txt`）。
 - Scene pipeline：默认开启；`scene-pipeline.disable` 可关闭。
 - Clear fusion：普通 bounded-batch 游戏路径默认开启；`clear-fusion.disable` 优先。
-- 有界批处理：由 runner 的 `-BoundedBatch` 或已有 marker 决定；默认 play 路径会写
-  `bounded-batch.enable` 吗？以 runner 实际参数为准，不要假设。
+- 有界批处理：默认不写 `bounded-batch.enable`；使用 `-BoundedBatch` 显式开启。runner
+  会快照并在结束后恢复已有 marker。
 - 静态着色器：SELF 编译定义决定目录；runner 会把它 staging 到该目录。
 
 ## 5. 日志与截图
