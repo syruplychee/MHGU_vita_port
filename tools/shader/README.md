@@ -22,7 +22,10 @@ SPK/捕获
   软件阴影 stage 生成/校验。
 - `setup_shacc.py`、`convert_cache.py`：Shacc 配置与编译缓存。
 - `compare_static_shader_packages.py`、`audit_static_library.py`：包/库审计。
-- 其余 `audit_*`、`verify_*`、`build_*`：历史批次/专项验证的支撑脚本。
+- `build_*_candidate_spec.py`、`plan_shadow_pairs.py`：候选/阴影 stage 规划。
+- `cache_inputs.py`、`crosscheck_*`、`resolve_static_environment.py`：环境/输入核对。
+- `probe_cg_capability.py`：Cg/Shacc 能力探测。
+- `verify_static_package.py`：包完整性校验（日常使用入口）。
 
 ## 依赖
 
