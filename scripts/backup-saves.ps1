@@ -84,5 +84,5 @@ if (Test-Path -LiteralPath $destination) {
 New-Item -ItemType Directory -Force -Path $destination | Out-Null
 Copy-Item -LiteralPath $Savedata -Destination (Join-Path $destination "savedata") -Recurse
 $ManifestPath = Write-Manifest (Join-Path $destination "savedata") $destination
-Write-Host "Savedata backed up to: $destination"
-Write-Host "Manifest: $ManifestPath"
+Write-Output "Savedata backed up to: $destination"
+Write-Output "Manifest: $ManifestPath"

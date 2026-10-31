@@ -26,6 +26,7 @@
 9. [当前状态与已知问题](09-status.md)
 10. [贡献指南](10-contributing.md)
 11. [故障排查](11-troubleshooting.md)
+12. [develop 开发起点与旧项目交接](12-development-baseline.md)
 
 ## 参考
 
