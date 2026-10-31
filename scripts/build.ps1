@@ -61,6 +61,10 @@ if (-not $CMake) {
 }
 if (-not $CMake) { Fail "CMake 3.24+ was not found. Set PATH or pass -CMake." }
 $CMake = (Resolve-Path -LiteralPath $CMake).Path
+$cmakeVersion = (& $CMake --version | Select-Object -First 1)
+if ($cmakeVersion -match "version 4\.4\.") {
+    Write-Warning "CMake 4.4.x can fail to create build directories on some secondary volumes. If configure fails, use CMake 4.3.x or a build directory on the system drive."
+}
 
 if (-not $Ninja) {
     $command = Get-Command ninja -ErrorAction SilentlyContinue
@@ -82,6 +86,19 @@ $tmp = Join-Path $BuildDir "tmp"
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 $env:TMP = $tmp
 $env:TEMP = $tmp
+# Verify that the actual toolchain processes can write to the build directory.
+# Some hardened Windows policies allow PowerShell/cmd writes but deny GCC,
+# Python and Ninja; detecting that here gives an actionable error.
+$probe = Join-Path $tmp "write-probe.txt"
+$probePreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+& $Python -c "import sys; open(sys.argv[1], 'w').write('ok')" $probe 2>&1 | Out-Null
+$probeCode = $LASTEXITCODE
+$ErrorActionPreference = $probePreference
+if ($probeCode -ne 0 -or -not (Test-Path -LiteralPath $probe)) {
+    Fail "Python cannot write to the build directory: $BuildDir. Use -BuildDir on a writable drive (for example C:\builds\mhgu-vita)."
+}
+Remove-Item -LiteralPath $probe -Force
 
 if ($Clean) {
     if (Test-Path -LiteralPath (Join-Path $BuildDir "CMakeCache.txt")) {
