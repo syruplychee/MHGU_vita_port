@@ -130,6 +130,21 @@
       "function_bytes": 36,
       "sha256": "410bedf2982207ea8c524171741bef2811965471ac9d7aff6504b1356751c5e3",
       "abi": "Typed native mutex enter/leave/try/is-owned; owner-thread scope, no Switch ThreadType access"
+    },
+    {
+      "name": "video_readback_loop",
+      "offset": 2760408,
+      "state": "ARM",
+      "expected_original_bytes": "3cb090e5",
+      "function_bytes": 156,
+      "sha256": "c7f0dc8a012c37f6d7fe334214369b09034b21fe96da90c146fe13102a0ac924",
+      "reviewed_function": {
+        "name": "NvRmMemReadStrided",
+        "offset": 2760144,
+        "bytes": 420,
+        "sha256": "1413e24147b7d727b915789d35e8fcf2a020bb6c1101de8acfc95ef5630942f1"
+      },
+      "abi": "Mid-function after original SDK object lookup: r0=object, r1=rows, r4=destination, r6=source offset, r7=row bytes; [sp+4]=destination stride, [sp+8]=source stride. CPU-produced live VIC allocation only: native row copy then original epilogue sdk+0x2a1f50. Otherwise emulate displaced LDR fp,[r0,#0x3c] and resume sdk+0x2a1edc; preserve original failure, bounds, cache synchronization and partial-copy path. r4-r11/SP/LR restored by original epilogue; no game logic changed."
     }
   ],
   "providers": [

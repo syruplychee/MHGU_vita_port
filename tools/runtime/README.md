@@ -13,6 +13,8 @@ Vita3K 启动与证据工具。
 | `observe_process_lifecycle.ps1` | 进程退出观察 |
 | `send_test_input.ps1` | 通过邮箱发送测试输入 |
 | `summarize_savedata_io.py` | 从 SDK 日志汇总存档 I/O |
+| `measure_movie.py` | 汇总解码/合成/读回事件节奏，不声明显示帧率 |
+| `measure_movie_color.py` | 汇总颜色转换探针入口到出口的墙钟耗时，不声明 CPU 时间或帧率 |
 
 日常入口是 `scripts/play.ps1`，它先备份存档再调用 `run_gui_play.ps1`。
 详细参数见 [在 Vita3K 中运行](../../docs/06-running-vita3k.md)。

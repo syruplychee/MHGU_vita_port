@@ -1,0 +1,78 @@
+{
+  "schema": 1,
+  "module": "subsdk0",
+  "source_sha256": "75fb812705612ec68cd0760640183a140a32d4d07181a40355cc002c52096245",
+  "build_id": "c2774fa4cace9ecc6a712bfc839214c19515f36e000000000000000000000000",
+  "verified_elf_text_sha256": "1b97455942726ee28e611ead1aea1298f67de5cc85fba2f2d47959dc0f7f7c05",
+  "marker": "ux0:data/mhgu-vita-port/media-color-probe.enable",
+  "default_enabled": false,
+  "purpose": "Measure the original movie platform color conversion without replacing its algorithm or playback timing",
+  "island": {
+    "owner": "subsdk0",
+    "append_bytes": 32,
+    "veneer_bytes": 8,
+    "encoding": "ldr pc,[pc,#-4]; absolute host bridge address",
+    "sdk_island_unchanged": true
+  },
+  "functions": [
+    {
+      "name": "movie::NnCodecVideoSink::ConvertYuvToRgb",
+      "offset": "0x33c4e8",
+      "bytes": 428,
+      "sha256": "fd83cf277feb8d26b9990d17bdb75cc0e6d91831045cce145cc05427cf8a98cf"
+    },
+    {
+      "name": "movie::NnCodecVideoSink::ConvertYuvToNv12",
+      "offset": "0x33c694",
+      "bytes": 492,
+      "sha256": "5f85c2e781d5add839d2cde732dae770c7b62b99f98c32582edb7cbf595cc65c"
+    }
+  ],
+  "patches": [
+    {
+      "name": "rgb_enter",
+      "offset": "0x33c4f4",
+      "state": "ARM",
+      "service": "0x24c",
+      "expected_original_bytes": "40e090e5",
+      "continuation": "0x33c4f8",
+      "abi": "Replay LDR lr,[r0,#0x40] into saved guest LR; r0=this, r1=destination, r2/r3=source arguments, this+0x3c/+0x40=width/height; retain the original function stack"
+    },
+    {
+      "name": "rgb_leave",
+      "offset": "0x33c678",
+      "state": "ARM",
+      "service": "0x24d",
+      "expected_original_bytes": "000081e5",
+      "continuation": "0x33c67c",
+      "abi": "Replay STR r0,[r1] after checking current guest write permission; preserve r0 and resume the original epilogue"
+    },
+    {
+      "name": "nv12_enter",
+      "offset": "0x33c6a0",
+      "state": "ARM",
+      "service": "0x24e",
+      "expected_original_bytes": "0c108de5",
+      "continuation": "0x33c6a4",
+      "abi": "Replay STR r1,[original guest sp,#12] after checking write permission; r0=this, r1=destination, r2/r3=source arguments, this+0x3c/+0x40=width/height; retain the original function stack"
+    },
+    {
+      "name": "nv12_leave",
+      "offset": "0x33c868",
+      "state": "ARM",
+      "service": "0x24f",
+      "expected_original_bytes": "000089e5",
+      "continuation": "0x33c86c",
+      "abi": "Replay STR r0,[r9] after checking current guest write permission; preserve r0 and resume the original epilogue"
+    }
+  ],
+  "timing": {
+    "clock": "sceKernelGetProcessTimeWide",
+    "scope": "wall time between mid-function entry and exit probes; includes scheduling and bridge overhead; not CPU-only time or displayed FPS",
+    "state": "one active conversion per executor: main plus 63 guest worker slots",
+    "log": "VP_MOVIE_COLOR_TIME",
+    "sampling": "first 2000 completed conversions, then every 32nd",
+    "no_samples": "unavailable; never report zero conversion cost from a function that was not observed"
+  },
+  "validation": "Before any probe write, require the locked module SHA256/build ID, both complete original function hashes, and all four original ARM words; reject mismatches before execution"
+}

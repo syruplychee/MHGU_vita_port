@@ -11,6 +11,9 @@
 #include "guest_svc.h"
 #include "audio_probe.h"
 #include "audio_sink.h"
+#include "media_video.h"
+#include "movie_control.h"
+#include "session_gate.h"
 #include <stddef.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/kernel/cpu.h>
@@ -21,10 +24,18 @@
 #include <psp2/kernel/sysmem.h>
 #include <string.h>
 #include <stdlib.h>
+#if defined(__GNUC__) && (defined(__arm__) || defined(__thumb__))
+#define VP_SDK_INTEGER_ONLY __attribute__((target("general-regs-only")))
+#else
+#define VP_SDK_INTEGER_ONLY
+#endif
 extern void vp_sdk_alloc(void),vp_sdk_free(void),vp_sdk_ctor_gate(void),vp_sdk_dso_enter(void),vp_sdk_lock(void),vp_sdk_unlock(void),vp_sdk_exception_info(void);
 extern void vp_sdk_malloc(void),vp_sdk_heap_free(void),vp_sdk_cpp_fixture_end(void);
 extern void vp_sdk_tls_normal(void),vp_sdk_tls_private(void),vp_sdk_tls_free_bridge(void),vp_sdk_tls_get_bridge(void),vp_sdk_tls_set_bridge(void);
 extern void vp_sdk_try_lock(void),vp_sdk_is_locked(void);
+extern void vp_sdk_video_readback(void);
+extern void vp_movie_color_rgb_enter(void),vp_movie_color_rgb_leave(void);
+extern void vp_movie_color_nv12_enter(void),vp_movie_color_nv12_leave(void);
 extern const unsigned char vp_sdk_svc_site_template[],vp_sdk_svc_site_end[];
 extern const unsigned char vp_sdk_svc_site_service_value[],vp_sdk_svc_site_continuation_value[],vp_sdk_svc_site_branch[];
 extern const unsigned char vp_sdk_timer_site_template[],vp_sdk_timer_site_end[];
@@ -40,9 +51,10 @@ extern const unsigned char vp_sdk_unwind_query[],vp_sdk_unwind_query_end[];
 /* nn::os::detail::InternalCriticalSection is a recursive lock keyed by its
  * guest word. Each address maps to one recursive host mutex; owner is the
  * guest thread handle (start_handle for the main executor) and depth is the
- * host recursion count, so IsLockedByCurrentThread can distinguish threads
- * and WaitProcessWideKeyAtomic can release the whole recursion depth. */
+ * guest recursion count. Only the outermost acquisition owns the host mutex;
+ * WaitProcessWideKeyAtomic releases it once and restores the guest depth. */
 typedef struct { uint32_t address;SceUID id;unsigned held,depth;uint32_t owner;
+    unsigned host_depth;
     /* Enter increments pending before it releases the session lock to block
      * on the host mutex, and clears it once the mutex is held. A slot with
      * pending set is mid-acquisition: its host mutex may already be owned
@@ -72,23 +84,26 @@ static int svc_arrival_enabled(void);
  * the kernel's atomic release and next-owner handoff. */
 #define VP_KEY_WAIT_LIMIT 32u
 typedef struct { uint32_t key,address,tag;SceUID event;unsigned used,signaled; } KeyWait;
-/* A process-wide-key signal with no registered waiter is not lost: the
- * kernel's wait re-checks the key's memory word and returns immediately when
- * the signaller already changed it. The guest word itself is updated by the
- * signaller, so the observable effect of that race is a wait that completes
- * at once. Keep one pending wake per key (bounded) and let the next waiter
- * consume it instead of parking until an unrelated signal arrives. */
-#define VP_KEY_PENDING_LIMIT 64u
-typedef struct { uint32_t key;unsigned count; } KeyPending;
+typedef struct {
+    uint64_t started_us;
+    uint32_t mode,width,height,destination,source_y,source_uv;
+} VPMovieColorTiming;
+static int movie_color_probe_enabled;
 typedef struct {
     VPThreadLocalAllocator allocator;
     Lock locks[VP_SDK_LOCK_LIMIT];
+    unsigned lock_hint[64]; /* Slot plus one; verify the address after reuse. */
     KeyWait key_waits[VP_KEY_WAIT_LIMIT];
-    KeyPending key_pending[VP_KEY_PENDING_LIMIT];
-    unsigned key_pending_count,key_pending_lost;
     unsigned key_waits_live,key_signals,key_wakes,key_timeouts;
     uint32_t original_args[4][21],resume,observed,observed_mask,gated,lock_calls,unlock_calls;
     unsigned lock_recycles,lock_cursor;
+    unsigned fast_enter,fast_leave,fast_try,fast_islocked,fast_fallback;
+    unsigned fast_miss[6]; /* Context, session busy, owner, slot, permission, contention. */
+    int fast_enabled;
+    VPExecutor *main_executor;
+    VPMovieColorTiming movie_color[64]; /* Main plus the 63 guest worker slots. */
+    unsigned movie_color_samples;
+    unsigned movie_readback_stacks;
     VPUnwindRegistry exceptions;
     VPSdkExceptionIndex indexes[4];
     uint32_t exception_output[4],exception_queries;
@@ -99,7 +114,9 @@ typedef struct {
     SceUID pool_block,launch_block;
     uint32_t pool_base,launch_address,start_handle,start_result,start_flag;
     unsigned ctor_dispatches;
-    SceUID state_lock;          /* serializes bridge state across guest threads */
+    SceUID state_lock;          /* Kernel backend, also retained for rollback. */
+    VPSessionGate state_gate;
+    int session_kernel;
     volatile uint32_t stopping;
     /* Temporary diagnosis: if the thread that entered nnMain stops issuing
      * SVCs while other guest threads keep running, its guest stack is dumped
@@ -254,7 +271,11 @@ typedef struct {
     unsigned prepared;
 } VPGuestThreadPool;
 static VPGuestThreadPool thread_pool;
+static int thread_probe_enabled=-1;
+volatile uint32_t vp_movie_umovie_thread;
+volatile uint32_t vp_movie_umovie_state;
 static uint32_t resume;
+VP_SDK_INTEGER_ONLY
 static uint32_t host_tls(void) { uint32_t v;__asm__ volatile("mrc p15,0,%0,c13,c0,3":"=r"(v));return v; }
 static uint32_t host_fp(void) { uint32_t v;__asm__ volatile("vmrs %0,FPSCR":"=r"(v));return v; }
 int vp_sdk_dso_replaces_tls(uint32_t offset) {
@@ -339,11 +360,75 @@ static int sdk_hid_helper_state_probe(FILE *log,VPNativeModule modules[4]) {
     fflush(log);
     return rc;
 }
+static int movie_color_probe_patch(FILE *log,VPNativeModule *m) {
+    FILE *marker=fopen("ux0:data/mhgu-vita-port/media-color-probe.enable","rb");
+    movie_color_probe_enabled=marker!=NULL;
+    if (marker) fclose(marker);
+    fprintf(log,"MOVIE_COLOR_PROBE_MODE enabled=%d module=subsdk0\n",movie_color_probe_enabled);
+    if (!movie_color_probe_enabled) return 0;
+    static const unsigned char module_sha[32]={
+        0x75,0xfb,0x81,0x27,0x05,0x61,0x2e,0xc6,0x8c,0xd0,0x76,0x06,0x40,0x18,0x3a,0x14,
+        0x0a,0x32,0xd4,0xd0,0x71,0x81,0xa4,0x03,0x55,0xcc,0x00,0x2c,0x52,0x09,0x62,0x45};
+    static const unsigned char build_id[32]={
+        0xc2,0x77,0x4f,0xa4,0xca,0xce,0x9e,0xcc,0x6a,0x71,0x2b,0xfc,0x83,0x92,0x14,0xc1,
+        0x95,0x15,0xf3,0x6e,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
+    static const struct { uint32_t offset,bytes;unsigned char sha[32]; } functions[]={
+        {0x33c4e8u,0x1acu,{
+            0xfd,0x83,0xcf,0x27,0x7f,0xeb,0x8d,0x26,0xb9,0x99,0x0d,0x17,0xbd,0xb7,0x5c,0xc0,
+            0xe6,0xd9,0x18,0x31,0x04,0x5c,0xce,0x14,0x5c,0xc0,0x54,0x27,0xcf,0x8a,0x98,0xcf}},
+        {0x33c694u,0x1ecu,{
+            0x5f,0x85,0xc2,0xe7,0x81,0xd5,0xad,0xd8,0x39,0xd2,0xcd,0xe7,0x32,0xda,0xe7,0x70,
+            0xc7,0xb6,0x2b,0x99,0xf9,0x8c,0x32,0x58,0x2e,0xdb,0x7c,0xbf,0x59,0x5c,0xc6,0x5c}}};
+    static const struct { uint32_t offset,word;void (*entry)(void); } sites[]={
+        {0x33c4f4u,0xe590e040u,vp_movie_color_rgb_enter},
+        {0x33c678u,0xe5810000u,vp_movie_color_rgb_leave},
+        {0x33c6a0u,0xe58d100cu,vp_movie_color_nv12_enter},
+        {0x33c868u,0xe5890000u,vp_movie_color_nv12_leave}};
+    if (memcmp(m->nso.file_sha256,module_sha,32) || memcmp(m->nso.build_id,build_id,32))
+        return VP_PATCH_BINDING;
+    /* Check both whole functions and all four original words before the first
+     * movie probe write. A different linked body is rejected, never sampled. */
+    for (unsigned i=0;i<2u;++i) {
+        unsigned char sha[32];
+        if (functions[i].offset>m->nso.segments[0].bytes
+            || functions[i].bytes>m->nso.segments[0].bytes-functions[i].offset) return VP_PATCH_RANGE;
+        vp_sha256(m->image+functions[i].offset,functions[i].bytes,sha);
+        if (memcmp(sha,functions[i].sha,32)) return VP_PATCH_BINDING;
+    }
+    for (unsigned i=0;i<4u;++i)
+        if (word(m->image+sites[i].offset)!=sites[i].word) return VP_PATCH_BINDING;
+    if (m->island_offset>m->capacity || m->island_bytes>m->capacity-m->island_offset)
+        return VP_PATCH_RANGE;
+    uint32_t off=m->island_offset+m->island_bytes;
+    if ((off&3u) || 32u>m->capacity-off) return VP_PATCH_RANGE;
+    VPPatchTarget target;
+    int rc=vp_patch_open(&target,m->image,m->nso.span,m->base);
+    for (unsigned i=0;i<4u && !rc;++i) {
+        uint32_t island=m->base+off+i*8u;
+        int64_t delta=(int64_t)island-((int64_t)m->base+sites[i].offset+8);
+        if ((delta&3) || delta<-(int64_t)VP_PATCH_BRANCH_REACH || delta>=VP_PATCH_BRANCH_REACH)
+            return VP_PATCH_REACH;
+        uint32_t veneer[2]={0xe51ff004u,(uint32_t)(uintptr_t)sites[i].entry};
+        memcpy(m->image+off+i*8u,veneer,sizeof(veneer));
+        rc=vp_patch_site(&target,sites[i].offset,sites[i].word,island);
+        fprintf(log,"MOVIE_COLOR_PROBE_PATCH site=0x%x word=0x%08x service=0x%x island=0x%08x status=%d\n",
+            sites[i].offset,sites[i].word,0x24cu+i,island,rc);
+    }
+    if (!rc) m->island_bytes+=32u;
+    return rc;
+}
+
 int vp_sdk_dso_patch(FILE *log,VPNativeModule modules[4]) {
+    int color_rc=movie_color_probe_patch(log,&modules[2]);
+    if (color_rc) {
+        fprintf(log,"MOVIE_COLOR_PROBE_REJECT status=%d\n",color_rc);fflush(log);
+        return color_rc;
+    }
     VPNativeModule *m=&modules[3];
     void (*entries[])(void)={vp_sdk_dso_enter,vp_sdk_ctor_gate,vp_sdk_lock,vp_sdk_unlock,vp_sdk_exception_info,
         vp_sdk_tls_normal,vp_sdk_tls_private,vp_sdk_tls_free_bridge,vp_sdk_tls_get_bridge,vp_sdk_tls_set_bridge,
-        vp_sdk_lock,vp_sdk_unlock,vp_sdk_try_lock,vp_sdk_is_locked};
+        vp_sdk_lock,vp_sdk_unlock,vp_sdk_try_lock,vp_sdk_is_locked,
+        vp_sdk_video_readback};
     const unsigned count=sizeof(entries)/sizeof(entries[0]);
     _Static_assert(sizeof(entries)/sizeof(entries[0])==sizeof(vp_sdk_dso_patches)/sizeof(vp_sdk_dso_patches[0]),"patch contract count");
     for (unsigned i=0;i<count;++i) {
@@ -471,6 +556,7 @@ int vp_sdk_dso_patch(FILE *log,VPNativeModule modules[4]) {
     }
     fflush(log);return rc;
 }
+VP_SDK_INTEGER_ONLY
 static int writable(const VPExecutor *e,const Session *s,uint32_t p,uint32_t bytes) {
     if (p>=e->stack_base+4096 && p<=e->stack_base+e->stack_bytes-bytes) return 1;
     for (unsigned i=0;i<4;++i) {
@@ -486,11 +572,30 @@ static int writable(const VPExecutor *e,const Session *s,uint32_t p,uint32_t byt
      * svcSetMemoryHeapSize, so bridge-side memory checks must accept them. */
     return vp_guest_svc_writable(&s->svc, p, bytes);
 }
+VP_SDK_INTEGER_ONLY
+static int session_enter(Session *s) {
+    if (s->session_kernel) return sceKernelLockMutex(s->state_lock,1,NULL);
+    return vp_session_gate_enter(&s->state_gate,host_tls());
+}
+VP_SDK_INTEGER_ONLY
+static int session_leave(Session *s) {
+    if (s->session_kernel) return sceKernelUnlockMutex(s->state_lock,1);
+    return vp_session_gate_leave(&s->state_gate,host_tls());
+}
+static _Noreturn void session_failure(Session *s,const char *operation,int rc) {
+    fprintf(s->log,"SDK_SESSION_LOCK_FATAL operation=%s backend=%s status=%d action=process-exit\n",
+        operation,s->session_kernel?"kernel-mutex":"user-gate",rc);
+    fflush(s->log);
+    sceKernelExitProcess(rc);
+    __builtin_trap(); /* A failed exit must never resume without the lock. */
+}
 static void state_lock(Session *s) {
-    if (s->state_lock >= 0) sceKernelLockMutex(s->state_lock, 1, NULL);
+    int rc=session_enter(s);
+    if (rc) session_failure(s,"enter",rc);
 }
 static void state_unlock(Session *s) {
-    if (s->state_lock >= 0) sceKernelUnlockMutex(s->state_lock, 1);
+    int rc=session_leave(s);
+    if (rc) session_failure(s,"leave",rc);
 }
 /* A service that parks must drop the session lock so the signaller can run.
  * While it is parked another dispatch may rewrite the ambient thread identity
@@ -522,6 +627,53 @@ static void device_wait_end(void *user,const uint32_t token[2]) {
     s->svc.current_thread_handle=token[0];
     s->svc.tls_buffer=token[1];
 }
+VP_SDK_INTEGER_ONLY
+static unsigned sdk_lock_index(Session *s,uint32_t address) {
+    unsigned hash=(address>>2)&63u;
+    unsigned hint=s->lock_hint[hash];
+    if (hint && hint<=VP_SDK_LOCK_LIMIT && s->locks[hint-1u].address==address)
+        return hint-1u;
+    unsigned i=0;
+    while (i<VP_SDK_LOCK_LIMIT && s->locks[i].address && s->locks[i].address!=address) ++i;
+    if (i<VP_SDK_LOCK_LIMIT && s->locks[i].address==address)
+        s->lock_hint[hash]=i+1u;
+    return i;
+}
+
+/* The caller pins the slot with pending before any park. A nonblocking probe
+ * under the session lock is safe only when no other acquisition is in flight. */
+static int sdk_lock_acquire(Session *s,Lock *lock,unsigned *waited) {
+    int rc=(int)SCE_KERNEL_ERROR_MUTEX_FAILED_TO_OWN;
+    *waited=0;
+    if (!lock->depth && lock->pending==1u) {
+        rc=sceKernelTryLockMutex(lock->id,1);
+        if (rc!=(int)SCE_KERNEL_ERROR_MUTEX_FAILED_TO_OWN) return rc;
+    }
+    /* This clock enforces the contention budget, not a performance probe.
+     * The uncontended return above never reads it. */
+    uint64_t spin_started=sceKernelGetProcessTimeWide();
+    for (unsigned attempt=0;attempt<256u;++attempt) {
+        VPPark park;
+        park_begin(s,&park);
+        rc=sceKernelTryLockMutex(lock->id,1);
+        park_end(s,&park);
+        if (rc!=(int)SCE_KERNEL_ERROR_MUTEX_FAILED_TO_OWN) return rc;
+        if (sceKernelGetProcessTimeWide()-spin_started>=1000u) break;
+    }
+    while (*waited<VP_SDK_LOCK_BLOCK_LIMIT_US) {
+        unsigned slice=VP_SDK_LOCK_SLICE_US;
+        VPPark park;
+        park_begin(s,&park);
+        rc=sceKernelLockMutex(lock->id,1,&slice);
+        park_end(s,&park);
+        if (rc!=(int)SCE_KERNEL_ERROR_WAIT_TIMEOUT) return rc;
+        /* The kernel may overwrite slice with remaining time; count the
+         * requested timeout, otherwise repeated zero remainders never expire. */
+        *waited+=VP_SDK_LOCK_SLICE_US;
+    }
+    return VP_SDK_LOCK_DEADLOCK;
+}
+
 static int create_guest_thread(Session *,VPBridgeFrame *);
 static int start_guest_thread(Session *,VPBridgeFrame *);
 static int exit_guest_thread(Session *,VPExecutor *,VPBridgeFrame *);
@@ -529,8 +681,179 @@ static int sleep_guest_thread(Session *,VPBridgeFrame *);
 static int thread_service(Session *,VPExecutor *,VPBridgeFrame *);
 static VPSdkTlsValues *tls_values_for(Session *,VPExecutor *);
 static VPGuestThread *thread_for_executor(VPExecutor *);
+
+/* This AAPCS boundary runs on the guest stack without a saved VFP frame.
+ * Keep it integer-only. Acquire Session in the same order as dispatch; no
+ * guest mutex is acquired before this wait. Existing slots still require
+ * current writable memory; first use and guest-lock contention use dispatch. */
+_Static_assert(offsetof(VPHostBridge,user)==28,"fast lock bridge user ABI");
+VP_SDK_INTEGER_ONLY
+int vp_sdk_lock_fast(uint32_t address,VPExecutor *e,uint32_t service) {
+    if (!e || e->user!=&session || session.state_lock<0 || !session.fast_enabled) {
+        __sync_fetch_and_add(&session.fast_miss[0],1u);
+        return 0;
+    }
+    Session *s=&session;
+    int rc=session_enter(s);
+    if (rc) {
+        __sync_fetch_and_add(&s->fast_miss[1],1u);
+        return rc;
+    }
+    int result=0;
+    if (s->stopping || (address&3u)) goto done;
+    VPGuestThread *thread=thread_for_executor(e);
+    uint32_t owner;
+    if (thread && thread->handle) owner=thread->handle;
+    else if (e==s->main_executor) owner=s->start_handle?s->start_handle:1u;
+    else { ++s->fast_miss[2];goto done; }
+    unsigned i=sdk_lock_index(s,address);
+    if (i>=VP_SDK_LOCK_LIMIT || s->locks[i].address!=address) {
+        ++s->fast_miss[3];goto done;
+    }
+    if (!writable(e,s,address,4u)) { ++s->fast_miss[4];goto done; }
+    Lock *lock=&s->locks[i];
+    if (service==0x246u) {
+        result=lock->depth && lock->owner==owner?1:2;
+        ++s->fast_islocked;
+    } else if (service==0x232u || service==0x245u) {
+        if (lock->depth && lock->owner==owner) {
+            ++lock->depth;
+            result=1;
+        } else if (!lock->depth && !lock->pending) {
+            rc=sceKernelTryLockMutex(lock->id,1);
+            if (!rc) {
+                lock->owner=owner;lock->depth=1;lock->host_depth=1;lock->held=1;
+                /* A fast acquisition has no hold-time probe. Diagnostics
+                 * cover only holds whose enter and leave both use dispatch. */
+                lock->held_since_us=0;
+                result=1;
+            } else if (rc!=(int)SCE_KERNEL_ERROR_MUTEX_FAILED_TO_OWN) {
+                result=rc;
+            }
+        }
+        if (result>0) {
+            if (result==1) ++s->lock_calls;
+            if (service==0x232u) ++s->fast_enter;
+            else ++s->fast_try;
+        }
+    } else if (service==0x233u && lock->depth && lock->owner==owner) {
+        if (lock->depth>1u) {
+            --lock->depth;result=1;
+        } else {
+            rc=sceKernelUnlockMutex(lock->id,1);
+            if (!rc) {
+                lock->owner=0;lock->depth=0;lock->host_depth=0;lock->held=0;
+                lock->held_since_us=0;result=1;
+            } else result=rc;
+        }
+        if (result==1) { ++s->unlock_calls;++s->fast_leave; }
+    }
+done:
+    if (!result) ++s->fast_miss[5];
+    rc=session_leave(s);
+    return rc?rc:result;
+}
+
+static int movie_color_probe_service(Session *s,VPExecutor *e,VPBridgeFrame *f) {
+    if (!movie_color_probe_enabled) return VP_BRIDGE_UNSUPPORTED;
+    VPGuestThread *thread=thread_for_executor(e);
+    unsigned slot;
+    if (e==s->main_executor) slot=0;
+    else if (thread && thread->handle) slot=1u+(unsigned)(thread-thread_pool.threads);
+    else return VP_BRIDGE_ARGUMENT;
+    VPMovieColorTiming *timing=&s->movie_color[slot];
+    unsigned mode=f->service<0x24eu?1u:2u;
+    if (!(f->service&1u)) {
+        uint32_t object=f->regs[0];
+        if (timing->mode || object>UINT32_MAX-0x44u
+            || !vp_guest_svc_readable(&s->svc,object+0x3cu,8u)) return VP_BRIDGE_ARGUMENT;
+        uint32_t width=word((void *)(uintptr_t)(object+0x3cu));
+        uint32_t height=word((void *)(uintptr_t)(object+0x40u));
+        if (mode==1u) {
+            f->lr=height; /* Displaced LDR lr,[r0,#0x40]. */
+            f->pc=e->modules[2].base+0x33c4f8u;
+        } else {
+            if (f->sp>UINT32_MAX-12u || !writable(e,s,f->sp+12u,4u)) return VP_BRIDGE_ARGUMENT;
+            memcpy((void *)(uintptr_t)(f->sp+12u),&f->regs[1],4u);
+            f->pc=e->modules[2].base+0x33c6a4u;
+        }
+        timing->mode=mode;timing->width=width;timing->height=height;
+        timing->destination=f->regs[1];timing->source_y=f->regs[2];timing->source_uv=f->regs[3];
+        timing->started_us=sceKernelGetProcessTimeWide();
+    } else {
+        uint64_t ended_us=sceKernelGetProcessTimeWide();
+        uint32_t output=mode==1u?f->regs[1]:f->regs[9];
+        if (timing->mode!=mode || !writable(e,s,output,4u)) return VP_BRIDGE_ARGUMENT;
+        memcpy((void *)(uintptr_t)output,&f->regs[0],4u);
+        f->pc=e->modules[2].base+(mode==1u?0x33c67cu:0x33c86cu);
+        unsigned n=++s->movie_color_samples;
+        if (n<=2000u || n%32u==0u) {
+            fprintf(s->log,"VP_MOVIE_COLOR_TIME n=%u mode=%s thread=0x%x width=%u height=%u "
+                "destination=0x%08x source_y=0x%08x source_uv=0x%08x bytes=%u "
+                "elapsed_us=%llu entry_us=%llu t_us=%llu\n",
+                n,mode==1u?"rgb":"nv12",s->svc.current_thread_handle,timing->width,timing->height,
+                timing->destination,timing->source_y,timing->source_uv,f->regs[0],
+                (unsigned long long)(ended_us-timing->started_us),
+                (unsigned long long)timing->started_us,(unsigned long long)ended_us);
+        }
+        timing->mode=0;timing->started_us=0;
+    }
+    return 0;
+}
+
 static int dispatch_locked(VPExecutor *e,VPBridgeFrame *f) {
     Session *s=e->user;
+    if (f->service>=0x24cu && f->service<=0x24fu) return movie_color_probe_service(s,e,f);
+    if (f->service==0x24bu) {
+        int32_t error=(int32_t)f->regs[0];
+        fprintf(s->log,"SDK_LOCK_FAST_ERROR status=0x%08x lr=0x%08x thread=0x%08x\n",
+            (uint32_t)error,f->lr,s->svc.current_thread_handle);
+        fflush(s->log);
+        return error<0?error:VP_BRIDGE_ARGUMENT;
+    }
+    if (f->service==0x24a) {
+        /* ReadStrided has already resolved its SDK object. At +0x108 r0 is
+         * that object, r1 is the row count, r7 is row bytes, r6 the source
+         * offset, r4 the destination; local sp+4/+8 hold the two strides.
+         * Preserve the original failure and partial-copy paths by resuming
+         * the displaced LDR and loop whenever the CPU-output copy declines. */
+        const uint32_t object=f->regs[0];
+        if (!vp_guest_svc_readable(&s->svc,object,0x40u)
+            || !vp_guest_svc_readable(&s->svc,f->sp+4u,8u)) return VP_BRIDGE_ARGUMENT;
+        const uint32_t bytes=word((const unsigned char *)(uintptr_t)object+0x3cu);
+        const uint32_t source=word((const unsigned char *)(uintptr_t)object+0x38u);
+        const uint32_t dst_stride=word((const unsigned char *)(uintptr_t)f->sp+4u);
+        const uint32_t src_stride=word((const unsigned char *)(uintptr_t)f->sp+8u);
+        const uint64_t span=f->regs[1]
+            ? (uint64_t)(f->regs[1]-1u)*src_stride+f->regs[7] : 0u;
+        const uint64_t start=(uint64_t)source+f->regs[6];
+        if (f->regs[6]<=bytes && span<=bytes-f->regs[6] && start<=UINT32_MAX
+            && vp_media_video_readback(&s->svc,(uint32_t)start,src_stride,
+                f->regs[4],dst_stride,f->regs[7],f->regs[1])) {
+            if (movie_color_probe_enabled && s->movie_readback_stacks<4u) {
+                unsigned n=++s->movie_readback_stacks;
+                fprintf(s->log,"VP_MOVIE_READBACK_STACK n=%u thread=0x%x sp=0x%08x lr=0x%08x "
+                    "saved_fp_offset=48 saved_lr_offset=52\n",n,s->svc.current_thread_handle,f->sp,f->lr);
+                fprintf(s->log,"VP_MOVIE_READBACK_REGS n=%u",n);
+                for (unsigned reg=0;reg<13u;++reg) fprintf(s->log," r%u=0x%08x",reg,f->regs[reg]);
+                fputc('\n',s->log);
+                fprintf(s->log,"VP_MOVIE_READBACK_WORDS n=%u",n);
+                for (unsigned offset=0;offset<512u;offset+=4u) {
+                    if (f->sp<=UINT32_MAX-offset
+                        && vp_guest_svc_readable(&s->svc,f->sp+offset,4u)) {
+                        uint32_t value=word((void *)(uintptr_t)(f->sp+offset));
+                        fprintf(s->log," +0x%03x=0x%08x",offset,value);
+                    } else fprintf(s->log," +0x%03x=unreadable",offset);
+                }
+                fputc('\n',s->log);fflush(s->log);
+            }
+            f->pc=e->modules[3].base+0x2a1f50u;
+        } else {
+            f->regs[11]=bytes; /* displaced LDR fp,[r0,#0x3c] */
+            f->pc=e->modules[3].base+0x2a1edcu;
+        }
+        return 0;
+    }
     if (f->service==0x304) { /* MapMemory: alias-stack calls and arena state */
         static int reported;
         uint32_t base=e->modules[1].base;
@@ -653,9 +976,10 @@ static int dispatch_locked(VPExecutor *e,VPBridgeFrame *f) {
         f->regs[0]=(uint32_t)rc;return 0;
     }
     if (f->service==0x232 || f->service==0x233 || f->service==0x245 || f->service==0x246) {
-        uint32_t address=f->regs[0];unsigned i=0;
+        ++s->fast_fallback;
+        uint32_t address=f->regs[0];
         if (!writable(e,s,address,4) || (address&3)) return -141;
-        while (i<VP_SDK_LOCK_LIMIT && s->locks[i].address && s->locks[i].address!=address) ++i;
+        unsigned i=sdk_lock_index(s,address);
         if (f->service==0x246) {
             f->regs[0]=i<VP_SDK_LOCK_LIMIT && s->locks[i].address && s->locks[i].depth
                 && s->locks[i].owner==s->svc.current_thread_handle;
@@ -672,7 +996,7 @@ static int dispatch_locked(VPExecutor *e,VPBridgeFrame *f) {
             for (unsigned scan=0;scan<VP_SDK_LOCK_LIMIT;++scan) {
                 unsigned r=(s->lock_cursor+scan)%VP_SDK_LOCK_LIMIT;
                 Lock *slot=&s->locks[r];
-                if (!slot->address || slot->depth || slot->pending || slot->held || slot->owner) continue;
+                if (!slot->address || slot->depth || slot->host_depth || slot->pending || slot->held || slot->owner) continue;
                 unsigned previous=slot->address;
                 slot->address=address;
                 s->lock_cursor=(r+1)%VP_SDK_LOCK_LIMIT;
@@ -706,19 +1030,24 @@ static int dispatch_locked(VPExecutor *e,VPBridgeFrame *f) {
             lock->address=address;
             fprintf(s->log,"SDK_LOCK_NEW index=%u address=0x%08x\n",i,address);fflush(s->log);
         }
+        s->lock_hint[(address>>2)&63u]=i+1u;
         int rc;
         if (f->service==0x245) {
+            uint32_t owner=s->svc.current_thread_handle;
+            if (lock->depth && lock->owner==owner) {
+                ++lock->depth;++s->lock_calls;f->regs[0]=1;return 0;
+            }
             rc=sceKernelTryLockMutex(lock->id,1);
             if (!rc) {
-                uint32_t owner=s->svc.current_thread_handle;
                 if (!lock->depth) {
                     lock->owner=owner;
+                    lock->host_depth=1;
                     lock->held_since_us=svc_arrival_enabled()
                         ?sceKernelGetProcessTimeWide():0u;
                 }
                 ++lock->depth;lock->held=1;++s->lock_calls;f->regs[0]=1;
             }
-            else if (rc==(int)SCE_KERNEL_ERROR_MUTEX_FAILED_TO_OWN || rc==(int)SCE_KERNEL_ERROR_MUTEX_RECURSIVE) { f->regs[0]=0;rc=0; }
+            else if (rc==(int)SCE_KERNEL_ERROR_MUTEX_FAILED_TO_OWN) { f->regs[0]=0;rc=0; }
         } else if (f->service==0x232) {
             /* A blocking Enter must not hold the session lock: the current
              * owner needs it to reach Leave. B126: a waiter stays queued on
@@ -730,35 +1059,28 @@ static int dispatch_locked(VPExecutor *e,VPBridgeFrame *f) {
              * wake-up authoritative; the total cap still reports a real
              * deadlock instead of hanging the session. */
             uint32_t owner=s->svc.current_thread_handle;
+            if (lock->depth && lock->owner==owner) {
+                ++lock->depth;++s->lock_calls;return 0;
+            }
             unsigned waited=0;
             if (lock->depth && address>=e->modules[3].base+0x86ec00u && address<e->modules[3].base+0x86ee00u)
                 fprintf(s->log,"SDK_APPLET_LOCK_WAIT address=0x%08x owner=0x%08x depth=%u thread=0x%08x\n",
                     address,lock->owner,lock->depth,owner);
             ++lock->pending;
-            VPPark lock_park;
-            uint64_t lock_started=sceKernelGetProcessTimeWide();
+            uint64_t lock_started=svc_arrival_enabled()?sceKernelGetProcessTimeWide():0u;
             uint32_t holder_before=lock->owner;
-            for (;;) {
-                unsigned slice=VP_SDK_LOCK_SLICE_US;
-                park_begin(s,&lock_park);
-                rc=sceKernelLockMutex(lock->id,1,&slice);
-                park_end(s,&lock_park);
-                if (!rc) break;
-                if (rc!=(int)SCE_KERNEL_ERROR_WAIT_TIMEOUT) {
-                    --lock->pending;
-                    fprintf(s->log,"SDK_LOCK_ENTER_FAIL index=%u address=0x%08x owner=0x%08x thread=0x%08x depth=%u status=0x%08x\n",
-                        i,address,lock->owner,owner,lock->depth,(uint32_t)rc);
-                    fflush(s->log);return rc;
-                }
-                waited+=slice;
-                if (waited>=VP_SDK_LOCK_BLOCK_LIMIT_US) {
-                    --lock->pending;
+            rc=sdk_lock_acquire(s,lock,&waited);
+            --lock->pending;
+            if (rc) {
+                if (rc==VP_SDK_LOCK_DEADLOCK) {
                     fprintf(s->log,"SDK_LOCK_ENTER_TIMEOUT index=%u address=0x%08x owner=0x%08x thread=0x%08x depth=%u waited_us=%u model=host-mutex\n",
                         i,address,lock->owner,owner,lock->depth,waited);
-                    fflush(s->log);return VP_SDK_LOCK_DEADLOCK;
+                } else {
+                    fprintf(s->log,"SDK_LOCK_ENTER_FAIL index=%u address=0x%08x owner=0x%08x thread=0x%08x depth=%u status=0x%08x\n",
+                        i,address,lock->owner,owner,lock->depth,(uint32_t)rc);
                 }
+                fflush(s->log);return rc;
             }
-            --lock->pending;
             /* B125: record real contention separately from ordinary immediate
              * acquisition; the wait runs under a host mutex timeout slice, so
              * the measured process-time delta is the blocking time. */
@@ -767,7 +1089,7 @@ static int dispatch_locked(VPExecutor *e,VPBridgeFrame *f) {
                 if (waited_us>=20000u) {
                     ++g_sdk_lock_wait_lines;
                     fprintf(s->log,"VP_SDK_LOCK_TIME address=0x%08x thread=0x%x holder_at_wait=0x%x owner=0x%x waited_us=%llu depth=%u slots=%u\n",
-                        address,lock_park.thread,holder_before,lock->owner,
+                        address,owner,holder_before,lock->owner,
                         (unsigned long long)waited_us,lock->depth,
                         (unsigned)s->lock_calls);
                     fflush(s->log);
@@ -775,6 +1097,7 @@ static int dispatch_locked(VPExecutor *e,VPBridgeFrame *f) {
             }
             if (!lock->depth) {
                 lock->owner=owner;
+                lock->host_depth=1;
                 lock->held_since_us=svc_arrival_enabled()
                     ?sceKernelGetProcessTimeWide():0u;
             }
@@ -783,13 +1106,18 @@ static int dispatch_locked(VPExecutor *e,VPBridgeFrame *f) {
                 fprintf(s->log,"SDK_APPLET_LOCK_ENTER address=0x%08x thread=0x%08x waited_us=%u depth=%u\n",
                     address,owner,waited,lock->depth);
         } else {
-            rc=sceKernelUnlockMutex(lock->id,1);
+            if (lock->depth>1u && lock->owner==s->svc.current_thread_handle) {
+                --lock->depth;++s->unlock_calls;return 0;
+            }
+            rc=(!lock->depth || lock->owner!=s->svc.current_thread_handle)
+                ?(int)SCE_KERNEL_ERROR_MUTEX_NOT_OWNED:sceKernelUnlockMutex(lock->id,1);
             if (!rc) {
                 uint64_t held_us=lock->held_since_us&&svc_arrival_enabled()
                     ?sceKernelGetProcessTimeWide()-lock->held_since_us:0u;
                 if (lock->depth) --lock->depth;
                 if (!lock->depth) {
                     lock->owner=0;
+                    lock->host_depth=0;
                     if (held_us>=50000u && g_sdk_hold_lines<4000u) {
                         ++g_sdk_hold_lines;
                         fprintf(s->log,"VP_SDK_LOCK_HOLD address=0x%08x thread=0x%x hold_us=%llu\n",
@@ -839,7 +1167,8 @@ typedef struct {
     uint64_t sleep_us, key_us, lock_us, wait_us, ipc_us, timer_us;
 } VPSvcArrival;
 
-static VPSvcArrival g_svc_arrivals[32];
+#define VP_SVC_ARRIVAL_LIMIT 64u
+static VPSvcArrival g_svc_arrivals[VP_SVC_ARRIVAL_LIMIT];
 static unsigned g_svc_arrival_lines, g_svc_arrival_stacks;
 static unsigned g_svc_slow_lines, g_svc_key_lines;
 static uint64_t g_svc_summary_last;
@@ -869,7 +1198,7 @@ static void svc_activity_flush(Session *s, uint64_t now) {
     if (!g_svc_summary_last) { g_svc_summary_last = now; return; }
     if (now - g_svc_summary_last < 1000000u) return;
     g_svc_summary_last = now;
-    for (unsigned i = 0; i < 32u; ++i) {
+    for (unsigned i = 0; i < VP_SVC_ARRIVAL_LIMIT; ++i) {
         VPSvcArrival *a = &g_svc_arrivals[i];
         if (!a->handle || !a->calls) continue;
         fprintf(s->log,"VP_THREAD_ACT thread=0x%x calls=%u busy_us=%llu max_us=%llu "
@@ -897,12 +1226,12 @@ static int svc_arrival_enabled(void) {
 }
 
 static VPSvcArrival *svc_arrival_slot(uint32_t handle) {
-    unsigned spare=32u;
-    for (unsigned i=0;i<32u;++i) {
+    unsigned spare=VP_SVC_ARRIVAL_LIMIT;
+    for (unsigned i=0;i<VP_SVC_ARRIVAL_LIMIT;++i) {
         if (g_svc_arrivals[i].handle==handle) return &g_svc_arrivals[i];
-        if (!g_svc_arrivals[i].handle && spare==32u) spare=i;
+        if (!g_svc_arrivals[i].handle && spare==VP_SVC_ARRIVAL_LIMIT) spare=i;
     }
-    if (spare==32u) return NULL;
+    if (spare==VP_SVC_ARRIVAL_LIMIT) return NULL;
     g_svc_arrivals[spare].handle=handle;
     return &g_svc_arrivals[spare];
 }
@@ -1059,6 +1388,10 @@ static int dispatch(VPExecutor *e,VPBridgeFrame *f) {
                 s->main_heart_tick=now;
                 fprintf(s->log,"SVC_MAIN_HEART us=%llu service=0x%x sp=0x%08x pc=0x%08x lr=0x%08x\n",
                     (unsigned long long)now,f->service,f->sp,f->pc,f->lr);
+                fprintf(s->log,"VP_SDK_LOCK_FAST enter=%u leave=%u try=%u islocked=%u fallback=%u hold_trace=slow-enter-and-leave-only\n",
+                    s->fast_enter,s->fast_leave,s->fast_try,s->fast_islocked,s->fast_fallback);
+                fprintf(s->log,"VP_SDK_LOCK_FAST_MISS context=%u session_error=%u owner=%u slot=%u permission=%u contention=%u\n",
+                    s->fast_miss[0],s->fast_miss[1],s->fast_miss[2],s->fast_miss[3],s->fast_miss[4],s->fast_miss[5]);
                 unsigned queues=0,presents=0;
                 for (unsigned i=0;i<VP_GUEST_HANDLE_LIMIT;++i) {
                     const VPGuestHandle *h=&s->svc.handles[i];
@@ -1423,6 +1756,7 @@ int vp_sdk_thread_pool_prepare(VPNativeModule *modules,unsigned count,FILE *log)
     fflush(log);
     return 0;
 }
+VP_SDK_INTEGER_ONLY
 static VPGuestThread *thread_for_executor(VPExecutor *e) {
     if (!thread_pool.prepared || !e) return NULL;
     for (unsigned i=0;i<VP_GUEST_THREAD_LIMIT;++i)
@@ -1543,6 +1877,43 @@ static int create_guest_thread(Session *s,VPBridgeFrame *f) {
     t->wait_cancel_requested=0;t->wait_cancellable=0;
     t->entry=f->regs[1];t->arg=f->regs[2];t->type=f->regs[2];
     t->priority=f->regs[0];t->core=f->regs[4];
+    /* ThreadType stores the title entry/argument at +0x38/+0x34 and the debug
+     * name pointer at +0xe8. Logging them is the only way to relate the SVC
+     * entry trampoline to the title's own thread functions. Read-only; the
+     * fields are checked before use and never modified. */
+    {
+        if (thread_probe_enabled<0) {
+            FILE *m=fopen("ux0:data/mhgu-vita-port/thread-probe.enable","rb");
+            thread_probe_enabled=m!=NULL;
+            if (m) fclose(m);
+            fprintf(s->log,"THREAD_PROBE_MODE enabled=%d\n",thread_probe_enabled);
+        }
+        if (thread_probe_enabled) {
+            uint32_t user_entry=0,user_arg=0,name_ptr=0;
+            char name[33];
+            name[0]=0;
+            if (vp_guest_svc_readable(&s->svc,t->arg+0x38,4))
+                user_entry=*(const uint32_t *)(uintptr_t)(t->arg+0x38);
+            if (vp_guest_svc_readable(&s->svc,t->arg+0x34,4))
+                user_arg=*(const uint32_t *)(uintptr_t)(t->arg+0x34);
+            if (vp_guest_svc_readable(&s->svc,t->arg+0xe8,4))
+                name_ptr=*(const uint32_t *)(uintptr_t)(t->arg+0xe8);
+            if (name_ptr && vp_guest_svc_readable(&s->svc,name_ptr,1)) {
+                for (unsigned i=0;i<32u;++i) {
+                    if (!vp_guest_svc_readable(&s->svc,name_ptr+i,1)) break;
+                    char c=*(const char *)(uintptr_t)(name_ptr+i);
+                    name[i]=c;
+                    if (!c) break;
+                    name[i]=(c>=32&&c<127)?c:'?';
+                    name[i+1]=0;
+                }
+                name[32]=0;
+            }
+            fprintf(s->log,"SDK_THREAD_USER handle=0x%08x sdk_entry=0x%08x user_entry=0x%08x user_arg=0x%08x name_ptr=0x%08x name=\"%s\"\n",
+                handle,t->entry,user_entry,user_arg,name_ptr,name);
+            fflush(s->log);
+        }
+    }
     t->alias_dst=0;t->alias_size=0;t->entry_slot_word=0;t->alias_valid=0;
     /* CreateThread maps the alias stack immediately before issuing SVC 8, and
      * the SDK writes the entry thunk before that call. Associate the newest
@@ -1579,6 +1950,54 @@ static int worker_entry(SceSize args,void *argp) {
     (void)args;
     VPGuestThread *t=*(VPGuestThread **)argp;
     Session *s=&session;
+    uint32_t user_entry=0,user_arg=0,name_ptr=0;
+    char name[33];
+    name[0]=0;
+    if (vp_guest_svc_readable(&s->svc,t->arg+0x38,4))
+        user_entry=*(const uint32_t *)(uintptr_t)(t->arg+0x38);
+    if (vp_guest_svc_readable(&s->svc,t->arg+0x34,4))
+        user_arg=*(const uint32_t *)(uintptr_t)(t->arg+0x34);
+    if (vp_guest_svc_readable(&s->svc,t->arg+0xe8,4))
+        name_ptr=*(const uint32_t *)(uintptr_t)(t->arg+0xe8);
+    if (name_ptr && vp_guest_svc_readable(&s->svc,name_ptr,1)) {
+        for (unsigned i=0;i<32u;++i) {
+            if (!vp_guest_svc_readable(&s->svc,name_ptr+i,1)) break;
+            char c=*(const char *)(uintptr_t)(name_ptr+i);
+            if (!c) break;
+            name[i]=(c>=32&&c<127)?c:'?';
+            name[i+1]=0;
+        }
+        name[32]=0;
+    }
+    /* The movie controller must be known even when the verbose thread probe
+     * is off: the native presentation uses it to request the title's own stop
+     * command. These reads are bounds-checked and never modify guest state. */
+    if (!strcmp(name,"uMovie::PlayerThread")
+        && vp_guest_svc_readable(&s->svc,user_arg,4)) {
+        vp_movie_umovie_thread=user_arg;
+        if (vp_guest_svc_readable(&s->svc,user_arg+0x158,4))
+            vp_movie_umovie_state=*(const uint32_t *)(uintptr_t)(user_arg+0x158);
+        if (thread_probe_enabled>0) {
+            uint32_t vt=*(const uint32_t *)(uintptr_t)user_arg;
+            uint32_t m18=0,m1c=0,m20=0;
+            if (vt && vp_guest_svc_readable(&s->svc,vt+0x18,4))
+                m18=*(const uint32_t *)(uintptr_t)(vt+0x18);
+            if (vt && vp_guest_svc_readable(&s->svc,vt+0x1c,4))
+                m1c=*(const uint32_t *)(uintptr_t)(vt+0x1c);
+            if (vt && vp_guest_svc_readable(&s->svc,vt+0x20,4))
+                m20=*(const uint32_t *)(uintptr_t)(vt+0x20);
+            fprintf(s->log,"SDK_WORKER_VTABLE handle=0x%08x object=0x%08x vtable=0x%08x m18=0x%08x m1c=0x%08x m20=0x%08x\n",
+                t->handle,user_arg,vt,m18,m1c,m20);
+        }
+        fprintf(s->log,"VP_MOVIE_CONTROL thread=0x%08x state=0x%08x\n",
+            vp_movie_umovie_thread,vp_movie_umovie_state);
+    }
+    if (thread_probe_enabled>0) {
+        fprintf(s->log,"SDK_WORKER_USER handle=0x%08x user_entry=0x%08x user_arg=0x%08x name_ptr=0x%08x name=\"%s\"\n",
+            t->handle,user_entry,user_arg,name_ptr,name);
+    }
+    if (thread_probe_enabled>0) fflush(s->log);
+
     if (t->alias_valid) {
         uint32_t slot=t->alias_dst+t->alias_size-16;
         uint32_t now=t->entry_slot_word;
@@ -1697,32 +2116,15 @@ static int sleep_guest_thread(Session *s,VPBridgeFrame *f) {
     return 0;
 }
 static Lock *find_lock(Session *s,uint32_t address) {
-    for (unsigned i=0;i<VP_SDK_LOCK_LIMIT;++i)
-        if (s->locks[i].address==address) return &s->locks[i];
+    unsigned i=sdk_lock_index(s,address);
+    if (i<VP_SDK_LOCK_LIMIT && s->locks[i].address==address) return &s->locks[i];
     return NULL;
-}
-static void key_pending_add(Session *s,uint32_t key) {
-    for (unsigned i=0;i<s->key_pending_count;++i)
-        if (s->key_pending[i].key==key) { ++s->key_pending[i].count;return; }
-    if (s->key_pending_count<VP_KEY_PENDING_LIMIT) {
-        s->key_pending[s->key_pending_count].key=key;
-        s->key_pending[s->key_pending_count].count=1;
-        ++s->key_pending_count;
-    } else ++s->key_pending_lost;
-}
-static int key_pending_take(Session *s,uint32_t key) {
-    for (unsigned i=0;i<s->key_pending_count;++i) {
-        if (s->key_pending[i].key!=key) continue;
-        if (!--s->key_pending[i].count)
-            s->key_pending[i]=s->key_pending[--s->key_pending_count];
-        return 1;
-    }
-    return 0;
 }
 static int wait_guest_key(Session *s,VPBridgeFrame *f) {
     uint32_t address=f->regs[0],key=f->regs[1]&~3u,tag=f->regs[2];
     uint64_t ns=(uint64_t)f->regs[3]|((uint64_t)f->regs[4]<<32);
-    if ((address&3)||!vp_guest_svc_writable(&s->svc,address,4)) {
+    if ((address&3)||!vp_guest_svc_writable(&s->svc,address,4)
+        || !vp_guest_svc_writable(&s->svc,key,4)) {
         f->regs[0]=0xD401u;
         fprintf(s->log,"SVC_KEY_WAIT_REJECT address=0x%08x key=0x%08x\n",address,key);
         fflush(s->log);return 0;
@@ -1740,16 +2142,6 @@ static int wait_guest_key(Session *s,VPBridgeFrame *f) {
         fprintf(s->log,"SVC_KEY_WAIT_CREATE status=%d\n",(int)w->event);fflush(s->log);return 0;
     }
     w->key=key;w->address=address;w->tag=tag;w->used=1;w->signaled=0;++s->key_waits_live;
-    /* A signal that arrived while no thread was parked was recorded on the
-     * key. Under the session lock this check races with nothing: either the
-     * signal saw this waiter or this waiter sees the pending record. */
-    if (key_pending_take(s,key)) {
-        w->signaled=1;
-        sceKernelSetEventFlag(w->event,1);
-        fprintf(s->log,"SVC_KEY_WAIT_PENDING address=0x%08x key=0x%08x tag=0x%08x thread=0x%08x\n",
-            address,key,tag,s->svc.current_thread_handle);
-        fflush(s->log);
-    }
     /* svcWaitProcessWideKeyAtomic releases the arbitrated critical section
      * registered on [address] as part of the wait. Enter/Leave are native
      * host-mutex services here, so drop this thread's recursion depth before
@@ -1763,16 +2155,19 @@ static int wait_guest_key(Session *s,VPBridgeFrame *f) {
     Lock *pinned=NULL;
     if (lock && lock->depth && lock->owner==owner) {
         pinned=lock;++pinned->pending;
-        while (lock->depth) {
-            int urc=sceKernelUnlockMutex(lock->id,1);
-            if (urc) {
-                fprintf(s->log,"SVC_KEY_WAIT_UNLOCK_FAIL address=0x%08x depth=%u status=0x%08x\n",
-                    address,lock->depth,(uint32_t)urc);
-                fflush(s->log);break;
-            }
-            --lock->depth;++released;
+        int urc=sceKernelUnlockMutex(lock->id,1);
+        if (urc) {
+            fprintf(s->log,"SVC_KEY_WAIT_UNLOCK_FAIL address=0x%08x depth=%u status=0x%08x\n",
+                address,lock->depth,(uint32_t)urc);
+            fflush(s->log);
+            sceKernelDeleteEventFlag(w->event);
+            w->used=0;w->signaled=0;--s->key_waits_live;
+            --pinned->pending;
+            return urc;
         }
-        if (!lock->depth) { lock->held=0;lock->owner=0; }
+        released=lock->depth;
+        lock->depth=0;lock->host_depth=0;lock->held=0;lock->owner=0;
+        lock->held_since_us=0;
     } else if (lock && lock->depth) {
         fprintf(s->log,"SVC_KEY_WAIT_OWNER address=0x%08x owner=0x%08x thread=0x%08x depth=%u model=host-mutex\n",
             address,lock->owner,owner,lock->depth);
@@ -1780,7 +2175,12 @@ static int wait_guest_key(Session *s,VPBridgeFrame *f) {
     }
     /* The Horizon kernel writes the next owner tag (zero when the chain is
      * empty) before blocking. This platform has no tag handoff chain. */
-    uint32_t next=0;memcpy((void *)(uintptr_t)address,&next,4);
+    /* Registration, release and the key flag are serialized with Signal by
+     * Session. Only the event of this registered waiter may retain a wake;
+     * a signal before registration grants no credit to a future waiter. */
+    uint32_t has_waiter=1,next=0;
+    memcpy((void *)(uintptr_t)key,&has_waiter,4);
+    memcpy((void *)(uintptr_t)address,&next,4);
     int rc=0;
     SceUInt us=0,*timeout=NULL;
     if ((int64_t)ns>0) {
@@ -1836,18 +2236,14 @@ static int wait_guest_key(Session *s,VPBridgeFrame *f) {
     unsigned reacquired=0;
     if (!rc && released) {
         unsigned waited=0;
-        VPPark relock_park;
-        while (reacquired<released) {
-            unsigned slice=VP_SDK_LOCK_SLICE_US;int arc;
-            park_begin(s,&relock_park);
-            arc=sceKernelLockMutex(lock->id,1,&slice);
-            park_end(s,&relock_park);
-            if (!arc) { ++reacquired;++lock->depth;continue; }
-            if (arc!=(int)SCE_KERNEL_ERROR_WAIT_TIMEOUT) { reacquire_error=arc;break; }
-            waited+=slice;
-            if (waited>=VP_SDK_LOCK_BLOCK_LIMIT_US) { reacquire_error=VP_SDK_LOCK_DEADLOCK;break; }
+        int arc=sdk_lock_acquire(s,lock,&waited);
+        if (!arc) {
+            lock->depth=released;lock->host_depth=1;lock->held=1;lock->owner=owner;
+            lock->held_since_us=svc_arrival_enabled()?sceKernelGetProcessTimeWide():0u;
+            reacquired=released;
+        } else {
+            reacquire_error=arc;
         }
-        if (lock->depth) { lock->held=1;lock->owner=owner; }
         if (reacquired!=released)
             fprintf(s->log,"SVC_KEY_WAIT_RELOCK address=0x%08x released=%u reacquired=%u depth=%u status=0x%08x\n",
                 address,released,reacquired,lock->depth,(uint32_t)reacquire_error);
@@ -1889,23 +2285,33 @@ static int wait_guest_key(Session *s,VPBridgeFrame *f) {
 }
 static int signal_guest_key(Session *s,VPBridgeFrame *f) {
     uint32_t key=f->regs[0]&~3u;int32_t count=(int32_t)f->regs[1];
+    if (!vp_guest_svc_writable(&s->svc,key,4)) {
+        f->regs[0]=0xD401u;
+        fprintf(s->log,"SVC_KEY_SIGNAL_REJECT key=0x%08x\n",key);
+        fflush(s->log);return 0;
+    }
     unsigned woke=0;
+    int rc=0;
     for (unsigned i=0;i<VP_KEY_WAIT_LIMIT && (count<=0 || woke<(unsigned)count);++i) {
         KeyWait *w=&s->key_waits[i];
         if (!w->used || w->signaled || w->key!=key) continue;
+        rc=sceKernelSetEventFlag(w->event,1);
+        if (rc) break;
         w->signaled=1;
-        sceKernelSetEventFlag(w->event,1);
         ++woke;
     }
     ++s->key_signals;
-    /* No parked waiter: keep the signal for the next wait on this key so the
-     * condition-variable handshake cannot lose it to scheduling order. */
-    if (!woke) key_pending_add(s,key);
-    f->regs[0]=0;
-    fprintf(s->log,"SVC_KEY_SIGNAL key=0x%08x count=%d woke=%u live=%u thread=0x%08x caller=0x%08x\n",
-        key,(int)count,woke,s->key_waits_live,s->svc.current_thread_handle,f->lr);
+    uint32_t has_waiter=0;
+    for (unsigned i=0;i<VP_KEY_WAIT_LIMIT;++i) {
+        const KeyWait *w=&s->key_waits[i];
+        if (w->used && !w->signaled && w->key==key) { has_waiter=1;break; }
+    }
+    memcpy((void *)(uintptr_t)key,&has_waiter,4);
+    f->regs[0]=(uint32_t)rc;
+    fprintf(s->log,"SVC_KEY_SIGNAL key=0x%08x count=%d woke=%u live=%u thread=0x%08x caller=0x%08x status=0x%08x\n",
+        key,(int)count,woke,s->key_waits_live,s->svc.current_thread_handle,f->lr,(uint32_t)rc);
     fflush(s->log);
-    return 0;
+    return rc;
 }
 /* Diagnostic input-path probe. The marker-gated islands below enter this
  * service immediately after the title's per-style pad readers call
@@ -2206,26 +2612,57 @@ static int thread_service(Session *s,VPExecutor *e,VPBridgeFrame *f) {
     }
     return VP_NOT_HANDLED;
 }
-void vp_sdk_thread_pool_stop(FILE *log) {
-    unsigned running=0,killed=0;
+/* sceKernelDeleteThread accepts only dormant threads. Vita3K's
+ * sceKernelWaitThreadEnd ignores its timeout, so it cannot bound shutdown.
+ * Poll the exit status instead and stop the whole process rather than tear
+ * down the shared session semaphore or stacks under a live worker. */
+#define VP_THREAD_STOP_POLL_MS 1000u
+static int thread_wait_dormant(int host) {
+    for (unsigned i=0;i<VP_THREAD_STOP_POLL_MS;++i) {
+        int status=0;
+        int rc=sceKernelGetThreadExitStatus(host,&status);
+        if (!rc) return 0;
+        if (rc!=(int)SCE_KERNEL_ERROR_NOT_DORMANT) return rc;
+        sceKernelDelayThread(1000);
+    }
+    return SCE_KERNEL_ERROR_NOT_DORMANT;
+}
+static _Noreturn void thread_pool_fatal(FILE *log,const char *operation,
+                                        unsigned index,int host,int status) {
+    fprintf(log,"SDK_THREAD_POOL_FATAL operation=%s index=%u handle=0x%x status=%d action=process-exit\n",
+        operation,index,host,status);
+    fflush(log);
+    sceKernelExitProcess(-160);
+    __builtin_trap(); /* A failed exit must not free resources still in use. */
+}
+int vp_sdk_thread_pool_stop(FILE *log) {
+    unsigned running=0,exited=0,killed=0;
     for (unsigned i=0;i<VP_GUEST_THREAD_LIMIT;++i) {
         VPGuestThread *t=&thread_pool.threads[i];
-        if (t->state!=2) continue;
-        ++running;
-        if (t->host>=0) {
-            if (!sceKernelDeleteThread(t->host)) ++killed;
-            t->host=-1;
-        }
+        if (t->state==2) ++running;
+        if (t->host<0) continue;
+        if (t->state==3) ++exited;
+        int rc=thread_wait_dormant(t->host);
+        if (rc)
+            thread_pool_fatal(log,"wait-dormant",i,t->host,rc);
+        rc=sceKernelDeleteThread(t->host);
+        if (rc)
+            thread_pool_fatal(log,"delete",i,t->host,rc);
+        t->host=-1;
         t->state=3;
+        ++killed;
     }
-    fprintf(log,"SDK_THREAD_STOP running=%u killed=%u retained=%u\n",running,killed,running?1u:0u);
+    fprintf(log,"SDK_THREAD_STOP running=%u exited=%u killed=%u retained=0\n",
+        running,exited,killed);
     fflush(log);
-    if (thread_pool.prepared && !running) {
+    if (thread_pool.prepared) {
         int released=sceKernelFreeMemBlock(thread_pool.stack_block);
         fprintf(log,"SDK_THREAD_POOL_RELEASE status=%d\n",released);
         fflush(log);
         thread_pool.stack_block=-1;thread_pool.stack_base=0;thread_pool.prepared=0;
+        if (released) return released;
     }
+    return 0;
 }
 /* ---- M5 audio assertion probe ------------------------------------------
  * The area is ordinary host memory, page-aligned and registered with the
@@ -2495,20 +2932,20 @@ static void vp_sdk_audio_probe_request(void *user) {
     {
         VPAudioProbeArgs *live=(VPAudioProbeArgs *)(uintptr_t)s->audio_probe_args_addr;
         int waited_ms=0;
+        VPPark probe_park;
         /* The SDK's thread trampoline reaches its first SDK call before the
          * probe entry runs, and that call is dispatched under the session
-         * mutex this Open handler is itself holding. Waiting while holding it
-         * parks the probe permanently (probe81: 5 s at stage 0). Drop the
-         * recursive mutex for the wait; the Open reply has already been
-         * written and this handler has nothing left to mutate, and dispatch()
-         * restores the ambient thread/TLS values when it returns. */
-        state_unlock(s);
+         * lock this Open handler is itself holding. Waiting while holding it
+         * parks the probe permanently (probe81: 5 s at stage 0). Use the
+         * common park protocol so the ambient thread/TLS values are restored
+         * when the session lock is reacquired. */
+        park_begin(s,&probe_park);
         while (!((volatile VPAudioProbeArgs *)live)->done
             && ((volatile VPAudioProbeArgs *)live)->stage<10u && waited_ms<5000) {
             sceKernelDelayThread(1000);
             ++waited_ms;
         }
-        state_lock(s);
+        park_end(s,&probe_park);
         fprintf(s->log,"AUDIO_PROBE_HANDSHAKE waited_ms=%d stage=%u done=%u\n",
             waited_ms,live->stage,live->done);
         fflush(s->log);
@@ -2537,14 +2974,38 @@ int vp_sdk_dso_execute(FILE *log,VPExecutor *e) {
     uint32_t saved_host_tls=host_tls(),saved_host_fp=host_fp();
     memset(&session,0,sizeof(session));Session *s=&session;s->log=log;s->resume=resume;
     s->pool_block=-1;s->launch_block=-1;s->state_lock=-1;
+    s->state_gate.semaphore=-1;
     s->state_lock=sceKernelCreateMutex("vp-guest-state",SCE_KERNEL_MUTEX_ATTR_RECURSIVE,0,NULL);
     if (s->state_lock<0) return s->state_lock;
+    {
+        FILE *kernel=fopen("ux0:data/mhgu-vita-port/sdk-session-kernel.enable","rb");
+        s->session_kernel=kernel!=NULL;
+        if (kernel) fclose(kernel);
+        if (!s->session_kernel) {
+            s->state_gate.semaphore=sceKernelCreateSema("vp-session-gate",0,0,0x7fffffff,NULL);
+            if (s->state_gate.semaphore<0) {
+                int rc=s->state_gate.semaphore;
+                int deleted=sceKernelDeleteMutex(s->state_lock);s->state_lock=-1;
+                fprintf(log,"SDK_SESSION_LOCK_INIT status=%d mutex_cleanup=%d\n",rc,deleted);
+                fflush(log);return rc;
+            }
+        }
+        fprintf(log,"SDK_SESSION_LOCK_MODE backend=%s\n",
+            s->session_kernel?"kernel-mutex":"user-gate");
+    }
+    {
+        FILE *disable=fopen("ux0:data/mhgu-vita-port/sdk-lock-fast.disable","rb");
+        s->fast_enabled=disable==NULL;
+        if (disable) fclose(disable);
+        fprintf(log,"SDK_LOCK_FAST_MODE enabled=%d\n",s->fast_enabled);
+    }
     for (unsigned i=0;i<VP_GUEST_THREAD_LIMIT;++i) {
         thread_pool.threads[i].executor.handler=dispatch;
         thread_pool.threads[i].executor.user=s;
     }
     for (unsigned i=0;i<VP_SDK_LOCK_LIMIT;++i) s->locks[i].id=-1;
     VPExecutorHandler old_handler=e->handler;void *old_user=e->user;e->handler=dispatch;e->user=s;
+    s->main_executor=e;
     vp_thread_local_allocator_init(&s->allocator);
     vp_guest_svc_init(&s->svc,log);
     s->svc.device_wait_begin=device_wait_begin;
@@ -2805,7 +3266,8 @@ int vp_sdk_dso_execute(FILE *log,VPExecutor *e) {
         fprintf(log,"SDK_FINI_WRAPPER module=%u result=%u live=%u status=%d\n",i,result,s->allocator.live_allocations,rc);fflush(log);
     }
     fprintf(log,"SDK_DSO_UNREGISTER live=%u bytes=%u status=%d\n",s->allocator.live_allocations,s->allocator.live_bytes,rc);fflush(log);
-    vp_sdk_thread_pool_stop(log);
+    int pool_rc=vp_sdk_thread_pool_stop(log);
+    if (!rc) rc=pool_rc;
     for (unsigned i=0;i<VP_SDK_LOCK_LIMIT;++i) if (s->locks[i].id>=0) {
         int released=s->locks[i].held?sceKernelUnlockMutex(s->locks[i].id,1):0;
         int deleted=sceKernelDeleteMutex(s->locks[i].id);if (!rc) rc=released?released:deleted;
@@ -2824,7 +3286,14 @@ int vp_sdk_dso_execute(FILE *log,VPExecutor *e) {
     if (s->state_lock>=0) {
         int deleted=sceKernelDeleteMutex(s->state_lock);
         fprintf(log,"SDK_STATE_RELEASE status=%d\n",deleted);fflush(log);
+        if (!rc) rc=deleted;
         s->state_lock=-1;
+    }
+    if (s->state_gate.semaphore>=0) {
+        int deleted=sceKernelDeleteSema(s->state_gate.semaphore);
+        fprintf(log,"SDK_SESSION_GATE_RELEASE status=%d\n",deleted);fflush(log);
+        if (!rc) rc=deleted;
+        s->state_gate.semaphore=-1;
     }
     fprintf(log,"SDK_DSO_CLEANUP live=%u quiescent=%d status=%d\n",s->allocator.live_allocations,vp_executor_quiescent(e),rc);fflush(log);
     return rc;

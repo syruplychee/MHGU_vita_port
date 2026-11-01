@@ -13,6 +13,9 @@ Marker 是 `ux0:data/mhgu-vita-port/` 下的空文件或短文本文件。运行
 | `gpu-present.enable` | 启用 GPU present |
 | `media-decode.enable` | 启用媒体解码 |
 | `media-video.enable` | 启用视频播放 |
+| `media-native-readback.disable` | 关闭 CPU 视频表面的原生读回复制，恢复原 SDK 按行缓存同步路径；启动时读取，用于对照/回滚 |
+| `sdk-lock-fast.disable` | 关闭 SDK 锁轻量入口，继续使用完整上下文桥；锁递归及错误语义不变 |
+| `sdk-session-kernel.enable` | Session 全部使用原内核互斥体，供同一 SELF 对照用户态门锁；启动时读取 |
 
 ## 2. 渲染策略
 
@@ -68,6 +71,11 @@ Marker 是 `ux0:data/mhgu-vita-port/` 下的空文件或短文本文件。运行
 | `audio-command-dump.enable` | 音频命令 dump |
 | `capture-request.txt` / `capture-live.enable` | 实时截图邮箱 |
 | `applet-exit` / `applet-exit-delay-ms` | 自动退出（诊断） |
+| `media-color-probe.enable` | 启用原视频颜色转换计时探针；仅接受锁定 subsdk0 身份，默认关闭，会临时改写 4 处原指令 |
+| `native-movie.enable` | 启用框架级原生播片；从 ROM 树读取用户自己的 MP4，复用 SceAvcdec，原生呈现视频。默认关闭；当前无音频。移除后重启回到原 guest 管线 |
+| `native-movie.limit-ms` | 诊断：文件内十进制毫秒数，原生播放在该时长后停止并走游戏停止命令；只用于有界测试，不作为验收结果 |
+| `thread-probe.enable` | 诊断：记录 guest ThreadType 的 user entry/arg/name、uMovie vtable 和 movie 控制地址；只读，默认关闭 |
+| `movie-force-stop.enable` | 诊断：首次解码 5 秒后向游戏 uMovie 命令字写入 8，用于单独验证停止路径；不用于正式播片 |
 
 ## 6. 优先级
 

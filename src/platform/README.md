@@ -14,7 +14,8 @@ Vita 平台服务与图形后端。
 | `gxm_resource_layout.c` | `VPSRES1` 纹理资源 sidecar |
 | `gxm_depth*.c` | 深度视图、清除、阴影采样 |
 | `audio_*.c` | 音频命令、混音、AudioOut |
-| `media_*.c` | 视频解码/呈现 |
+| `media_*.c` | 视频解码/呈现与 guest NVDEC 桥 |
+| `native_movie.c` | 可选的框架级 MP4 原生播片；复用 SceAvcdec，视频-only |
 | `memory_attributes.c`、`nvmap_table.c` | 内存属性与 nvmap 生命周期 |
 | `render_resolution.h` | 360p/540p 缩放策略 |
 

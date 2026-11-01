@@ -66,6 +66,7 @@ add_executable(vita_port_native_loader
     src/platform/log_sink.c
     src/platform/media_decode.c
     src/platform/media_video.c
+    src/platform/native_movie.c
     src/platform/memory_attributes.c
     src/platform/nvmap_table.c
     src/platform/sdk_exception_index.c

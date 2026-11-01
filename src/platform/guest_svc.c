@@ -12,6 +12,7 @@
 #include "gxm_runtime.h"
 #include "media_decode.h"
 #include "media_video.h"
+#include "native_movie.h"
 #include "time_calendar.h"
 #include <psp2/ctrl.h>
 #include <psp2/kernel/rng.h>
@@ -360,6 +361,7 @@ static const uint8_t *empty_romfs(void) {
  * errors and periodic summaries: the shipped title issues thousands of reads. */
 #define STORAGE_DETAIL_LIMIT 64
 #define STORAGE_SUMMARY_INTERVAL 256
+static unsigned storage_mp4_detail_logs;
 
 static void put32(uint32_t address, uint32_t value) { memcpy((void *)(uintptr_t)address, &value, 4); }
 static void put64(uint32_t address, uint64_t value) {
@@ -5181,6 +5183,7 @@ static int close_handle(VPGuestSvc *svc, VPBridgeFrame *f) {
                     state->audio_mixer = NULL;
                 }
                 release_all_save_objects(state);
+                vp_media_video_forget_session(state);
                 memset(state, 0, sizeof(*state));
             }
         }
@@ -6519,11 +6522,17 @@ static int send_sync_request(VPGuestSvc *svc, VPBridgeFrame *f, int with_buffer)
             }
             reply_domain_out_raw(buffer, 0, 0, 0, result);
             f->regs[0] = 0;
-            if (result || svc->storage.reads < STORAGE_DETAIL_LIMIT) {
+            const int mp4_path = strstr(svc->storage.last_path, ".mp4") != NULL;
+            if (result == 0 && mp4_path)
+                vp_native_movie_note_path(svc->storage.last_path);
+            if (result || svc->storage.reads < STORAGE_DETAIL_LIMIT
+                || (mp4_path && storage_mp4_detail_logs < 8u)) {
                 slog(svc, "SVC_STORAGE_READ handle=0x%08x object=%u offset=%llu size=%llu result=0x%08x path=%s error=%s\n",
                         handle, object_id, (unsigned long long)offset,
                         (unsigned long long)size, result, svc->storage.last_path,
                         reason ? reason : "");
+                if (mp4_path && storage_mp4_detail_logs < 8u)
+                    ++storage_mp4_detail_logs;
             } else if (svc->storage.reads % STORAGE_SUMMARY_INTERVAL == 0) {
                 slog(svc, "SVC_STORAGE_SUMMARY reads=%llu bytes=%llu opens=%llu errors=%llu generations=%llu tree_opens=%llu tree_closes=%llu tree_retires=%llu busy=%llu result=0\n",
                         (unsigned long long)svc->storage.reads,

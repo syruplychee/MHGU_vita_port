@@ -45,7 +45,7 @@ CI 使用 Ubuntu + GCC。
 
 ### 2.2 覆盖范围
 
-跨平台测试（26 项）：
+跨平台测试（27 项）：
 
 - `audio_downmix`、`audio_ipc`
 - `batch_policy`
@@ -56,6 +56,7 @@ CI 使用 Ubuntu + GCC。
 - `gxm_depth`、`gxm_depth_view`、`gxm_depth_view_shadow`、`gxm_resource_layout`、
   `gxm_sampler_slots`、`gxm_shadow_sampler`
 - `memory_attributes`、`nvmap_table`
+- `media_strided_copy`
 - `pair_cache_policy`、`render_resolution`
 - `static_shader_index`、`texture_snapshot`、`time_calendar`
 - `vertex_format`、`vertex_window`
@@ -68,6 +69,68 @@ CI 使用 Ubuntu + GCC。
 - `log_sink`（pthread）
 
 这些测试直接编译生产源文件或包含生产实现，不是复制品。
+
+仅 Windows 另有 `session_gate`：使用真实 Win32 信号量和八线程，检查共享门锁的
+互斥、递归、先释放后等待、过期唤醒 token 与错误传播。当前 Windows 共 28 项。
+
+附加的播片计时工具测试：
+
+```powershell
+python -m unittest discover -s tests -p test_movie_timing.py -v
+python tools/runtime/measure_movie.py --log <sdk-dso.log> --start 45 --end 100 --output <report.json>
+```
+
+工具按成功解码/合成的计数和时间计算内容处理速率，重复计数不增加帧数；日志缺口会
+明确标记。Y/UV 两次读回只是两份平面复制，不能算两帧。这个结果不单独证明显示或音频。
+测正常游玩性能时不要添加 `-SurfaceReadback`；该参数会开启额外 GPU 表面同步，
+适合检查 CPU 读回数据，应与正常配置分别报告。
+
+颜色转换探针（仅 `media-color-probe.enable` 存在时有效）：
+
+```powershell
+python -m unittest discover -s tests -p test_movie_color_timing.py -v
+python tools/runtime/measure_movie_color.py --log <sdk-dso.log> --output <color-report.json>
+```
+
+工具只汇总探针完成的 `VP_MOVIE_COLOR_TIME` 记录，并按 rgb/nv12 分开统计。`elapsed_us`
+是入口到出口的墙钟时间，包含 guest 调度与桥接，不是纯 CPU 时间，也不能当成帧率；
+探针在前 2000 次完成后改为每 32 次记录一次，日志行数不等于转换总数。报告会明确标记
+采样区间，并在探针未启用、补丁被拒绝或没有命中时给出原因，不能把“无样本”读成零成本。
+
+框架级原生播片（仅 `native-movie.enable` 存在时有效）：
+
+```powershell
+# 先创建 ux0:data/mhgu-vita-port/native-movie.enable。
+# 完整片头约 176 秒，窗口要覆盖首次解码到标题出现。
+.\tools\runtime\run_gui_play.ps1 `
+  -Vpk <vita_port_native_loader.vpk> `
+  -OutDir build/runs/native-movie-full-<date> `
+  -CaptureSeconds 60,120,180,225 -ExitAfterSeconds 240
+```
+
+验收日志是 `VP_NATIVE_MOVIE_DONE decoded=... presented=... elapsed_us=...
+rate_milli=... failed=0`。必须同时报告影片文件、VPK/SELF 哈希、是否有音频；`presented`
+是原生呈现帧，`decoded` 是送入解码器的 AU，两者不能互换。`rate_milli` 是
+`presented × 1e9 / elapsed_us` 的千分率；本机完整片头为 5278/176085450 →
+29974，即 29.974 内容帧/秒。`native-movie.limit-ms` 只用于短诊断，不能拿有限窗口
+冒充完整片头。任何 `VP_NATIVE_MOVIE_FAIL` 都表示已回退 guest 管线，不能记为成功。
+
+这项验收是 L3，且当前没有音频：原生呈现期间 guest 音频被静音。MP4 解析/呈现代码
+没有独立的宿主单元测试，首次验证依赖 movie06 的完整 L3 运行；在补充解析器宿主
+测试和真机 L4 前，不得写成 L1/L4 或“移植完成”。
+
+SDK 锁控制流程的 Windows 模拟检查（需要 MSVC）：
+
+```powershell
+python tests/sdk_lock_regression.py --output build/sdk-lock-check
+cmake -S build/sdk-lock-check -B build/sdk-lock-check/build
+cmake --build build/sdk-lock-check/build --config Release
+ctest --test-dir build/sdk-lock-check/build -C Release --output-on-failure
+```
+
+输出目录必须是新目录。脚本从生产实现提取代码，27 组检查使用模拟互斥体/事件，
+验证递归、owner、快慢混合、key wait、超时、条件变量当前等待者语义、两种 Session
+后端和真实错误；不能替代真实内核并发测试。
 
 ### 2.3 测试约定
 
@@ -161,4 +224,3 @@ CI 不构建 Vita VPK（需要 VitaSDK 和游戏输入），也不运行 Vita3K�
 | Vita3K 运行 | 未执行 | 初始化时有既有会话占用 Vita3K；不打断用户运行 |
 
 这些结果只证明对应层级；不代表真机、完整玩法或当前工作树之外的行为。
-
