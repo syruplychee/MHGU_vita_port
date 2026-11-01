@@ -61,6 +61,7 @@ vp_host_test(gxm_resource_layout
 vp_host_test(gxm_sampler_slots)
 vp_host_test(gxm_shadow_sampler "${VP_SRC}/platform/gxm_shadow_sampler.c")
 vp_host_test(memory_attributes "${VP_SRC}/platform/memory_attributes.c")
+vp_host_test(media_strided_copy)
 vp_host_test(nvmap_table "${VP_SRC}/platform/nvmap_table.c")
 vp_host_test(pair_cache_policy)
 vp_host_test(render_resolution)
@@ -69,6 +70,11 @@ vp_host_test(texture_snapshot)
 vp_host_test(time_calendar)
 vp_host_test(vertex_format "${VP_SRC}/platform/vertex_format.c")
 vp_host_test(vertex_window "${VP_SRC}/platform/vertex_window.c")
+
+if(WIN32)
+    vp_host_test(session_gate)
+    set_tests_properties(session_gate PROPERTIES TIMEOUT 25)
+endif()
 
 # These two use POSIX-only memory and pthread facilities; CI runs them on Linux.
 if(UNIX)

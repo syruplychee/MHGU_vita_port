@@ -176,6 +176,8 @@ build/vita3k-pref/ux0/data/mhgu-vita-port/
 | 启动即失败，日志停在 VM 分配 | Vita3K 版本限制 | 换兼容构建；记录版本 |
 | 黑屏但进程在跑 | 图形路径/场景未支持 | 查 `gxm-runtime.log` 的拒绝原因 |
 | 村庄约 5 FPS | CPU/GXM 准备与等待 | 见 [当前状态](09-status.md)，不是配置错误 |
-| 视频约 2.8 FPS | 播放器提交节奏 | 已知问题，非 GPU 瓶颈 |
+| 原 guest 视频约 8 内容事件/秒 | 播放器提交节奏 | 原管线已知问题，非 GPU 瓶颈；可用原生播片回退/替代 |
+| 原生播片无声 | 当前只实现视频，guest 音频被静音 | 已知限制；见 [ADR 0014](decisions/0014-native-movie-player.md) |
+| 原生播片未启用 | `native-movie.enable` 缺失 | 需要时创建 marker；失败会回退 guest 并记录 `VP_NATIVE_MOVIE_FAIL` |
 | 任务画面异常 | 着色器/生产者路径未完全闭环 | 记录日志与截图，提交 issue |
 | 存档被覆盖 | 未备份/未恢复 | 从 `local/save-backups/` 恢复 |

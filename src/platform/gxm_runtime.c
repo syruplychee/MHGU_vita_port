@@ -10,6 +10,7 @@
 #include "gxm_resource_layout.h"
 #include "gxm_shadow_sampler.h"
 #include "log_sink.h"
+#include "native_movie.h"
 #include "nso_loader.h"
 #include "pair_cache_policy.h"
 #include "render_resolution.h"
@@ -10871,6 +10872,17 @@ static int frame_present_internal(uint64_t va) {
     rc = gxm_pending_scene_complete("present");
     if (rc < 0) return rc;
     if (!gxm_ready) return -1;
+    /* The native movie owns the display while it is presenting. Retire the
+     * guest's submitted scene (above) but do not copy or queue its stale movie
+     * surface; the guest display binder still receives a successful present. */
+    if (vp_native_movie_presenting()) {
+        s = surface_find(va);
+        if (s != NULL) {
+            s->disp_valid = 0u;
+            s->present_draws = 0u;
+        }
+        return 0;
+    }
     s = surface_find(va);
     if (s == NULL || s->color_mem == NULL) return -2;
     if (gxm_clear_fusion_enabled() && s->clear_pending) {

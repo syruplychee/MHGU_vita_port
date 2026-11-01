@@ -4,12 +4,49 @@
 .arm
 .text
 #include "host_bridge.inc.S"
+#include "guest_tls.inc.S"
+
+/* AAPCS function entries need only integer argument preservation for the
+ * integer-only fast helper. Misses restore the original call before entering
+ * the complete bridge. Fatal kernel errors get their own non-retrying bridge. */
+.macro VP_SDK_LOCK_FUNCTION name, service, boolean=0
+    .balign 4
+    .global \name
+    .type \name,%function
+\name:
+    push {r0-r3,ip,lr}
+    VP_GUEST_CONTEXT r1,r2,24
+    ldr r1, [r1, #28] /* VPHostBridge.user == VPExecutor * */
+    movw r2, #\service
+    bl vp_sdk_lock_fast
+    cmp r0, #0
+    blt 2f
+    beq 1f
+    .if \boolean
+        cmp r0, #1
+        moveq r0, #1
+        movne r0, #0
+        str r0, [sp]
+    .endif
+    pop {r0-r3,ip,lr}
+    bx lr
+1:
+    pop {r0-r3,ip,lr}
+    b \name\()_slow
+2:
+    str r0, [sp]
+    pop {r0-r3,ip,lr}
+    b vp_sdk_lock_fast_error
+    .size \name,.-\name
+    VP_HOST_BRIDGE_FUNCTION \name\()_slow, \service
+.endm
+
 VP_HOST_BRIDGE_FUNCTION vp_sdk_alloc, 0x100
 VP_HOST_BRIDGE_FUNCTION vp_sdk_free, 0x101
 VP_HOST_BRIDGE_FUNCTION vp_sdk_ctor_gate, 0x230
 VP_HOST_BRIDGE_FUNCTION vp_sdk_dso_enter, 0x231
-VP_HOST_BRIDGE_FUNCTION vp_sdk_lock, 0x232
-VP_HOST_BRIDGE_FUNCTION vp_sdk_unlock, 0x233
+VP_SDK_LOCK_FUNCTION vp_sdk_lock, 0x232
+VP_SDK_LOCK_FUNCTION vp_sdk_unlock, 0x233
 VP_HOST_BRIDGE_FUNCTION vp_sdk_exception_info, 0x234
 VP_HOST_BRIDGE_FUNCTION vp_sdk_malloc, 0x235
 VP_HOST_BRIDGE_FUNCTION vp_sdk_heap_free, 0x236
@@ -18,9 +55,18 @@ VP_HOST_BRIDGE_FUNCTION vp_sdk_tls_private, 0x241
 VP_HOST_BRIDGE_FUNCTION vp_sdk_tls_free_bridge, 0x242
 VP_HOST_BRIDGE_FUNCTION vp_sdk_tls_get_bridge, 0x243
 VP_HOST_BRIDGE_FUNCTION vp_sdk_tls_set_bridge, 0x244
-VP_HOST_BRIDGE_FUNCTION vp_sdk_try_lock, 0x245
-VP_HOST_BRIDGE_FUNCTION vp_sdk_is_locked, 0x246
+VP_SDK_LOCK_FUNCTION vp_sdk_try_lock, 0x245, 1
+VP_SDK_LOCK_FUNCTION vp_sdk_is_locked, 0x246, 1
+VP_HOST_BRIDGE_FUNCTION vp_sdk_lock_fast_error, 0x24b
 VP_HOST_BRIDGE_FUNCTION vp_sdk_os_unavailable, 0x249
+/* Mid-function site: the handler selects the SDK loop or original epilogue. */
+VP_HOST_BRIDGE_FUNCTION vp_sdk_video_readback, 0x24a
+/* Marker-gated subsdk0 mid-function probes; handlers replay the displaced
+ * integer word and supply the original continuation, rather than guest LR. */
+VP_HOST_BRIDGE_FUNCTION vp_movie_color_rgb_enter, 0x24c
+VP_HOST_BRIDGE_FUNCTION vp_movie_color_rgb_leave, 0x24d
+VP_HOST_BRIDGE_FUNCTION vp_movie_color_nv12_enter, 0x24e
+VP_HOST_BRIDGE_FUNCTION vp_movie_color_nv12_leave, 0x24f
 
 /* Pure tail forwards: exception propagation stays entirely on the guest
  * stack, through the original SDK runtime. No host C++ runtime is linked. */

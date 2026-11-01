@@ -10,6 +10,9 @@
 #include <psp2/videodec.h>
 
 #include "media_decode.h"
+#include "media_strided_copy.h"
+#include "movie_control.h"
+#include "native_movie.h"
 
 /* The operational path is opt-in. media-decode.enable opens the nvhost nodes
  * (the transport model from 0031); this marker additionally executes decode
@@ -69,6 +72,13 @@ typedef struct {
     uint32_t error_count;
     uint32_t dump_count;
     volatile int busy;
+    /* Allocation ids prevent an old CPU-output range from matching a new
+     * GPU allocation that reuses its address after nvmap Free. */
+    struct {
+        VPGuestSession *state;
+        uint32_t handle, address, bytes;
+    } readback[VP_MEDIA_VIDEO_QUEUE * 2u];
+    unsigned readback_cursor, readback_count;
 } VPMediaVideo;
 
 static VPMediaVideo g_video;
@@ -120,6 +130,82 @@ static int media_video_enabled(void) {
 
 int vp_media_video_enabled(void) {
     return media_video_enabled();
+}
+
+static void media_readback_publish(VPGuestSession *state, uint32_t address,
+                                   uint32_t bytes) {
+    VPMediaVideo *v = &g_video;
+    for (uint32_t i = 0; i < state->nvmap_handle_count; ++i) {
+        const VPGuestNvMapHandle *h = &state->nvmap_handles[i];
+        if (!h->allocated || address < h->address
+            || (uint64_t)address + bytes > (uint64_t)h->address + h->size)
+            continue;
+        unsigned slot = v->readback_cursor++ % (VP_MEDIA_VIDEO_QUEUE * 2u);
+        for (unsigned n = 0; n < VP_MEDIA_VIDEO_QUEUE * 2u; ++n) {
+            if (v->readback[n].state == state
+                && v->readback[n].handle == h->id
+                && v->readback[n].address == address) { slot = n; break; }
+        }
+        v->readback[slot].state = state;
+        v->readback[slot].handle = h->id;
+        v->readback[slot].address = address;
+        v->readback[slot].bytes = bytes;
+        return;
+    }
+}
+
+void vp_media_video_forget_session(const VPGuestSession *state) {
+    for (unsigned i = 0; i < VP_MEDIA_VIDEO_QUEUE * 2u; ++i) {
+        if (g_video.readback[i].state == state)
+            memset(&g_video.readback[i], 0, sizeof(g_video.readback[i]));
+    }
+}
+
+int vp_media_video_readback(VPGuestSvc *svc, uint32_t source,
+    uint32_t source_stride, uint32_t destination, uint32_t destination_stride,
+    uint32_t row_bytes, uint32_t rows) {
+    static int checked, disabled;
+    if (!checked) {
+        FILE *marker = fopen("ux0:data/mhgu-vita-port/media-native-readback.disable", "rb");
+        checked = 1;
+        if (marker) { fclose(marker); disabled = 1; }
+        vp_guest_svc_log(svc, "VP_MEDIA_NATIVE_READBACK enabled=%d\n", !disabled);
+    }
+    if (disabled || !rows || !row_bytes || source_stride < row_bytes
+        || destination_stride < row_bytes) return 0;
+    const uint64_t source_span = (uint64_t)(rows - 1u) * source_stride + row_bytes;
+    const uint64_t destination_span = (uint64_t)(rows - 1u) * destination_stride + row_bytes;
+    if (source_span > UINT32_MAX || destination_span > UINT32_MAX
+        || (uint64_t)source + source_span > UINT32_MAX
+        || (uint64_t)destination + destination_span > UINT32_MAX
+        || ((uint64_t)source < (uint64_t)destination + destination_span
+            && (uint64_t)destination < (uint64_t)source + source_span)) return 0;
+    VPMediaVideo *v = &g_video;
+    for (unsigned i = 0; i < VP_MEDIA_VIDEO_QUEUE * 2u; ++i) {
+        if (!v->readback[i].handle || source < v->readback[i].address
+            || (uint64_t)source + source_span >
+                (uint64_t)v->readback[i].address + v->readback[i].bytes) continue;
+        VPGuestSession *state = v->readback[i].state;
+        VPGuestNvMapHandle *h = vp_nvmap_table_find(state->nvmap_handles,
+            state->nvmap_handle_count, v->readback[i].handle);
+        if (!h || !h->allocated || source < h->address
+            || (uint64_t)source + source_span > (uint64_t)h->address + h->size)
+            continue;
+        if (!vp_guest_svc_readable(svc, source, (uint32_t)source_span)
+            || !vp_guest_svc_writable(svc, destination, (uint32_t)destination_span)) return 0;
+        const uint64_t start = sceKernelGetProcessTimeWide();
+        const int copied = vp_media_strided_copy((void *)(uintptr_t)destination,
+            (uint32_t)destination_span, destination_stride,
+            (const void *)(uintptr_t)source, (uint32_t)source_span, source_stride,
+            row_bytes, rows);
+        if (copied && (++v->readback_count <= 2000u || v->readback_count % 32u == 0u))
+            vp_guest_svc_log(svc, "VP_MEDIA_VIDEO_READBACK n=%u rows=%u row_bytes=%u src_stride=%u dst_stride=%u total_us=%llu t_us=%llu thread=0x%x\n",
+                v->readback_count, rows, row_bytes, source_stride, destination_stride,
+                (unsigned long long)(sceKernelGetProcessTimeWide() - start),
+                (unsigned long long)sceKernelGetProcessTimeWide(), svc->current_thread_handle);
+        return copied;
+    }
+    return 0;
 }
 
 static int media_video_instrument(void) {
@@ -237,6 +323,7 @@ static void media_video_shutdown(VPGuestSvc *svc) {
     v->ready_head = 0;
     v->ready_count = 0;
     v->have_frame = 0;
+    memset(v->readback, 0, sizeof(v->readback));
     v->first_submit = 1;
 }
 
@@ -577,9 +664,53 @@ static int media_video_dump(VPMediaVideo *v, uint32_t slot,
     return wrote_luma == luma_size && wrote_chroma == chroma_size;
 }
 
+/* Diagnostic: request the title's own uMovie stop command after a bounded
+ * window. The player thread polls its state word every millisecond, so this
+ * exercises the title's real stop/cleanup path without patching guest code.
+ * Disabled unless the marker exists; the native player will use the same
+ * state handoff once its playback ends. */
+#define VP_MOVIE_FORCE_STOP_MARKER \
+    "ux0:data/mhgu-vita-port/movie-force-stop.enable"
+static int movie_force_stop_enabled = -1;
+static uint64_t movie_force_stop_first_us;
+static int movie_force_stop_done;
+
+static void movie_force_stop_probe(VPGuestSvc *svc) {
+    if (movie_force_stop_enabled < 0) {
+        FILE *marker = fopen(VP_MOVIE_FORCE_STOP_MARKER, "rb");
+        movie_force_stop_enabled = marker != NULL;
+        if (marker != NULL) fclose(marker);
+        vp_guest_svc_log(svc, "VP_MOVIE_FORCE_STOP_MODE enabled=%d\n",
+                         movie_force_stop_enabled);
+    }
+    if (!movie_force_stop_enabled || movie_force_stop_done) return;
+    const uint64_t now = sceKernelGetProcessTimeWide();
+    if (movie_force_stop_first_us == 0u) {
+        movie_force_stop_first_us = now;
+        vp_guest_svc_log(svc,
+                         "VP_MOVIE_FORCE_STOP_ARM state=0x%08x thread=0x%08x\n",
+                         vp_movie_umovie_state, vp_movie_umovie_thread);
+        return;
+    }
+    if (now - movie_force_stop_first_us < 5000000ull) return;
+    const uint32_t state_addr = vp_movie_umovie_state;
+    if (state_addr < 0x80000000u || state_addr >= 0x90000000u) return;
+    volatile uint32_t *command =
+        (volatile uint32_t *)(uintptr_t)(state_addr + 0x2Cu);
+    const uint32_t previous = *command;
+    *command = 8u; /* uMovie command 8: stop and release the decoder. */
+    __sync_synchronize();
+    movie_force_stop_done = 1;
+    vp_guest_svc_log(svc,
+                     "VP_MOVIE_FORCE_STOP state=0x%08x thread=0x%08x old=%u new=8\n",
+                     state_addr, vp_movie_umovie_thread, previous);
+}
+
 int vp_media_video_decode(VPGuestSvc *svc, VPGuestSession *state, uint32_t fd,
                           uint64_t picture_info, uint64_t bitstream) {
     if (!media_video_enabled()) return 0;
+    if (vp_native_movie_active()) return 0;
+    movie_force_stop_probe(svc);
     if (!media_video_enter(svc, "decode")) return 0;
 
     VPMediaVideo *v = &g_video;
@@ -720,6 +851,10 @@ int vp_media_video_decode(VPGuestSvc *svc, VPGuestSession *state, uint32_t fd,
                          fd, frame_number, stream_len, headers);
     }
     result = 0;
+    /* The first decoded AU proves the decoder exists and the movie has really
+     * started. Hand presentation to the native path if it is enabled; a
+     * refusal leaves the guest bridge in charge. */
+    if (frame_number == 0u) (void)vp_native_movie_start(svc);
 
 done:
     if (media_time_should_log()) {
@@ -737,9 +872,65 @@ done:
     return result;
 }
 
+int vp_media_video_native_decode(const uint8_t *es, uint32_t size,
+                                 uint32_t *width, uint32_t *coded_height,
+                                 uint32_t *visible_height, uint32_t *pitch,
+                                 const uint8_t **frame) {
+    VPMediaVideo *v = &g_video;
+    if (es == NULL || width == NULL || coded_height == NULL
+        || visible_height == NULL || pitch == NULL || frame == NULL)
+        return -1;
+    if (!v->initialized || !v->decoder_created || v->out[0] == NULL
+        || size == 0u || size > v->es_size)
+        return -1;
+    if (__sync_lock_test_and_set(&v->busy, 1)) return -2;
+
+    memcpy(v->es, es, size);
+    v->picture.size = sizeof(v->picture);
+    v->picture.frame.pixelType =
+        SCE_AVCDEC_PIXELFORMAT_YUV420_PACKED_RASTER;
+    v->picture.frame.framePitch = v->width;
+    v->picture.frame.frameWidth = v->width;
+    v->picture.frame.frameHeight = v->height;
+    v->picture.frame.pPicture[0] = v->out[0];
+    v->picture.frame.pPicture[1] = NULL;
+
+    SceAvcdecAu au;
+    memset(&au, 0, sizeof(au));
+    au.pts.upper = 0xFFFFFFFFu;
+    au.pts.lower = 0xFFFFFFFFu;
+    au.dts.upper = 0xFFFFFFFFu;
+    au.dts.lower = 0xFFFFFFFFu;
+    au.es.pBuf = v->es;
+    au.es.size = size;
+
+    SceAvcdecArrayPicture array;
+    memset(&array, 0, sizeof(array));
+    array.numOfElm = 1;
+    array.pPicture = v->picture_list;
+    const int rc = sceAvcdecDecode(&v->ctrl, &au, &array);
+    int produced = rc < 0 ? rc : (array.numOfOutput > 0u ? 1 : 0);
+    if (produced > 0) {
+        const SceAvcdecFrame *out = &v->picture.frame;
+        uint32_t w = out->frameWidth ? out->frameWidth : v->width;
+        uint32_t pitch_value = out->framePitch ? out->framePitch : v->width;
+        uint32_t coded = out->frameHeight ? out->frameHeight : v->height;
+        uint32_t visible = out->verticalSize;
+        if (visible == 0u || visible > coded) visible = coded;
+        *width = w;
+        *pitch = pitch_value;
+        *coded_height = coded;
+        *visible_height = visible;
+        *frame = (const uint8_t *)v->out[0];
+    }
+    __sync_lock_release(&v->busy);
+    return produced;
+}
+
 int vp_media_video_composite(VPGuestSvc *svc, VPGuestSession *state, uint32_t fd,
                              uint64_t config, uint64_t luma, uint64_t chroma) {
     if (!media_video_enabled()) return 0;
+    if (vp_native_movie_active()) return 0;
     if (!media_video_enter(svc, "composite")) return 0;
 
     VPMediaVideo *v = &g_video;
@@ -849,6 +1040,9 @@ int vp_media_video_composite(VPGuestSvc *svc, VPGuestSession *state, uint32_t fd
         memset((uint8_t *)(uintptr_t)chroma_cpu + y * aligned_width, 0,
                aligned_width);
     t_copied = sceKernelGetProcessTimeWide();
+
+    media_readback_publish(state, luma_cpu, luma_size);
+    media_readback_publish(state, chroma_cpu, chroma_size);
 
     v->ready_head = (v->ready_head + 1u) % VP_MEDIA_VIDEO_QUEUE;
     --v->ready_count;

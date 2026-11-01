@@ -1,5 +1,7 @@
 #include "audio_sink.h"
 
+#include "native_movie.h"
+
 #include <psp2/audioout.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
@@ -179,6 +181,11 @@ static int sink_thread(SceSize args, void *argp) {
             if (gap > sink.stats.max_output_gap_us)
                 sink.stats.max_output_gap_us = gap;
         }
+        /* Native movie presentation has no audio track in this phase; muting
+         * the guest sink prevents the original slow audio pipeline from
+         * playing out of sync with the native picture. */
+        if (vp_native_movie_presenting())
+            memset(block, 0, sizeof(block));
         int rc = sceAudioOutOutput(sink.port, block);
         if (rc < 0 && !sink.stats.last_error)
             sink.stats.last_error = (uint32_t)rc;

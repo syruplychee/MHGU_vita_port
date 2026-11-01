@@ -6,7 +6,7 @@ int vp_sdk_dso_patch(FILE *,VPNativeModule[4]);
 int vp_sdk_dso_execute(FILE *,VPExecutor *);
 int vp_sdk_dso_replaces_tls(uint32_t);
 int vp_sdk_thread_pool_prepare(VPNativeModule *,unsigned,FILE *);
-void vp_sdk_thread_pool_stop(FILE *);
+int vp_sdk_thread_pool_stop(FILE *);
 /* Execution facts observed by the original-Start run. `nnos_returned` is the
  * rtld callback flag written when nnosInitialize returns; `nnmain_entered`
  * is set only when a live return address inside main's nnMain body was found
