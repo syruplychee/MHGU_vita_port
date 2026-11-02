@@ -47,10 +47,17 @@ CPU 侧优化，其余方案保留为历史结论。
 ## 风险与限制
 
 - 串行号比较只在 outstanding 值差小于 2^31 时有效；当前每 arena 一个 pending，
-  共 3 个，满足条件。若未来增加无界 pending 队列，必须重新设计。
+  共 3 个，arena 重用和同步边界会持续清理旧 scene，满足条件。若未来增加无界
+  pending 队列，必须重新设计。
 - “等待最新通知证明更早 scene 完成”依赖同一 context 的提交顺序和 GPU 通知语义；
   真机 GXM 行为仍未验证。
 - 旧分支的命中率/等待调用下降是 L3、单窗口数据；本分支不宣称 FPS 加速。
+- [API 声明确认] 本地 VitaSDK `psp2/gxm.h` 确认了 `sceGxmNotificationWait` 和
+  `sceGxmEndScene` 的声明。[源码确认，L0] 同 context 顺序提交和等待后清理资源是
+  当前后端的源码约束，头文件
+  本身不证明真机行为。宿主测试中的 GXM 函数是测试替身，只验证调度与资源记账。
+- 对照构建的 ELF `text` 增加 320 字节、BSS 增加 176 字节、`data` 不变（L2，
+  `arm-vita-eabi-size`）。没有修改 guest 模块、ABI 或补丁的原字节/范围。
 - 未迁入 CPU/NEON 清屏、NVN hook、LOD 写入、census、phase-rate/skip/阴影降频、
   direct owned texture bind、缓存扩容、内容 hash、跳过纹理校验、纹理空闲池等；
   这些方案的收益和风险见统一交接文档。
@@ -66,9 +73,15 @@ CPU 侧优化，其余方案保留为历史结论。
 
 ## 验证
 
-- L1：新增 `tests/gxm_render_pipeline.c`，由 CMake 从生产 `gxm_runtime.c` 抽取实际
+- L1：Windows Release 29/29 独立复核通过；新增 `tests/gxm_render_pipeline.c`，
+  由 CMake 从生产 `gxm_runtime.c` 抽取实际
   函数体编译；覆盖 hint 多 key/完整匹配拒绝/失效重用、完成等待无 pending/多 arena/
   最新非最大 index/失败不清理不 unpin/成功准确释放 pin/单 arena 等待/回绕与跳过 0。
+  同一测试另经 WSL GCC `-std=c11 -Wall -Wextra -Werror` 编译并通过；WSL 没有 CMake，
+  未执行 Linux 全套 CTest。
 - L2：输入锁与 VPK 构建通过（本地 GCC 15.2.0）。
-- L3/L4：未执行；主控需在 Vita3K/真机复核画面、时序和性能。详见
+- L3：develop 与新分支各约 300 秒回归，村庄及同一村长对话页可见，正常退出，
+  `draw_fail=78`、`batch_failed=0` 与基线一致；原存档及开关恢复校验通过。
+  只有一对墙钟输入运行，未证明稳定帧率收益或完整玩法。
+- L4：未执行。完整身份、计数与未验证范围见
   [交接文档第 6 节](../13-render-performance-lessons.md#6-本分支验证状态)。

@@ -94,7 +94,7 @@ pin。每个 arena 重用前仍调用 `gxm_pending_scene_complete_arena` 单独�
 | CPU/NEON clear 填充 | 实验路径 materialize 2.949 → 约 1.605–1.797 s/120 s（约 −43%）；64×64/160×48 显示色带自检与 transfer 路径像素一致 | CPU 写 `color_mem` 后由 GPU 采样，真机 ARM/GPU 内存一致性未验证；诊断 dump 需回退；默认仍走 transfer fill | 旧分支 marker opt-in；需真机可见性测试与同状态村景 A/B |
 | 阴影阶段跳帧/降频 | 阶段基线 138.8 → 104.1 ms（mean −25%），1/2 为 112.5 ms、1/3 为 106.2 ms | 保留旧阴影内容；运动/转镜头会过期。后续帧驱动对照中“仅阴影”为 167.8 ms，反而高于默认 147.1 ms，说明收益不稳定 | marker opt-in，未改默认；需确定性移动镜头输入和内容时效验收 |
 | 直接绑定 decoder-owned texture | 同窗口 mean 141.4 → 112.7 ms，解码 8.78 → 1.31 s，1024² 暂存复制 48,402 → 7,442 次 | pin 住的槽不能换出，memblock 抖动（34,686 次分配）并在约 40 MB 分配失败；pin 生命周期依赖 GXM notification，真机未验证 | 旧分支 opt-in；需解决 arena/碎片与真机 pin 语义后再评估 |
-| 128 位内容概率 hash | 不再保留 raw 副本后，fresh allocations 34,686 → 75，失败与非缓存解码为 0 | 用 2^-128 碰撞概率替代逐字节身份，弱于精确比较；内容变化与可见性依赖事件 | 旧分支采用；本分支明确不采用，保持逐字节纹理身份/每次检查。只有碰撞模型和错误可见性都能接受时才重开 |
+| 128 位内容概率 hash | 不再保留 raw 副本后，fresh allocations 34,686 → 75，失败与非缓存解码为 0 | 指纹相同不能证明字节相同；旧报告写的 `2^-128` 未附具体算法的碰撞率证明；内容变化与可见性依赖事件 | 旧分支采用；本分支明确不采用，保持逐字节纹理身份/每次检查。只有碰撞模型和错误可见性都能接受时才重开 |
 | 每 present 一次 / 跨帧间隔纹理校验 | 固定镜头 mean 263.5 → 140.0 ms（每 present 一次），再 → 136.6 ms（间隔 8）；哈希工作量约 −83% | 同一 present 内首次采样后的写入延迟到下一 present；interval 最多陈旧 8 个 present；不是写事件驱动 | marker opt-in；应改为资源写/上传成功事件失效，再以固定镜头整帧验收 |
 
 ## 5. 测量教训
@@ -154,14 +154,70 @@ pin。每个 arena 重用前仍调用 `gxm_pending_scene_complete_arena` 单独�
 
 | 级别 | 状态 | 说明 |
 |---|---|---|
-| L1 宿主测试 | 主控独立复核通过 | Windows MSVC 19.51 Release，29/29；新增 `gxm_render_pipeline` 直接抽取生产函数体，覆盖多 key/完整匹配拒绝/失效重用、空洞后的 hint 刷新、无 pending/多 arena/最新非最大 index/失败不清理不 unpin/成功准确释放 pin/单 arena 等待/回绕与跳过 0 |
-| L2 构建 | 主控独立复核通过 | ExeFS + NPDM + NACP 身份锁通过；VitaSDK GCC 15.2.0；VPK SHA256 `7710b195a3370ee46d7db5ffa881c46920ef37dafbb8acb4833365b2a24bed66`，SELF SHA256 `7a87ae913ce129c9a00e0d3960e1e8558c7e4b00121afbc2960deda135a1d2af` |
-| L3 Vita3K | 未执行 | 未做画面、FPS、日志窗口或存档验证；不得写成本分支已有性能收益 |
+| L1 宿主测试 | 独立复核通过 | Windows MSVC 19.51 Release，29/29；新增 `gxm_render_pipeline` 直接抽取生产函数体，12 组检查覆盖多 key/完整匹配拒绝/失效重用、空洞后的 hint 刷新、无 pending/多 arena/最新非最大 index/失败不清理不 unpin/成功准确释放 pin/单 arena 等待/回绕与跳过 0；WSL GCC 单独编译该测试也通过，未执行 Linux 全套 CTest |
+| L2 构建 | 主控独立复核通过 | ExeFS + NPDM + NACP 身份锁通过；VitaSDK GCC 15.2.0；VPK SHA256 `72f516f3322dbee0356b5682953ef8a41a93f30749a6ad63ca9c93aa2fbb6249`，SELF SHA256 `7a87ae913ce129c9a00e0d3960e1e8558c7e4b00121afbc2960deda135a1d2af` |
+| L3 Vita3K | 功能回归通过，性能未定 | develop 与本分支各一次约 300 秒，进入村庄并显示同一村长对话页，正常退出；只确认本窗口未见明显画面回归，不代表稳定加速或完整玩法 |
 | L4 真机 | 未执行 | 无任何真机结论 |
 
 本轮没有加入运行时 marker、census、CPU 清屏、NVN hook、LOD 写入、纹理跳过校验或
 缓存扩容。回滚方式是直接 revert 这两个代码点的提交；没有需要清理的运行开关或诊断
 状态。
+
+### 6.1 本次 L3 的身份与范围
+
+代码提交 `f44a929`。两次有效回归使用 Vita3K 4106/d7edcbe9、OpenGL、540p、
+默认 16 MiB 上传缓存、`BoundedBatch` + `PlayPerf` + `LiveInput`，SDL dummy 音频。
+没有启用 surface readback、新诊断 marker 或旧分支实验开关；运行后恢复原开关。
+测试存档为 B116 回归所用的 `m6b51-m6-direct-20261028/test-save-create3`，
+`system` SHA256 `ec85c733…`，`system_backup` `8fcdeee6…`。
+
+| 项 | develop 基线 | 新分支 |
+|---|---|---|
+| 构建源码 | `08d4b6d` | `f44a929` |
+| 本地证据目录（不提交） | `build/runs/safe-render-develop2-20261102/` | `build/runs/safe-render-candidate-20261102/` |
+| VPK SHA256 | `9f9d41d10f9dce5eb916f0e722ddaaa6e76be5132b762d667922e89a9f9bfd31` | `72f516f3322dbee0356b5682953ef8a41a93f30749a6ad63ca9c93aa2fbb6249` |
+| SELF/安装 eboot SHA256 | `be28aaaf3a1706a5a15dbb3a6b4526d465a36849f9e3f9d8feb885211d577dc2` | `7a87ae913ce129c9a00e0d3960e1e8558c7e4b00121afbc2960deda135a1d2af` |
+| 观察时长 | 301.841 s | 301.769 s |
+| 正常退出 / 退出码 | 是 / 0 | 是 / 0 |
+| 最后一条累计 pair hit / hint hit | 257,554 / 131,009（50.9%） | 265,254 / 188,354（71.0%） |
+| 最后一条累计 notify calls | 40,365 | 37,236 |
+| 最后一条累计 notify block | 9.361 s | 8.901 s |
+| `draw_fail` / `batch_failed` | 78 / 0 | 78 / 0 |
+| 存档恢复、逐文件哈希与开关恢复校验 | 全部通过 | 全部通过 |
+
+两次的模拟器 SHA256 均为
+`d21795e11ecfa4ec6f9efee4e727cfcd55ef27b0a0c27ea44aa98b4a9cbc9b6f`；
+静态包 ABI 2、364 variant，manifest SHA256
+`f7f49f56cd0642ec8282c2b07c192b0af0fa179b374220fcc363939cfea6e285`，index SHA256
+`f003f35a009153d416763dbad6a5834182af98cb7f5a99dc8c5141b00f873df3`。
+完整身份与计数汇总保存在本地 `build/reports/safe-render-20261102/`。
+
+人工查看 200/250/280 秒的真实窗口截图：两次依次为角色选择、村庄进场镜头、村长
+对话；280 秒为相同构图和相同对话页，人物、建筑、贴图与阴影可见，NPC/动画时刻不同。
+截图记录窗口可见、未最小化、没有遮挡且已有本次 present；窗口并非始终处于前台。
+没有发现 `wait_fail`、`action=poison`、`VP_GXM_BATCH_FLUSH_FAIL` 或 fatal 日志。
+
+**这些累计计数不是受控加速比。** 输入仍依赖墙钟，250 秒两次进场镜头进度不同，
+280 秒截图标题的瞬时 FPS 分别为 6 与 5；它们不能证明加速，也不足以判定性能回退。
+需要固定状态的多对帧时间分布才能给出整帧结论。本轮接受的是相同对话页的功能回归、
+提示表命中改善和等待调用减少，不把单对累计阻塞时间下降当作稳定收益。
+
+基线最初的 220 秒尝试 `safe-render-develop-20261102` 在 160 秒仍是菜单，未作为
+村庄对照。第二次延长到 300 秒，补入 150–200 秒的确认键，并在约 267 秒补一次确认；
+新分支使用相同按键时刻；约 267 秒的补充确认，基线为手动 1000 ms，新分支为脚本
+300 ms，这也使两次运行不能当作严格的性能配对。基线构建是在 checkout `08d4b6d`
+时生成的；运行器的
+`process.json.sources` 记录运行时工作区源码，应以表中的 VPK/SELF 和构建提交归属
+基线，不能把运行器的源码哈希误当成基线的编译来源。
+
+输入锁 SHA256 为 `5b5da067a6a5aa786e53c4970e09f6945bd6e697c1f2bfebd070cf0b65aee3f8`。
+工具为 VitaSDK GCC 15.2.0、CMake 4.3.1、Ninja 1.13.2、uv 环境 Python 3.12.13。
+本机 D 盘及部分新目录仍会被 GCC/Ninja 拒绝写入；没有关闭编译检查，改用已有可写
+父目录下的独立 C 盘构建目录，`scripts/build.ps1 -BuildDir <可写目录>` 构建通过。
+产物已校验后复制到本地 `build/vita/` 供默认启动使用。这个环境限制不属于渲染改动。
+
+未验证：真机、任务/住宅、战斗、动态镜头/连续切场景、长时间资源回收、存档写入功能、
+音频和稳定帧时间。运行中的存档保护只证明原档恢复，不能替代写档功能验收。
 
 ## 7. 旧证据入口
 
