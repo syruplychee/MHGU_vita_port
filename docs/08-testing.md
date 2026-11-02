@@ -45,7 +45,7 @@ CI 使用 Ubuntu + GCC。
 
 ### 2.2 覆盖范围
 
-跨平台测试（27 项）：
+跨平台测试（28 项）：
 
 - `audio_downmix`、`audio_ipc`
 - `batch_policy`
@@ -53,8 +53,8 @@ CI 使用 Ubuntu + GCC。
 - `float_bits_numeric`
 - `gpu_command_buffer`、`gpu_effective_rt`、`gpu_indices`、`gpu_stream`、
   `gpu_texture_decode`、`gpu_uniform_state`
-- `gxm_depth`、`gxm_depth_view`、`gxm_depth_view_shadow`、`gxm_resource_layout`、
-  `gxm_sampler_slots`、`gxm_shadow_sampler`
+- `gxm_depth`、`gxm_depth_view`、`gxm_depth_view_shadow`、`gxm_render_pipeline`、
+  `gxm_resource_layout`、`gxm_sampler_slots`、`gxm_shadow_sampler`
 - `memory_attributes`、`nvmap_table`
 - `media_strided_copy`
 - `pair_cache_policy`、`render_resolution`
@@ -68,10 +68,12 @@ CI 使用 Ubuntu + GCC。
 - `guest_storage`（32 位 guest 地址 + POSIX mmap）
 - `log_sink`（pthread）
 
-这些测试直接编译生产源文件或包含生产实现，不是复制品。
+这些测试直接编译生产源文件或包含生产实现，不是复制品。`gxm_render_pipeline`
+由 `tests/CMakeLists.txt` 用标记从 `src/platform/gxm_runtime.c` 截取实际函数体生成
+测试 include；标记缺失会在 configure 阶段失败，避免静默测试一份复制实现。
 
 仅 Windows 另有 `session_gate`：使用真实 Win32 信号量和八线程，检查共享门锁的
-互斥、递归、先释放后等待、过期唤醒 token 与错误传播。当前 Windows 共 28 项。
+互斥、递归、先释放后等待、过期唤醒 token 与错误传播。当前 Windows 共 29 项。
 
 附加的播片计时工具测试：
 

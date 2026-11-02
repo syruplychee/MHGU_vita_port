@@ -27,6 +27,7 @@
 10. [贡献指南](10-contributing.md)
 11. [故障排查](11-troubleshooting.md)
 12. [develop 开发起点与旧项目交接](12-development-baseline.md)
+13. [渲染性能安全迁移：结论、反例与测量教训](13-render-performance-lessons.md)
 
 ## 参考
 
@@ -56,3 +57,4 @@
 - [0012 条件变量只通知当前等待者](decisions/0012-condition-variable-signal.md)
 - [0013 Session 用户态门锁](decisions/0013-session-user-gate.md)
 - [0014 框架级原生播片](decisions/0014-native-movie-player.md)
+- [0015 渲染性能安全迁移](decisions/0015-safe-render-performance.md)

@@ -17,6 +17,39 @@ set(VP_INCLUDES
 
 find_package(Threads)
 
+# Compile exact production sections into a host test. Markers turn a renamed or
+# removed section into a configure error instead of silently testing a copy.
+function(vp_extract_marked source begin_marker end_marker out_var)
+    string(FIND "${source}" "${begin_marker}" begin)
+    if(begin EQUAL -1)
+        message(FATAL_ERROR "Missing host-test source marker: ${begin_marker}")
+    endif()
+    string(FIND "${source}" "${end_marker}" end)
+    if(end EQUAL -1 OR end LESS begin)
+        message(FATAL_ERROR "Missing host-test source marker: ${end_marker}")
+    endif()
+    string(LENGTH "${end_marker}" end_length)
+    math(EXPR section_length "${end} - ${begin} + ${end_length}")
+    string(SUBSTRING "${source}" ${begin} ${section_length} section)
+    set(${out_var} "${section}" PARENT_SCOPE)
+endfunction()
+
+file(READ "${VP_SRC}/platform/gxm_runtime.c" VP_GXM_RUNTIME_SOURCE)
+set(VP_GXM_RENDER_PIPELINE_SOURCE "")
+foreach(section
+        pair_base pair_struct pair_hint color_mask pair_match pair_probe
+        notify pending_state pending_functions)
+    vp_extract_marked("${VP_GXM_RUNTIME_SOURCE}"
+        "/* VP_HOST_TEST_EXTRACT:${section}_begin */"
+        "/* VP_HOST_TEST_EXTRACT:${section}_end */"
+        extracted)
+    string(APPEND VP_GXM_RENDER_PIPELINE_SOURCE "${extracted}\n")
+endforeach()
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/gxm_render_pipeline_production.inc"
+     "${VP_GXM_RENDER_PIPELINE_SOURCE}")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${VP_SRC}/platform/gxm_runtime.c")
+
 function(vp_host_test name)
     add_executable(${name} "${CMAKE_CURRENT_SOURCE_DIR}/${name}.c" ${ARGN})
     target_include_directories(${name} PRIVATE ${VP_INCLUDES})
@@ -45,6 +78,9 @@ vp_host_test(gpu_stream "${VP_SRC}/platform/gpu_stream.c")
 vp_host_test(gpu_texture_decode "${VP_SRC}/platform/gpu_texture.c")
 vp_host_test(gpu_uniform_state "${VP_SRC}/platform/gpu_stream.c")
 vp_host_test(gxm_depth "${VP_SRC}/platform/gxm_depth.c")
+vp_host_test(gxm_render_pipeline)
+target_include_directories(gxm_render_pipeline PRIVATE
+                           "${CMAKE_CURRENT_BINARY_DIR}")
 vp_host_test(gxm_depth_view
     "${VP_SRC}/platform/gxm_depth_view.c"
     "${VP_SRC}/platform/gxm_resource_layout.c"

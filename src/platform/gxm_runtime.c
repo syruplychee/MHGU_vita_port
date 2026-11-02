@@ -79,6 +79,7 @@ static SceGxmVertexProgram *vertex_program;
 static SceGxmFragmentProgram *fragment_program;
 static const SceGxmProgram *gxm_vs_program;
 static const SceGxmProgram *gxm_fs_program;
+/* VP_HOST_TEST_EXTRACT:pair_base_begin */
 typedef struct {
     unsigned hash;
     unsigned viewport_transform;
@@ -91,6 +92,7 @@ typedef struct {
     const SceGxmProgram *vs_program;
     const SceGxmProgram *fs_program;
 } VPGxmProgramPair;
+/* VP_HOST_TEST_EXTRACT:pair_base_end */
 static VPGxmProgramPair gxm_pairs[VP_GXM_PROGRAM_STORE];
 static unsigned gxm_pair_count;
 /* Static shader index v1. The index is built offline; this module only
@@ -146,6 +148,7 @@ typedef struct {
      * parameters on every depth draw. */
     unsigned has_f_mask;
 } VPStaticResident;
+/* VP_HOST_TEST_EXTRACT:pair_struct_begin */
 typedef struct VPStaticPair {
     int used;
     uint32_t vs_stage, fs_stage;
@@ -166,6 +169,7 @@ typedef struct VPStaticPair {
     uint32_t last_use;
     VPGxmProgramPair base;
 } VPStaticPair;
+/* VP_HOST_TEST_EXTRACT:pair_struct_end */
 typedef struct {
     unsigned index_hits, index_misses, gxp_loads, registrations, unregistrations;
     unsigned pair_hits, pair_misses, pair_evictions, resident_evictions;
@@ -206,34 +210,58 @@ static uint16_t static_resident_slots[VP_STATIC_INDEX_MAX_VARIANTS];
 static unsigned static_resident_used;
 static unsigned static_resident_bytes;
 static unsigned static_clock;
-/* One most-recent successful pair. Only a key back to the slot; the full
- * inputs are still compared with static_pair_inputs_match. */
+static VPStaticPair static_pairs[VP_GXM_STATIC_PAIR_LIMIT];
+/* VP_HOST_TEST_EXTRACT:pair_hint_begin */
+/* Recent successful pairs. Only keys back to slots; every probe still runs the
+ * full input comparison. Several pairs normally alternate (UI, terrain,
+ * characters), so a one-entry hint misses about half of all lookups and every
+ * miss scans the whole pair table. */
+#define VP_STATIC_PAIR_HINTS 8u
 typedef struct {
     VPStaticPair *pair;
     uint32_t vs_token;
     uint32_t fs_token;
     unsigned viewport;
+    uint64_t age;
 } VPStaticPairHint;
-static VPStaticPair static_pairs[VP_GXM_STATIC_PAIR_LIMIT];
-static VPStaticPairHint static_pair_hint;
-static VPStaticPair *static_current_pair;
+static VPStaticPairHint static_pair_hints[VP_STATIC_PAIR_HINTS];
+static uint64_t static_pair_hint_clock;
 
 static void static_pair_hint_reset(void) {
-    memset(&static_pair_hint, 0, sizeof(static_pair_hint));
+    for (unsigned i = 0; i < VP_STATIC_PAIR_HINTS; ++i)
+        memset(&static_pair_hints[i], 0, sizeof(static_pair_hints[i]));
+    static_pair_hint_clock = 0u;
 }
 
 /* Called before a slot is released or reused; only its identity matters. */
 static void static_pair_hint_forget(const VPStaticPair *pair) {
-    if (static_pair_hint.pair == pair) static_pair_hint_reset();
+    for (unsigned i = 0; i < VP_STATIC_PAIR_HINTS; ++i)
+        if (static_pair_hints[i].pair == pair)
+            memset(&static_pair_hints[i], 0, sizeof(static_pair_hints[i]));
 }
 
 static void static_pair_hint_set(VPStaticPair *pair, uint32_t vs_token,
                                  uint32_t fs_token, unsigned viewport) {
-    static_pair_hint.pair = pair;
-    static_pair_hint.vs_token = vs_token;
-    static_pair_hint.fs_token = fs_token;
-    static_pair_hint.viewport = viewport;
+    VPStaticPairHint *slot = NULL;
+    for (unsigned i = 0; i < VP_STATIC_PAIR_HINTS; ++i) {
+        VPStaticPairHint *hint = &static_pair_hints[i];
+        if (hint->pair == pair) { slot = hint; break; }
+        if (hint->pair == NULL) {
+            if (slot == NULL || slot->pair != NULL) slot = hint;
+        } else if (slot == NULL ||
+                   (slot->pair != NULL && hint->age < slot->age)) {
+            slot = hint;
+        }
+    }
+    if (slot == NULL) return;
+    slot->pair = pair;
+    slot->vs_token = vs_token;
+    slot->fs_token = fs_token;
+    slot->viewport = viewport;
+    slot->age = ++static_pair_hint_clock;
 }
+/* VP_HOST_TEST_EXTRACT:pair_hint_end */
+static VPStaticPair *static_current_pair;
 static VPStaticStats static_stats;
 static int static_index_load(const char *dir);
 static int static_preload_observed(void);
@@ -791,6 +819,30 @@ static int frame_context_reject(const char *entry);
  * deferred scene pipeline. Waiting a value implies completion of every earlier
  * scene because the GPU consumes scenes in submission order. */
 static uint32_t gxm_notify_seq;
+/* VP_HOST_TEST_EXTRACT:notify_begin */
+/* Values are monotonic and skip zero when the 32-bit sequence wraps: zero is
+ * the region's initial/unset value, never a submitted notification. */
+static uint32_t gxm_notify_next(uint32_t value) {
+    value++;
+    if (value == 0u) value++;
+    return value;
+}
+
+/* Serial-number comparison for values separated by less than 2^31. At most one
+ * scene per arena is outstanding, so the pending set stays far inside that
+ * window; this must not be used as a general timestamp comparison. */
+static int gxm_notify_newer(uint32_t value, uint32_t reference) {
+    uint32_t distance = value - reference;
+    return distance != 0u && distance < UINT32_C(0x80000000);
+}
+
+/* True when waiting for completed proves pending has also completed. This is
+ * the exact complement of gxm_notify_newer, so newest selection and retirement
+ * always agree. */
+static int gxm_notify_reached(uint32_t completed, uint32_t pending) {
+    return !gxm_notify_newer(pending, completed);
+}
+/* VP_HOST_TEST_EXTRACT:notify_end */
 static int gxm_scene_pipeline_enabled(void);
 static void gxm_pending_scene_retire_upto(uint32_t value);
 
@@ -2807,8 +2859,8 @@ static int frame_end_scene_timed(SceGxmContext *context,
         /* Never reset the region while a deferred scene may still be running:
          * values only grow, and a wait for a later value implies every earlier
          * scene completed. */
-        notification.value = ++gxm_notify_seq;
-        if (notification.value == 0u) notification.value = ++gxm_notify_seq;
+        gxm_notify_seq = gxm_notify_next(gxm_notify_seq);
+        notification.value = gxm_notify_seq;
     } else {
         notification.value = 1;
         *region = 0;
@@ -4199,6 +4251,7 @@ static int blend_op_to_gxm(uint32_t op, SceGxmBlendFunc *out) {
     }
 }
 
+/* VP_HOST_TEST_EXTRACT:color_mask_begin */
 static uint8_t color_mask_to_gxm(uint32_t mask) {
     uint8_t out = 0;
     if ((mask & 0x1u) != 0u) out |= SCE_GXM_COLOR_MASK_R;
@@ -4207,6 +4260,7 @@ static uint8_t color_mask_to_gxm(uint32_t mask) {
     if ((mask & 0x1000u) != 0u) out |= SCE_GXM_COLOR_MASK_A;
     return out;
 }
+/* VP_HOST_TEST_EXTRACT:color_mask_end */
 
 static int build_blend_info(const VPGxmDrawRequest *req, SceGxmBlendInfo *info) {
     SceGxmBlendFunc color_func, alpha_func;
@@ -5125,6 +5179,7 @@ static int static_build_pair(VPStaticPair *pair, const VPStaticResident *vs_res,
     return 0;
 }
 
+/* VP_HOST_TEST_EXTRACT:pair_match_begin */
 static int static_pair_inputs_match(const VPStaticPair *pair,
                                     const VPGxmDrawRequest *req,
                                     unsigned index_source) {
@@ -5138,6 +5193,7 @@ static int static_pair_inputs_match(const VPStaticPair *pair,
         pair->blend[4] == req->blend_alpha_src &&
         pair->blend[5] == req->blend_alpha_dst;
 }
+/* VP_HOST_TEST_EXTRACT:pair_match_end */
 
 static void static_release_pair(VPStaticPair *pair) {
     if (pair == NULL) return;
@@ -5159,29 +5215,35 @@ static void static_release_pair(VPStaticPair *pair) {
     memset(pair, 0, sizeof(*pair));
 }
 
-/* The hint is only a key back to a slot that was produced by the original
- * resolution path. The full input comparison is the same one the scan uses;
- * resident references held by the used slot keep its programs alive. */
+/* VP_HOST_TEST_EXTRACT:pair_probe_begin */
+/* The hints are only keys back to slots produced by the original resolution
+ * path. Every candidate runs the same full input comparison as the scan;
+ * resident references held by used slots keep their programs alive. */
 static int static_pair_hint_probe(const VPGxmDrawRequest *req,
                                   uint32_t vs_token, uint32_t fs_token,
                                   unsigned viewport, unsigned index_source,
                                   VPGxmProgramPair **out,
                                   VPStaticPair **owner) {
-    VPStaticPair *pair = static_pair_hint.pair;
+    for (unsigned i = 0; i < VP_STATIC_PAIR_HINTS; ++i) {
+        VPStaticPairHint *hint = &static_pair_hints[i];
+        VPStaticPair *pair = hint->pair;
 
-    if (pair == NULL || !pair->used) return 0;
-    if (static_pair_hint.vs_token != vs_token ||
-        static_pair_hint.fs_token != fs_token ||
-        static_pair_hint.viewport != viewport)
-        return 0;
-    if (!static_pair_inputs_match(pair, req, index_source)) return 0;
-    pair->last_use = ++static_clock;
-    static_stats.pair_hits++;
-    static_stats.pair_hint_hits++;
-    *out = &pair->base;
-    *owner = pair;
-    return 1;
+        if (pair == NULL || !pair->used) continue;
+        if (hint->vs_token != vs_token || hint->fs_token != fs_token ||
+            hint->viewport != viewport)
+            continue;
+        if (!static_pair_inputs_match(pair, req, index_source)) continue;
+        pair->last_use = ++static_clock;
+        hint->age = ++static_pair_hint_clock;
+        static_stats.pair_hits++;
+        static_stats.pair_hint_hits++;
+        *out = &pair->base;
+        *owner = pair;
+        return 1;
+    }
+    return 0;
 }
+/* VP_HOST_TEST_EXTRACT:pair_probe_end */
 
 /* Non-mutating cache probe for an already-built pair. Used while a batch is
  * open: a hit only refreshes LRU age and statistics, so no resident or pair
@@ -7094,6 +7156,7 @@ static void gxm_batch_publish_entry(VPGxmBatchEntry *entry) {
     commit_logs++;
 }
 
+/* VP_HOST_TEST_EXTRACT:pending_state_begin */
 /* One notification address per arena: NotificationWait tests equality. */
 typedef struct {
     int used;
@@ -7107,6 +7170,7 @@ typedef struct {
 } VPGxmPendingScene;
 static VPGxmPendingScene gxm_pending_scenes[VP_GXM_BATCH_ARENAS];
 static unsigned gxm_pending_scene_count;
+/* VP_HOST_TEST_EXTRACT:pending_state_end */
 
 static int gxm_scene_pipeline_active(void) {
     if (!gxm_scene_pipeline_enabled()) return 0;
@@ -7154,15 +7218,16 @@ static void gxm_pending_scene_record(unsigned arena, uint32_t value,
     }
 }
 
-/* Wait only before an arena is reused or CPU-visible work requires it. */
-static int gxm_pending_scene_complete_arena(unsigned arena, const char *why) {
-    VPGxmPendingScene *pending = &gxm_pending_scenes[arena];
+/* VP_HOST_TEST_EXTRACT:pending_functions_begin */
+/* Wait for one pending scene. A failure poisons the context and returns the
+ * original error without retiring the scene or releasing its upload pins: the
+ * failed wait does not prove the GPU stopped reading them. */
+static int gxm_pending_scene_wait(VPGxmPendingScene *pending, const char *why) {
     SceGxmNotification notification;
     uint64_t started, finished, blocked = 0u, now = 0u;
     int rc;
 
-    if (!pending->used) return 0;
-    notification.address = sceGxmGetNotificationRegion() + 1u + arena;
+    notification.address = sceGxmGetNotificationRegion() + 1u + pending->arena;
     notification.value = pending->notify_value;
     started = gxm_prof_now();
     rc = sceGxmNotificationWait(&notification);
@@ -7208,36 +7273,64 @@ static int gxm_pending_scene_complete_arena(unsigned arena, const char *why) {
                  (unsigned long long)gxm_pipeline_age_us,
                  (unsigned long long)gxm_pipeline_age_max);
     }
+    return 0;
+}
+
+static void gxm_pending_scene_retire_one(VPGxmPendingScene *pending) {
+    if (pending == NULL || !pending->used) return;
     for (unsigned i = 0; i < VP_UPLOAD_CACHE_SLOTS; ++i)
         if (pending->pins[i] && gxm_uploads[i].pending)
             gxm_uploads[i].pending--;
     memset(pending, 0, sizeof(*pending));
     gxm_pending_scene_count--;
-    return 0;
 }
 
-static int gxm_pending_scene_complete(const char *why) {
-    for (unsigned arena = 0; arena < VP_GXM_BATCH_ARENAS; ++arena) {
-        int rc = gxm_pending_scene_complete_arena(arena, why);
-        if (rc < 0) return rc;
-    }
-    return 0;
-}
-
-/* Retire a pending scene whose notification value was already waited by a
- * newer synchronous EndScene. Values grow in submission order, so v >= the
- * scene's value proves it completed. */
+/* Retire every pending scene whose notification the completed value proves
+ * finished. The comparison is the same serial-number test used to choose the
+ * newest scene, so a wrapped value cannot release a newer scene early. */
 static void gxm_pending_scene_retire_upto(uint32_t value) {
     for (unsigned arena = 0; arena < VP_GXM_BATCH_ARENAS; ++arena) {
         VPGxmPendingScene *pending = &gxm_pending_scenes[arena];
-        if (!pending->used || pending->notify_value > value) continue;
-        for (unsigned i = 0; i < VP_UPLOAD_CACHE_SLOTS; ++i)
-            if (pending->pins[i] && gxm_uploads[i].pending)
-                gxm_uploads[i].pending--;
-        memset(pending, 0, sizeof(*pending));
-        gxm_pending_scene_count--;
+        if (!pending->used || !gxm_notify_reached(value, pending->notify_value))
+            continue;
+        gxm_pending_scene_retire_one(pending);
     }
 }
+
+/* Wait only before an arena is reused or CPU-visible work requires it. */
+static int gxm_pending_scene_complete_arena(unsigned arena, const char *why) {
+    VPGxmPendingScene *pending = &gxm_pending_scenes[arena];
+    int rc;
+
+    if (!pending->used) return 0;
+    rc = gxm_pending_scene_wait(pending, why);
+    if (rc < 0) return rc;
+    gxm_pending_scene_retire_one(pending);
+    return 0;
+}
+
+/* Drain every pending scene. Scenes share one context and are submitted in
+ * notification order, so waiting for the newest pending value proves every
+ * older scene completed. The per-arena wait remains for arena reuse. */
+static int gxm_pending_scene_complete(const char *why) {
+    int newest = -1;
+    int rc;
+
+    for (unsigned arena = 0; arena < VP_GXM_BATCH_ARENAS; ++arena) {
+        VPGxmPendingScene *pending = &gxm_pending_scenes[arena];
+        if (!pending->used) continue;
+        if (newest < 0 ||
+            gxm_notify_newer(pending->notify_value,
+                             gxm_pending_scenes[newest].notify_value))
+            newest = (int)arena;
+    }
+    if (newest < 0) return 0;
+    rc = gxm_pending_scene_wait(&gxm_pending_scenes[newest], why);
+    if (rc < 0) return rc;
+    gxm_pending_scene_retire_upto(gxm_pending_scenes[newest].notify_value);
+    return 0;
+}
+/* VP_HOST_TEST_EXTRACT:pending_functions_end */
 
 /* Complete a scene whose draws were all encoded successfully. Called on
  * submission end and on every API/resource boundary. */
@@ -7303,8 +7396,8 @@ static int gxm_batch_flush_worker(unsigned reason) {
         SceGxmNotification notification;
         notification.address = sceGxmGetNotificationRegion() + 1u + gxm_batch_arena;
         *notification.address = 0u;
-        notification.value = ++gxm_notify_seq;
-        if (notification.value == 0u) notification.value = ++gxm_notify_seq;
+        gxm_notify_seq = gxm_notify_next(gxm_notify_seq);
+        notification.value = gxm_notify_seq;
         rc = sceGxmEndScene(gxm_context, NULL, &notification);
         t_end = gxm_prof_now();
         if (t_start != 0u) {
