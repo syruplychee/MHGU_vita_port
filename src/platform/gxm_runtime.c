@@ -972,6 +972,9 @@ static uint64_t gxm_perf_present_frames, gxm_perf_present_sum, gxm_perf_present_
 static uint64_t gxm_perf_present_last_at, gxm_perf_present_interval_sum;
 static uint64_t gxm_perf_present_interval_max, gxm_perf_present_interval_count;
 static uint64_t gxm_perf_present_buckets[VP_GXM_PERF_BUCKETS];
+/* Cumulative whole-frame intervals, distinct from the Present call duration.
+ * Difference two reports from the same scene to exclude boot/loading. */
+static uint32_t gxm_perf_frame_intervals[512];
 static uint64_t gxm_perf_global_ok, gxm_perf_global_fail, gxm_perf_global_skip;
 static unsigned gxm_last_draw_class = 2u; /* 0 colour, 1 depth-only, 2 noop */
 
@@ -1572,6 +1575,8 @@ static void gxm_perf_present(uint64_t fn_us, uint64_t now) {
         interval = now - gxm_perf_present_last_at;
         gxm_perf_present_interval_sum += interval;
         gxm_perf_present_interval_count++;
+        unsigned bucket=interval/1000u<511u ? (unsigned)(interval/1000u):511u;
+        gxm_perf_frame_intervals[bucket]++;
         if (interval > gxm_perf_present_interval_max)
             gxm_perf_present_interval_max = interval;
     }
@@ -1596,6 +1601,21 @@ static void gxm_perf_present(uint64_t fn_us, uint64_t now) {
              (unsigned long long)gxm_perf_global_ok,
              (unsigned long long)gxm_perf_global_fail,
              (unsigned long long)gxm_perf_global_skip);
+    if ((gxm_perf_present_frames % 32u) == 0u) {
+        glog("VP_GXM_FRAME_INTERVALS t_us=%llu count=%llu sum_us=%llu width_us=1000\n",
+            (unsigned long long)now,(unsigned long long)gxm_perf_present_interval_count,
+            (unsigned long long)gxm_perf_present_interval_sum);
+        /* Keep every line below the bounded log sink's formatting limit. */
+        for (unsigned base=0u;base<512u;base+=64u) {
+            char histogram[768];
+            unsigned used=0u;
+            for (unsigned i=0;i<64u;i++)
+                used+=(unsigned)snprintf(histogram+used,sizeof(histogram)-used,"%s%u",
+                    i?",":"",gxm_perf_frame_intervals[base+i]);
+            glog("VP_GXM_FRAME_BUCKETS t_us=%llu offset=%u hist=%s\n",
+                (unsigned long long)now,base,histogram);
+        }
+    }
     if ((gxm_perf_present_frames % 16u) == 0u) {
         /* Whole-frame budget from existing cumulative counters.
          *

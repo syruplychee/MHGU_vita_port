@@ -9,6 +9,8 @@ enable_testing()
 find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
 add_test(NAME vertex_rg32f_lowering
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_vertex_rg32f.py")
+add_test(NAME frame_window_metrics
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_frame_window.py")
 
 set(VP_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../src")
 set(VP_INCLUDES
@@ -71,6 +73,9 @@ endfunction()
 vp_host_test(audio_downmix)
 vp_host_test(audio_ipc "${VP_SRC}/platform/audio_ipc.c")
 vp_host_test(batch_policy)
+vp_host_test(engine_submit_probe)
+vp_host_test(engine_layout "${VP_SRC}/platform/engine_layout.c" "${VP_SRC}/platform/gpu_stream.c")
+target_compile_definitions(engine_layout PRIVATE VP_ENGINE_LAYOUT_CORE_ONLY=1)
 # audio_auto_catchup needs MAP_32BIT and is built in the UNIX block below.
 vp_host_test(clear_fusion "${VP_SRC}/platform/gxm_depth.c")
 vp_host_test(float_bits_numeric)
@@ -113,6 +118,9 @@ vp_host_test(vertex_window "${VP_SRC}/platform/vertex_window.c")
 if(WIN32)
     vp_host_test(session_gate)
     set_tests_properties(session_gate PROPERTIES TIMEOUT 25)
+    find_program(VP_TEST_POWERSHELL NAMES pwsh powershell REQUIRED)
+    add_test(NAME runtime_main_window COMMAND "${VP_TEST_POWERSHELL}"
+        -NoProfile -File "${CMAKE_CURRENT_SOURCE_DIR}/runtime_main_window.ps1")
 endif()
 
 # These two use POSIX-only memory and pthread facilities; CI runs them on Linux.

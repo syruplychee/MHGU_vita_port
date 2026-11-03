@@ -29,7 +29,7 @@
 12. [develop 开发起点与旧项目交接](12-development-baseline.md)
 13. [渲染性能安全迁移：结论、反例与测量教训](13-render-performance-lessons.md)
 14. [村庄黑块：原始代码、GXM 与模拟器的证据边界](14-render-black-block-investigation.md)
-15. [游戏内部渲染提交：入口线索与下一阶段计划](15-engine-render-submission-plan.md)
+15. [游戏内部渲染提交：公共入口、字段与已实施切片](15-engine-render-submission-plan.md)
 
 ## 参考
 
@@ -62,3 +62,4 @@
 - [0015 渲染性能安全迁移](decisions/0015-safe-render-performance.md)
 - [0016 本地 OpenGL 验证后端的顶点点积顺序](decisions/0016-local-vertex-dot-order.md)
 - [0017 角色浮点数据纹理保留 32 位精度](decisions/0017-lossless-vertex-float-textures.md)
+- [0018 游戏公共入口复用已准备的顶点布局](decisions/0018-engine-prepared-vertex-layout.md)

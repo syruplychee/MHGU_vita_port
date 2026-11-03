@@ -55,6 +55,7 @@ add_executable(vita_port_native_loader
     src/platform/guest_svc.c
     src/platform/gpu_stream.c
     src/platform/gpu_texture.c
+    src/platform/engine_layout.c
     src/platform/gxm_depth.c
     src/platform/gxm_depth_clear_native.c
     src/platform/gxm_depth_view.c

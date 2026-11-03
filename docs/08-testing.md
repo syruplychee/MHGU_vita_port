@@ -45,10 +45,13 @@ CI 使用 Ubuntu + GCC。
 
 ### 2.2 覆盖范围
 
-跨平台测试（29 项，需要 Python 3.10+）：
+跨平台测试（32 项，需要 Python 3.10+）：
 
 - `audio_downmix`、`audio_ipc`
 - `batch_policy`
+- `engine_submit_probe`、`engine_layout`：原调用点归类、完整布局内容匹配、不可变记录重放，
+  与原命令的 GPU/MME 状态逐字节比较
+- `frame_window_metrics`（Python）：整帧直方图完整性、正常退出/存档保护、同进程交替对照边界
 - `clear_fusion`
 - `float_bits_numeric`
 - `gpu_command_buffer`、`gpu_effective_rt`、`gpu_indices`、`gpu_stream`、
@@ -74,7 +77,8 @@ CI 使用 Ubuntu + GCC。
 测试 include；标记缺失会在 configure 阶段失败，避免静默测试一份复制实现。
 
 仅 Windows 另有 `session_gate`：使用真实 Win32 信号量和八线程，检查共享门锁的
-互斥、递归、先释放后等待、过期唤醒 token 与错误传播。当前 Windows 共 30 项。
+互斥、递归、先释放后等待、过期唤醒 token 与错误传播。`runtime_main_window` 直接提取
+运行器的窗口选择函数，检查最小化 Qt 启动器和 SDL 游戏窗口的选择。当前 Windows 共 34 项。
 
 附加的播片计时工具测试：
 

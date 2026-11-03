@@ -14,6 +14,8 @@
 #include "media_video.h"
 #include "movie_control.h"
 #include "session_gate.h"
+#include "engine_submit_probe.h"
+#include "engine_layout.h"
 #include <stddef.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/kernel/cpu.h>
@@ -36,6 +38,10 @@ extern void vp_sdk_try_lock(void),vp_sdk_is_locked(void);
 extern void vp_sdk_video_readback(void);
 extern void vp_movie_color_rgb_enter(void),vp_movie_color_rgb_leave(void);
 extern void vp_movie_color_nv12_enter(void),vp_movie_color_nv12_leave(void);
+extern void vp_engine_submit_enter(void),vp_engine_submit_leave(void);
+extern void vp_engine_layout_entry(void);
+uint32_t vp_engine_layout_resume;
+uint32_t vp_engine_layout_fallback;
 extern const unsigned char vp_sdk_svc_site_template[],vp_sdk_svc_site_end[];
 extern const unsigned char vp_sdk_svc_site_service_value[],vp_sdk_svc_site_continuation_value[],vp_sdk_svc_site_branch[];
 extern const unsigned char vp_sdk_timer_site_template[],vp_sdk_timer_site_end[];
@@ -89,6 +95,13 @@ typedef struct {
     uint32_t mode,width,height,destination,source_y,source_uv;
 } VPMovieColorTiming;
 static int movie_color_probe_enabled;
+static int engine_submit_probe_enabled;
+static uint32_t engine_submit_replay;
+static uint32_t engine_submit_leave_replay;
+typedef struct {
+    uint64_t started;
+    uint32_t active,object,state,command,before,family,same_object,same_layout;
+} VPEngineSubmitTiming;
 typedef struct {
     VPThreadLocalAllocator allocator;
     Lock locks[VP_SDK_LOCK_LIMIT];
@@ -103,6 +116,8 @@ typedef struct {
     VPExecutor *main_executor;
     VPMovieColorTiming movie_color[64]; /* Main plus the 63 guest worker slots. */
     unsigned movie_color_samples;
+    VPEngineSubmitTiming engine_submit[64];
+    VPEngineSubmitStats engine_stats;
     unsigned movie_readback_stacks;
     VPUnwindRegistry exceptions;
     VPSdkExceptionIndex indexes[4];
@@ -418,7 +433,110 @@ static int movie_color_probe_patch(FILE *log,VPNativeModule *m) {
     return rc;
 }
 
+static int engine_submit_probe_patch(FILE *log,VPNativeModule *m) {
+    FILE *marker=fopen("ux0:data/mhgu-vita-port/engine-submit-probe.enable","rb");
+    engine_submit_probe_enabled=marker!=NULL;
+    if (marker) fclose(marker);
+    fprintf(log,"ENGINE_SUBMIT_PROBE_MODE enabled=%d\n",engine_submit_probe_enabled);
+    if (!engine_submit_probe_enabled) return 0;
+    static const unsigned char file_sha[32]={
+        0xb3,0x93,0x54,0x15,0x49,0x95,0x49,0xad,0xaf,0x4c,0x0e,0x89,0x82,0x28,0x31,0xda,
+        0xa1,0x75,0xcf,0xd4,0x56,0xa7,0x99,0x07,0x91,0xc7,0x9b,0xe3,0x99,0x76,0x45,0xef};
+    static const unsigned char body_sha[32]={
+        0xe7,0x1e,0x66,0xbb,0xa8,0x8c,0x89,0xc1,0x8a,0xd8,0xd2,0xe4,0x65,0x1d,0xd3,0x18,
+        0x8c,0xcb,0x3a,0xed,0xf5,0x34,0x84,0xaf,0x9b,0x30,0xd2,0x10,0xc8,0xb4,0x65,0x7e};
+    static const struct {uint32_t site,word;void (*entry)(void);} sites[]={
+        {0xbc1764u,0xe92d4ff0u,vp_engine_submit_enter},
+        {0xbc23d4u,0xe28dd04cu,vp_engine_submit_leave}};
+    unsigned char sha[32];
+    if (memcmp(m->nso.file_sha256,file_sha,32)) return VP_PATCH_BINDING;
+    if (m->nso.segments[0].bytes<0xbc23dcu) return VP_PATCH_RANGE;
+    vp_sha256(m->image+0xbc1764u,0xc78u,sha);
+    if (memcmp(sha,body_sha,32)) return VP_PATCH_BINDING;
+    for (unsigned i=0;i<2u;i++)
+        if (word(m->image+sites[i].site)!=sites[i].word) return VP_PATCH_BINDING;
+    uint32_t off=m->island_offset+m->island_bytes;
+    if ((off&3u) || off>m->capacity || 32u>m->capacity-off) return VP_PATCH_RANGE;
+    for (unsigned i=0;i<2u;i++) {
+        int64_t delta=(int64_t)off+i*8u-sites[i].site-8;
+        if (delta<-(int64_t)VP_PATCH_BRANCH_REACH || delta>=VP_PATCH_BRANCH_REACH)
+            return VP_PATCH_REACH;
+    }
+    VPPatchTarget target;
+    int rc=vp_patch_open(&target,m->image,m->nso.span,m->base);
+    for (unsigned i=0;i<2u && !rc;i++) {
+        uint32_t island=m->base+off+i*8u;
+        uint32_t veneer[2]={0xe51ff004u,(uint32_t)(uintptr_t)sites[i].entry};
+        memcpy(m->image+off+i*8u,veneer,sizeof(veneer));
+        rc=vp_patch_site(&target,sites[i].site,sites[i].word,island);
+        fprintf(log,"ENGINE_SUBMIT_PATCH site=0x%x original=%08x island=%08x status=%d\n",
+            sites[i].site,sites[i].word,island,rc);
+    }
+    if (!rc) {
+        uint32_t replay[4]={0xe92d4ff0u,0xea000000u|
+            (((0xbc1768u-(off+20u+8u))>>2)&0xffffffu),
+            0xe28dd04cu,0xea000000u|(((0xbc23d8u-(off+28u+8u))>>2)&0xffffffu)};
+        memcpy(m->image+off+16u,replay,sizeof(replay));
+        engine_submit_replay=m->base+off+16u;
+        engine_submit_leave_replay=m->base+off+24u;
+        m->island_bytes+=32u;
+    }
+    return rc;
+}
+
+static int engine_layout_patch(FILE *log,VPNativeModule modules[4]) {
+    FILE *marker=fopen("ux0:data/mhgu-vita-port/engine-layout.enable","rb");
+    int enabled=marker!=NULL;
+    if (marker) fclose(marker);
+    fprintf(log,"ENGINE_LAYOUT_MODE enabled=%d\n",enabled);
+    if (!enabled) return 0;
+    if (engine_submit_probe_enabled) return VP_PATCH_BINDING;
+    VPNativeModule *m=&modules[1],*sdk=&modules[3];
+    static const unsigned char main_sha[32]={
+        0xe7,0x1e,0x66,0xbb,0xa8,0x8c,0x89,0xc1,0x8a,0xd8,0xd2,0xe4,0x65,0x1d,0xd3,0x18,
+        0x8c,0xcb,0x3a,0xed,0xf5,0x34,0x84,0xaf,0x9b,0x30,0xd2,0x10,0xc8,0xb4,0x65,0x7e};
+    static const struct {unsigned offset,bytes;unsigned char sha[32];} checks[]={
+        {0x33f8b0u,0x1b4u,{0x4c,0x22,0x37,0xd6,0xaa,0x39,0xc8,0x9a,
+            0x07,0x5d,0xe1,0xc8,0x0d,0x91,0x9c,0xdb,0xae,0xbb,0xe8,0x14,0xf0,0x4a,0x9f,0x4d,
+            0x96,0x9e,0xdb,0xb6,0x61,0xc2,0xc6,0x72}},
+        {0x33fa64u,0x154u,{0x81,0x70,0x47,0x6f,0xe0,0x5b,0x44,0x83,
+            0xc7,0x95,0x30,0xbe,0x82,0x7b,0xa1,0x59,0xf6,0x00,0x65,0xe2,0x72,0x31,0xde,0x98,
+            0xce,0xdf,0x4d,0xba,0xc9,0xe4,0xcb,0x53}}};
+    unsigned char sha[32];
+    if (m->nso.segments[0].bytes<0xbc23e4u || sdk->nso.segments[0].bytes<0x33fbb8u)
+        return VP_PATCH_RANGE;
+    if (word(m->image+0xbc23e0u)!=0x00c7ffbcu) return VP_PATCH_BINDING;
+    vp_sha256(m->image+0xbc1764u,0xc78u,sha);
+    if (memcmp(sha,main_sha,32)) return VP_PATCH_BINDING;
+    for (unsigned i=0;i<2u;i++) {
+        vp_sha256(sdk->image+checks[i].offset,checks[i].bytes,sha);
+        if (memcmp(sha,checks[i].sha,32)) return VP_PATCH_BINDING;
+    }
+    uint32_t off=m->island_offset+m->island_bytes;
+    if ((off&3u) || off>m->capacity || 20u>m->capacity-off) return VP_PATCH_RANGE;
+    int64_t delta=(int64_t)off-0xbc17d8u-8;
+    if (delta<-(int64_t)VP_PATCH_BRANCH_REACH || delta>=VP_PATCH_BRANCH_REACH) return VP_PATCH_REACH;
+    if (vp_engine_layout_init(sdk->base+0x33f8b0u,sdk->base+0x33fa64u)) return VP_PATCH_ARGUMENT;
+    vp_engine_layout_resume=m->base+0xbc1814u;
+    vp_engine_layout_fallback=m->base+off+8u;
+    uint32_t veneer[5]={0xe51ff004u,(uint32_t)(uintptr_t)vp_engine_layout_entry,
+        0xe59f0000u,0xea000000u|(((0xbc17dcu-(off+20u))>>2)&0xffffffu),
+        word(m->image+0xbc23e0u)};
+    memcpy(m->image+off,veneer,sizeof(veneer));
+    VPPatchTarget target;
+    int rc=vp_patch_open(&target,m->image,m->nso.span,m->base);
+    if (!rc) rc=vp_patch_site(&target,0xbc17d8u,0xe59f0c00u,m->base+off);
+    if (!rc) m->island_bytes+=20u;
+    fprintf(log,"ENGINE_LAYOUT_PATCH site=0xbc17d8 original=e59f0c00 continuation=%08x status=%d\n",
+        vp_engine_layout_resume,rc);
+    return rc;
+}
+
 int vp_sdk_dso_patch(FILE *log,VPNativeModule modules[4]) {
+    int engine_rc=engine_submit_probe_patch(log,&modules[1]);
+    if (engine_rc) return engine_rc;
+    engine_rc=engine_layout_patch(log,modules);
+    if (engine_rc) return engine_rc;
     int color_rc=movie_color_probe_patch(log,&modules[2]);
     if (color_rc) {
         fprintf(log,"MOVIE_COLOR_PROBE_REJECT status=%d\n",color_rc);fflush(log);
@@ -801,8 +919,74 @@ static int movie_color_probe_service(Session *s,VPExecutor *e,VPBridgeFrame *f) 
     return 0;
 }
 
+static void engine_submit_report(Session *s) {
+    const VPEngineSubmitStats *p=&s->engine_stats;
+    fprintf(s->log,"ENGINE_SUBMIT_STATS calls=%llu same_object=%llu same_layout=%llu "
+        "elapsed_us=%llu max_us=%u encoded_bytes=%llu families=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+        (unsigned long long)p->calls,(unsigned long long)p->same_object,
+        (unsigned long long)p->same_layout,(unsigned long long)p->elapsed_us,p->max_us,
+        (unsigned long long)p->encoded_bytes,(unsigned long long)p->families[0],
+        (unsigned long long)p->families[1],(unsigned long long)p->families[2],
+        (unsigned long long)p->families[3],(unsigned long long)p->families[4],
+        (unsigned long long)p->families[5],(unsigned long long)p->families[6],
+        (unsigned long long)p->families[7],(unsigned long long)p->families[8]);
+}
+
+static int engine_submit_probe_service(Session *s,VPExecutor *e,VPBridgeFrame *f) {
+    if (!engine_submit_probe_enabled) return VP_BRIDGE_UNSUPPORTED;
+    VPGuestThread *thread=thread_for_executor(e);
+    unsigned slot;
+    if (e==s->main_executor) slot=0u;
+    else if (thread && thread->handle) slot=1u+(unsigned)(thread-thread_pool.threads);
+    else return VP_BRIDGE_ARGUMENT;
+    VPEngineSubmitTiming *t=&s->engine_submit[slot];
+    if (f->service==0x250u) {
+        uint32_t state=f->regs[1],object=f->regs[2],old,layout,old_layout=0u;
+        if (t->active || state>UINT32_MAX-0x14u || object>UINT32_MAX-12u ||
+            !vp_guest_svc_readable(&s->svc,state,0x14u) ||
+            !vp_guest_svc_readable(&s->svc,object,12u) ||
+            f->sp<36u || !writable(e,s,f->sp-36u,36u)) return VP_BRIDGE_ARGUMENT;
+        old=word((void *)(uintptr_t)(state+0x10u));
+        layout=word((void *)(uintptr_t)(object+8u));
+        if (old) {
+            if (old>UINT32_MAX-12u || !vp_guest_svc_readable(&s->svc,old,12u))
+                return VP_BRIDGE_ARGUMENT;
+            old_layout=word((void *)(uintptr_t)(old+8u));
+        }
+        uint32_t command=word((void *)(uintptr_t)(state+4u));
+        if (command>UINT32_MAX-16u || !vp_guest_svc_readable(&s->svc,command,16u))
+            return VP_BRIDGE_ARGUMENT;
+        *t=(VPEngineSubmitTiming){.active=1u,.object=object,.state=state,
+            .command=command,.before=word((void *)(uintptr_t)(command+12u)),
+            .family=vp_engine_submit_family(f->lr-e->modules[1].base),
+            .same_object=old==object,.same_layout=old && old_layout==layout};
+        if (s->engine_stats.calls<16u)
+            fprintf(s->log,"ENGINE_SUBMIT_SAMPLE thread=%u caller=%08x ctx=%08x state=%08x "
+                "object=%08x old=%08x layout=%08x old_layout=%08x command=%08x family=%u\n",
+                slot,f->lr-e->modules[1].base,f->regs[0],state,object,old,layout,old_layout,
+                command,t->family);
+        /* PUSH must run after restoring the bridge frame: its guest stack
+         * destination overlaps the tail of the currently saved frame. */
+        f->pc=engine_submit_replay;
+        t->started=sceKernelGetProcessTimeWide();
+    } else {
+        uint64_t elapsed=sceKernelGetProcessTimeWide()-t->started;
+        if (!t->active || f->sp>UINT32_MAX-0x4cu) return VP_BRIDGE_ARGUMENT;
+        uint32_t after=word((void *)(uintptr_t)(t->command+12u));
+        /* A command-buffer growth is not a contiguous byte range. */
+        uint32_t bytes=after>=t->before && after-t->before<0x100000u ? after-t->before:0u;
+        vp_engine_submit_account(&s->engine_stats,t->family,t->same_object,t->same_layout,
+            elapsed>UINT32_MAX?UINT32_MAX:(uint32_t)elapsed,bytes);
+        t->active=0u;
+        f->pc=engine_submit_leave_replay;
+        if (!(s->engine_stats.calls&4095u)) engine_submit_report(s);
+    }
+    return 0;
+}
+
 static int dispatch_locked(VPExecutor *e,VPBridgeFrame *f) {
     Session *s=e->user;
+    if (f->service==0x250u || f->service==0x251u) return engine_submit_probe_service(s,e,f);
     if (f->service>=0x24cu && f->service<=0x24fu) return movie_color_probe_service(s,e,f);
     if (f->service==0x24bu) {
         int32_t error=(int32_t)f->regs[0];
@@ -3234,6 +3418,8 @@ int vp_sdk_dso_execute(FILE *log,VPExecutor *e) {
         /* DSO registration and constructor dispatch now happen inside the
          * original Start path, after nnosInitialize installed ThreadManager. */
         uint32_t flag=word(m->image+0x862754),tp=word((void *)(uintptr_t)(e->bridge.guest.tls_ro+0x1f8));
+        if (engine_submit_probe_enabled) engine_submit_report(s);
+        vp_engine_layout_report(log);
         fprintf(log,"SDK_DSO status=%d service=0x%x observed=%u mask=%u gated=%u sdk_flag=%u tls_ro=0x%08x tp=0x%08x tls_rw=0x%08x live=%u peak=%u locks=%u unlocks=%u recycles=%u nnmain=%u session_stop=%u\n",
             stopped,f->service,s->observed,s->observed_mask,s->gated,flag,e->bridge.guest.tls_ro,tp,e->bridge.guest.tls_rw,s->allocator.live_allocations,s->allocator.peak_bytes,s->lock_calls,s->unlock_calls,s->lock_recycles,
             s->nnmain_found?1u:0u,s->session_stopped?1u:0u);

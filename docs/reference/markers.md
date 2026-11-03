@@ -19,6 +19,10 @@ Marker 是 `ux0:data/mhgu-vita-port/` 下的空文件或短文本文件。运行
 
 ## 2. 渲染策略
 
+`engine-layout.enable` 启动时接管已锁定的游戏公共入口，复用顶点布局的完整准备结果；
+当前为显式选择，详见 ADR 0018。`engine-submit-probe.enable` 仅测原入口，默认关闭，
+两者不能同时使用。它们都不允许通过跳过 draw 或降低效果来宣称提速。
+
 | Marker | 默认 | 说明 |
 |---|---|---|
 | `scene-pipeline.enable` | 默认开启 | 旧显式开关；B116 起普通 batch 默认使用 |

@@ -3,6 +3,7 @@
 #include "audio_render.h"
 #include "audio_sink.h"
 #include "gpu_stream.h"
+#include "engine_layout.h"
 #include "gpu_texture.h"
 #include "texture_snapshot.h"
 #include "gpu_indices.h"
@@ -254,6 +255,7 @@ typedef struct {
     uint32_t cbuf_high[VP_GPU_SUBCHANNELS];
     uint32_t cbuf_size[VP_GPU_SUBCHANNELS];
     uint32_t draw_count;
+    unsigned layout_report_entries;
 } VPGpuDecode;
 
 static void vp_gpu_decode_release(void *opaque) {
@@ -4313,6 +4315,7 @@ static void vp_guest_gpu_decode_entry_locked(VPGuestSvc *svc, VPGuestSession *st
     uint64_t phase_end;
     size_t k = 0;
     size_t write_count = 0;
+    unsigned layout_consumed=0u;
     int bad;
 
     vp_hid_fill_state(svc);
@@ -4349,6 +4352,7 @@ static void vp_guest_gpu_decode_entry_locked(VPGuestSvc *svc, VPGuestSession *st
      * stays the producer's; decoder state never borrows a mutable pointer. */
     memcpy(decode->commands.words,(const void *)(uintptr_t)cpu,
            (size_t)words * sizeof(uint32_t));
+    if (!(++decode->layout_report_entries&1023u)) vp_engine_layout_report(svc->log);
     if (perf) {
         phase_end = sceKernelGetProcessTimeWide();
         gpu_cpu_perf.command_copy_us += phase_end - phase;
@@ -4383,6 +4387,18 @@ static void vp_guest_gpu_decode_entry_locked(VPGuestSvc *svc, VPGuestSession *st
     direct.log = log;
     while (k < write_count) {
         vp_gpu_write write = decode->commands.writes[k];
+        if (write.method==VP_ENGINE_LAYOUT_METHOD &&
+            (write.value&0xffff0000u)==VP_ENGINE_LAYOUT_TOKEN) {
+            if (vp_engine_layout_consume(write.value,write.sub,&decode->state,&decode->shared)) {
+                ++svc->ipc_unsupported;
+                slog(svc,"VP_ENGINE_LAYOUT_REJECT token=%08x sub=%u fd=%u submission=%u\n",
+                    write.value,write.sub,fd,submission);
+                return;
+            }
+            layout_consumed++;
+            k++;
+            continue;
+        }
         if (write.method < 0xE00u) {
             vp_macro_upload_apply(&decode->macros, &decode->upload,
                                   write.method, write.value);
@@ -4439,6 +4455,7 @@ static void vp_guest_gpu_decode_entry_locked(VPGuestSvc *svc, VPGuestSession *st
             direct.upload_size = 0u;
         }
     }
+    vp_engine_layout_note_consumed(layout_consumed);
     if (perf) {
         phase_end = sceKernelGetProcessTimeWide();
         gpu_cpu_perf.command_dispatch_us += phase_end - phase;

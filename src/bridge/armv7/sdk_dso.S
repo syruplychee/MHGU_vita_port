@@ -67,6 +67,32 @@ VP_HOST_BRIDGE_FUNCTION vp_movie_color_rgb_enter, 0x24c
 VP_HOST_BRIDGE_FUNCTION vp_movie_color_rgb_leave, 0x24d
 VP_HOST_BRIDGE_FUNCTION vp_movie_color_nv12_enter, 0x24e
 VP_HOST_BRIDGE_FUNCTION vp_movie_color_nv12_leave, 0x24f
+/* Locked main resource-submit sites; handlers replay the displaced words. */
+VP_HOST_BRIDGE_FUNCTION vp_engine_submit_enter, 0x250
+VP_HOST_BRIDGE_FUNCTION vp_engine_submit_leave, 0x251
+
+/* Only the two fixed-count layout encoders are replaced. The C helper uses
+ * guest-TLS-safe memory operations and original SDK calls on
+ * misses. It preserves callee-saved registers and the original guest stack. */
+.balign 4
+.global vp_engine_layout_entry
+.type vp_engine_layout_entry,%function
+vp_engine_layout_entry:
+    push {r0-r3,ip,lr}
+    mov r0,r5
+    mov r1,r4
+    bl vp_engine_layout_prepare
+    cmp r0,#0
+    beq 2f
+    pop {r0-r3,ip,lr}
+    ldr ip,1f
+    ldr pc,[ip]
+1:  .word vp_engine_layout_resume
+2:  pop {r0-r3,ip,lr}
+    ldr ip,3f
+    ldr pc,[ip]
+3:  .word vp_engine_layout_fallback
+.size vp_engine_layout_entry,.-vp_engine_layout_entry
 
 /* Pure tail forwards: exception propagation stays entirely on the guest
  * stack, through the original SDK runtime. No host C++ runtime is linked. */
