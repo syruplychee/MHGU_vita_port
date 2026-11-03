@@ -4,6 +4,13 @@
 #include <stdint.h>
 
 #define VP_TEXTURE_UPLOAD_RGBA16F 0x101u
+/* Lossless vertex RGBA32F representation: each logical pixel is stored as two
+ * physical RG32F texels, so all four original 32-bit channel patterns survive
+ * and the physical texture is twice as wide. The identity is distinct from
+ * RGBA16F (0x101), signed BC4/BC5 (0x227/0x228) and their swizzle variants. */
+#define VP_TEXTURE_UPLOAD_RGBA32F_RG32F 0x201u
+#define VP_TEXTURE_RG32F_LOGICAL_MAX_WIDTH 2048u
+#define VP_TEXTURE_RG32F_MAX_HEIGHT 4096u
 
 /* Encoded upload identity returned by vp_texture_upload_format(). The low byte
  * is the Maxwell TIC format. The high bits distinguish descriptor variants that
@@ -50,6 +57,28 @@ int vp_texture_blocks_linear(const uint8_t *src,size_t bytes,uint8_t *dst,
  * applying the TIC component remap. */
 int vp_texture_rgba32f_pitch_to_rgba16f(const uint8_t *src,size_t src_bytes,
     uint8_t *dst,unsigned width,unsigned height,size_t pitch,uint32_t tic_word0);
+/* Lossless vertex upload: map the TIC channel selectors onto logical RGBA,
+ * then store (R,G) and (B,A) as two RG32F texels per logical pixel. All four
+ * 32-bit patterns are copied unchanged; no half conversion is performed.
+ * The destination is tightly packed at 16 bytes per logical pixel. */
+int vp_texture_rgba32f_pitch_to_rg32f(const uint8_t *src,size_t src_bytes,
+    uint8_t *dst,size_t dst_bytes,unsigned width,unsigned height,size_t pitch,
+    uint32_t tic_word0);
+/* Measured vertex RGBA32F contract: TIC format/header/type, pitch-linear 2D,
+ * no mips, point min/mag filters and no border address mode. */
+typedef struct {
+    unsigned width,height;
+    uint32_t tic_word0;
+    unsigned tic_format, tic_header, texture_type;
+    unsigned depth, block_depth, max_mip_level;
+    size_t pitch, storage;
+    uint32_t sampler[2];
+} VPTextureVertexRg32fView;
+
+/* Returns NULL when the view is the measured layout, otherwise a stable
+ * reason tag. Unknown selectors and SINT/UINT component fields are refused
+ * rather than numerically reinterpreted. */
+const char *vp_texture_vertex_rg32f_check(const VPTextureVertexRg32fView *view);
 /* Build a GXM cube-map payload from one decoded RGBA face. The face is
  * replicated six times and a complete Morton-swizzled mip chain is generated. */
 unsigned vp_texture_cube_mip_count(unsigned width,unsigned height);

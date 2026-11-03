@@ -113,6 +113,9 @@ typedef struct {
     unsigned default_uniform_bytes;
     const SceGxmProgramParameter *tex[VP_GXM_FRAGMENT_SAMPLER_LIMIT];
     const SceGxmProgramParameter *tex_inv_size[VP_GXM_FRAGMENT_SAMPLER_LIMIT];
+    /* Vertex-only RGBA32F layout selector: 0 ordinary, 1 packed/repeat U,
+     * 2 packed/clamp U. Logical inverse extents remain unchanged. */
+    const SceGxmProgramParameter *tex_rgba32f_packed[VP_GXM_FRAGMENT_SAMPLER_LIMIT];
     const SceGxmProgramParameter *fragcoord_scale;
     /* Software-shadow helper ABI: three float4 uniforms per declared shadow
      * slot.  A partial trio is never filled with zero; it is refused. */
@@ -3872,7 +3875,32 @@ static int set_texture_extent_uniforms(void *buffer, const SceGxmProgram *progra
                                        const VPGxmDrawRequest *req, int vertex) {
     unsigned slots = vertex ? 3u : VP_GXM_FRAGMENT_SAMPLER_LIMIT;
     for (unsigned slot=0;slot<slots;slot++) {
-        char name[32];
+        char name[40];
+        unsigned format=0u,packed_value=0u;
+        const SceGxmProgramParameter *packed;
+        if (vertex && slot==0u) format=req->vertex_texture.tex_format;
+        else if (!vertex && slot==0u) format=req->tex_format;
+        else if (!vertex) format=req->extra_textures[slot-1u].tex_format;
+        if (format==VP_TEXTURE_UPLOAD_RGBA32F_RG32F) {
+            if (!vertex) {
+                glog("VP_GXM_TEXTURE_PACKED_UNSUPPORTED stage=fs slot=%u\n",slot);
+                return -1;
+            }
+            packed_value=(req->vertex_texture.sampler[0]&7u)==2u ? 2u : 1u;
+        }
+        snprintf(name,sizeof(name),"tex%u_rgba32f_packed",slot);
+        packed=sceGxmProgramFindParameterByName(program,name);
+        if (packed_value && packed==NULL) {
+            glog("VP_GXM_TEXTURE_PACKED_UNIFORM_MISSING stage=%s slot=%u "
+                 "format=0x%x detail=packed-texture-without-selector\n",
+                 vertex?"vs":"fs",slot,format);
+            return -1;
+        }
+        if (packed!=NULL) {
+            float value=(float)packed_value;
+            int rc=sceGxmSetUniformDataF(buffer,packed,0,1,&value);
+            if (rc<0) return rc;
+        }
         snprintf(name,sizeof(name),"tex%u_inv_size",slot);
         const SceGxmProgramParameter *p=sceGxmProgramFindParameterByName(program,name);
         if (!p) continue;
@@ -4646,6 +4674,9 @@ static int static_reflection_build(const SceGxmProgram *program, unsigned stage,
         refl->tex[i] = sceGxmProgramFindParameterByName(program, name);
         snprintf(name, sizeof(name), "tex%u_inv_size", i);
         refl->tex_inv_size[i] = sceGxmProgramFindParameterByName(program, name);
+        snprintf(name, sizeof(name), "tex%u_rgba32f_packed", i);
+        refl->tex_rgba32f_packed[i] =
+            sceGxmProgramFindParameterByName(program, name);
         snprintf(name, sizeof(name), "tex%u_shadow_extent", i);
         refl->shadow_extent[i] = sceGxmProgramFindParameterByName(program, name);
         snprintf(name, sizeof(name), "tex%u_shadow_state", i);
@@ -5454,8 +5485,31 @@ static int static_set_texture_extent(void *buffer, const VPStaticReflection *ref
     unsigned slots = vertex ? 3u : VP_GXM_FRAGMENT_SAMPLER_LIMIT;
     for (slot = 0; slot < slots; ++slot) {
         const SceGxmProgramParameter *p = refl->tex_inv_size[slot];
+        const SceGxmProgramParameter *packed = refl->tex_rgba32f_packed[slot];
         unsigned width = 0u, height = 0u;
+        unsigned format = 0u, packed_value = 0u;
         float inverse[2];
+        if (vertex && slot == 0u) format = req->vertex_texture.tex_format;
+        else if (!vertex && slot == 0u) format = req->tex_format;
+        else if (!vertex) format = req->extra_textures[slot - 1u].tex_format;
+        if (format == VP_TEXTURE_UPLOAD_RGBA32F_RG32F) {
+            if (!vertex) {
+                glog("VP_GXM_STATIC_PACKED_UNSUPPORTED slot=%u\n", slot);
+                return -1;
+            }
+            packed_value = (req->vertex_texture.sampler[0]&7u)==2u ? 2u : 1u;
+        }
+        if (packed_value != 0u && packed == NULL) {
+            glog("VP_GXM_STATIC_PACKED_UNIFORM_MISSING stage=%s slot=%u "
+                 "format=0x%x detail=packed-texture-without-selector\n",
+                 vertex ? "vs" : "fs", slot, format);
+            return -1;
+        }
+        if (packed != NULL) {
+            float value = (float)packed_value;
+            if (sceGxmSetUniformDataF(buffer, packed, 0, 1, &value) < 0)
+                return -1;
+        }
         if (p == NULL) continue;
         if (vertex && slot == 0u) {
             width = req->vertex_texture.width;
@@ -5818,6 +5872,10 @@ static int frame_gxm_texture_format(unsigned upload,SceGxmTextureFormat *out) {
     if (upload==0u) { *out=SCE_GXM_TEXTURE_FORMAT_A8B8G8R8; return 0; }
     if (upload==VP_TEXTURE_UPLOAD_RGBA16F) {
         *out=SCE_GXM_TEXTURE_FORMAT_F16F16F16F16_ABGR;
+        return 0;
+    }
+    if (upload==VP_TEXTURE_UPLOAD_RGBA32F_RG32F) {
+        *out=SCE_GXM_TEXTURE_FORMAT_F32F32_GR;
         return 0;
     }
     if (upload==0x24u) { *out=SCE_GXM_TEXTURE_FORMAT_UBC1_ABGR; return 0; }
@@ -9429,6 +9487,10 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
                 ? &batch_entry->vertex_texture : &gxm_vertex_texture;
             int vertex_desc_hit = 0;
             const void *vertex_desc_backing = NULL;
+            /* The logical extent stays in request/uniform space; GXM sees the
+             * physical 2x width of the lossless RG32F split. */
+            unsigned desc_width = extra->tex_format==VP_TEXTURE_UPLOAD_RGBA32F_RG32F
+                ? extra->width*2u : extra->width;
             if (batch_entry != NULL) {
                 VPTextureSnapshotKey key = gxm_snapshot_key(extra->va,
                     extra->width, extra->height, extra->tex_format, extra->cube,
@@ -9441,14 +9503,14 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
                     return -1;
                 }
                 vertex_desc_backing = tex_mem;
-                if (!gxm_texture_desc_lookup(tex_mem, extra->width,
+                if (!gxm_texture_desc_lookup(tex_mem, desc_width,
                         extra->height, fmt, extra->cube, mip_count,
                         VP_GXM_TEXTURE_DESC_EXTRA, extra->sampler, vtex)) {
                     rc=extra->cube ?
                         sceGxmTextureInitCube(vtex,tex_mem,
                             fmt,extra->width,extra->height,mip_count) :
                         sceGxmTextureInitLinear(vtex,tex_mem,
-                            fmt,extra->width,extra->height,1);
+                            fmt,desc_width,extra->height,1);
                     if (rc<0) {
                         frame_release_fs(frame_fs, frame_fs_owned);
                         return rc;
@@ -9456,7 +9518,7 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
                 } else vertex_desc_hit = 1;
                 batch_entry->vertex_cpu_texture = 1;
             } else {
-                if (!gxm_vertex_texture_mem || gxm_vertex_texture_width!=extra->width ||
+                if (!gxm_vertex_texture_mem || gxm_vertex_texture_width!=desc_width ||
                     gxm_vertex_texture_height!=extra->height ||
                     gxm_vertex_texture_format!=extra->tex_format ||
                     gxm_vertex_texture_cube!=extra->cube ||
@@ -9475,12 +9537,12 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
                         sceGxmTextureInitCube(&gxm_vertex_texture,gxm_vertex_texture_mem,
                             fmt,extra->width,extra->height,mip_count) :
                         sceGxmTextureInitLinear(&gxm_vertex_texture,gxm_vertex_texture_mem,
-                            fmt,extra->width,extra->height,1);
+                            fmt,desc_width,extra->height,1);
                     if (rc<0) {
                         frame_release_fs(frame_fs, frame_fs_owned);
                         return rc;
                     }
-                    gxm_vertex_texture_width=extra->width;
+                    gxm_vertex_texture_width=desc_width;
                     gxm_vertex_texture_height=extra->height;
                     gxm_vertex_texture_format=extra->tex_format;
                     gxm_vertex_texture_cube=extra->cube;
@@ -9515,12 +9577,13 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
                     (extra->sampler[1]&3u)==2u?SCE_GXM_TEXTURE_FILTER_LINEAR:
                                                 SCE_GXM_TEXTURE_FILTER_POINT);
                 sceGxmTextureSetMipFilter(vtex,
+                    extra->tex_format!=VP_TEXTURE_UPLOAD_RGBA32F_RG32F &&
                     ((extra->sampler[1]>>6)&3u)!=0u ? SCE_GXM_TEXTURE_MIP_FILTER_ENABLED :
                                                        SCE_GXM_TEXTURE_MIP_FILTER_DISABLED);
                 sceGxmTextureSetUAddrMode(vtex,u_mode);
                 sceGxmTextureSetVAddrMode(vtex,v_mode);
                 if (batch_entry != NULL)
-                    gxm_texture_desc_store(vertex_desc_backing, extra->width,
+                    gxm_texture_desc_store(vertex_desc_backing, desc_width,
                         extra->height, fmt, extra->cube, mip_count,
                         VP_GXM_TEXTURE_DESC_EXTRA, extra->sampler, vtex);
             }

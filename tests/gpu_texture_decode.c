@@ -5,6 +5,7 @@
 
 static uint8_t input[4096], output[64 * 64 * 4];
 static uint8_t float_source[48], float_half[16];
+static uint8_t float32_source[128], float32_rg32[128];
 static uint8_t cube_rgba[4 * 4 * 4],cube_data[504];
 static uint8_t cube_rgba64[64 * 64 * 4],cube_data64[135168];
 
@@ -72,6 +73,153 @@ int main(void) {
         assert(memcmp(float_half,expected,sizeof(expected))==0);
         assert(vp_texture_rgba32f_pitch_to_rgba16f(float_source,31,
             float_half,2,1,32,0x58d7ff81u)==-1);
+    }
+    {
+        /* Lossless vertex RGBA32F -> RG32F. The 32-bit patterns below are not
+         * half-representable; copying them through a half conversion would
+         * change both value and bit identity. */
+        const uint32_t pixel0[4]={0x3f800001u,0x3eaaaaabu,0x80000001u,0x7f7fffffu};
+        const uint32_t pixel1[4]={0x7fc00001u,0x00000001u,0xc0490fdbu,0x3f800000u};
+        const uint32_t expected[8]={0x3f800001u,0x3eaaaaabu,0x80000001u,
+                                    0x7f7fffffu,0x7fc00001u,0x00000001u,
+                                    0xc0490fdbu,0x3f800000u};
+        uint32_t got[8];
+        memcpy(float32_source,pixel0,sizeof(pixel0));
+        memcpy(float32_source+16,pixel1,sizeof(pixel1));
+        memset(float32_rg32,0xa5,sizeof(float32_rg32));
+        assert(vp_texture_rgba32f_pitch_to_rg32f(float32_source,sizeof(float32_source),
+            float32_rg32,64,2,1,32,0x58d7ff81u)==0);
+        memcpy(got,float32_rg32,sizeof(got));
+        assert(memcmp(got,expected,sizeof(got))==0);
+        assert(got[0]==0x3f800001u && got[3]==0x7f7fffffu);
+        /* TIC remap (G,R,1,0): the physical RG/BA pairs follow the selected
+         * logical channels, with the constant one kept as raw F32 bits. */
+        {
+            uint32_t remap=0x01u|(0xfffu<<7)|(3u<<19)|(2u<<22)|(7u<<25);
+            const uint32_t mapped[4]={pixel0[1],pixel0[0],0x3f800000u,0u};
+            assert(vp_texture_rgba32f_pitch_to_rg32f(float32_source,32,
+                float32_rg32,32,1,1,32,remap)==0);
+            assert(memcmp(float32_rg32,mapped,sizeof(mapped))==0);
+        }
+        /* Unmeasured selector values 1 and 6 stay refusals. */
+        assert(vp_texture_rgba32f_pitch_to_rg32f(float32_source,32,
+            float32_rg32,16,1,1,32,0x01u|(0xfffu<<7)|(1u<<19))==-1);
+        assert(vp_texture_rgba32f_pitch_to_rg32f(float32_source,32,
+            float32_rg32,16,1,1,32,0x01u|(0xfffu<<7)|(6u<<19))==-1);
+        /* Two logical rows with a padded source pitch: 48-byte pitch for a
+         * 32-byte logical row. The destination is tightly packed. */
+        memset(float32_source,0x5a,sizeof(float32_source));
+        memcpy(float32_source,pixel0,16);
+        memcpy(float32_source+48,pixel1,16);
+        memset(float32_rg32,0xa5,sizeof(float32_rg32));
+        assert(vp_texture_rgba32f_pitch_to_rg32f(float32_source,96,float32_rg32,
+            64,2,2,48,0x58d7ff81u)==0);
+        assert(memcmp(float32_rg32,pixel0,16)==0);
+        assert(memcmp(float32_rg32+32,pixel1,16)==0);
+        /* Bounds and the physical 2x-width limit. */
+        assert(vp_texture_rgba32f_pitch_to_rg32f(float32_source,95,float32_rg32,
+            64,2,2,48,0x58d7ff81u)==-1);
+        assert(vp_texture_rgba32f_pitch_to_rg32f(float32_source,96,float32_rg32,
+            63,2,2,48,0x58d7ff81u)==-1);
+        assert(vp_texture_rgba32f_pitch_to_rg32f(float32_source,96,float32_rg32,
+            64,2,2,31,0x58d7ff81u)==-1);
+        assert(vp_texture_rgba32f_pitch_to_rg32f(float32_source,96,float32_rg32,
+            64,0,2,48,0x58d7ff81u)==-1);
+        assert(vp_texture_rgba32f_pitch_to_rg32f(float32_source,96,float32_rg32,
+            64,2049,1,2049u*16u,0x58d7ff81u)==-1);
+        assert(VP_TEXTURE_UPLOAD_RGBA32F_RG32F==0x201u);
+        assert(vp_texture_upload_bytes(1024,64,VP_TEXTURE_UPLOAD_RGBA32F_RG32F)==
+               1048576u);
+        assert(vp_texture_upload_bytes(1024,64,VP_TEXTURE_UPLOAD_RGBA32F_RG32F)==
+               2u*vp_texture_upload_bytes(1024,64,VP_TEXTURE_UPLOAD_RGBA16F));
+        assert(vp_texture_upload_bytes(2048,4096,
+               VP_TEXTURE_UPLOAD_RGBA32F_RG32F)==(size_t)2048u*4096u*16u);
+        assert(vp_texture_upload_bytes(2049,1,
+               VP_TEXTURE_UPLOAD_RGBA32F_RG32F)==0);
+    }
+    {
+        /* The vertex contract accepts only the measured pitch-linear 2D,
+         * point, no-mip, no-border descriptor with FLOAT component fields. */
+        VPTextureVertexRg32fView view;
+        memset(&view,0,sizeof(view));
+        view.width=1024u;
+        view.height=64u;
+        view.tic_word0=0x58d7ff81u;
+        view.tic_format=0x01u;
+        view.tic_header=2u;
+        view.texture_type=1u;
+        view.depth=1u;
+        view.max_mip_level=0u;
+        view.pitch=16384u;
+        view.storage=1048576u;
+        view.sampler[0]=0u;      /* repeat U/V */
+        view.sampler[1]=0x11u;   /* point min+mag, mip filter disabled */
+        assert(vp_texture_vertex_rg32f_check(&view)==NULL);
+        view.width=2049u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"logical-width")==0);
+        view.width=0u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"zero-size")==0);
+        view.width=1024u;
+        view.height=4097u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"height")==0);
+        view.height=64u;
+        view.tic_format=0x24u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"format")==0);
+        view.tic_format=0x01u;
+        view.tic_header=3u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"header")==0);
+        view.tic_header=2u;
+        view.texture_type=3u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"type")==0);
+        view.texture_type=1u;
+        view.depth=2u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"depth")==0);
+        view.depth=1u;
+        view.block_depth=1u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"block-depth")==0);
+        view.block_depth=0u;
+        view.max_mip_level=1u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"mip")==0);
+        view.max_mip_level=0u;
+        view.tic_word0=0x58d7ff81u&~(0xfffu<<7);
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),
+                      "component-type")==0);
+        view.tic_word0=(0x58d7ff81u&~(7u<<19))|(1u<<19);
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),
+                      "swizzle-selector")==0);
+        view.tic_word0=0x58d7ff81u;
+        view.pitch=16383u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"pitch")==0);
+        view.pitch=16384u;
+        view.storage=1048575u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"storage")==0);
+        view.storage=1048576u;
+        view.sampler[1]=0x10u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"filter")==0);
+        view.sampler[1]=0x21u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"filter")==0);
+        view.sampler[1]=0xd1u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"mip-filter")==0);
+        view.sampler[1]=0x11u;
+        view.sampler[0]=3u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"border")==0);
+        view.sampler[0]=5u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"addr-mode")==0);
+        view.sampler[0]=0u;
+        view.sampler[0]=1u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"packed-u-mode")==0);
+        view.sampler[0]=2u;
+        assert(vp_texture_vertex_rg32f_check(&view)==NULL);
+        view.width=1023u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"row-alignment")==0);
+        view.width=1024u;
+        /* Real captured TIC/TSC: 2DNoMipmap and a dormant linear mip filter.
+         * Rejecting type 7 or the mip field would erase every character. */
+        view.texture_type=7u;
+        view.sampler[0]=0x00026092u;
+        view.sampler[1]=0x00000391u;
+        assert(vp_texture_vertex_rg32f_check(&view)==NULL);
+        assert(strcmp(vp_texture_vertex_rg32f_check(NULL),"missing")==0);
     }
     assert(vp_texture_cube_mip_count(4,4)==3);
     assert(vp_texture_cube_upload_bytes(4,4)==504);

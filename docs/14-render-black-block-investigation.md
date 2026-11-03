@@ -229,3 +229,102 @@ marker 恢复，无 pipeline wait_fail、batch flush failure 或 shader failure 
 `d21795e1...cbc9b6f`。选择回执位于 `build/reports/vertex-dot-20261103/selection.json`。
 不分发 exe；此次选择不是用户整帧玩法验收。全部地面/建筑黑块、其他材质、长时间
 运行和真机仍未验证；顶点纹理降精度造成的位置偏移仍待修复。
+
+## 7. 角色数据纹理恢复 32 位精度（2026-11-03）
+
+用户提出统一把原始数据压为 RGBA16F。检查后采用另一条原生 GXM 路径：把每个
+RGBA32F 像素存为相邻的两个 RG32F 像素，保留原始矩阵的四个 32 位分量。
+本地及公开 VitaSDK 声明有 F32F32_GR；这只是 API 证据，真机取样仍未验证。
+详细契约见 [ADR 0017](decisions/0017-lossless-vertex-float-textures.md)。
+
+### L1：数据和 GPU 对照
+
+- 正式 C 转换函数处理此前捕获的 32 张原始矩阵纹理，与独立的 32 位 TIC 通道映射
+  结果逐字节相同。源 pitch、通道重排、常量和非半精度可表示数字也有宿主用例。
+- 原包 364 个变体中，117 个二维顶点取样变体全部按原编译选项重新编译成功，
+  保留各自的 viewport / UINT signature 和既有输入修复；其余 247 个 GXP 保留原字节。
+  最终方案没有关闭寄存器不足错误，也没有采用实验性的 O1 调整。
+- 117 个新 GXP 的本地 Vita3K 翻译退出码均为 0，未记录翻译错误。
+- 同一批 125 个真实 draw、91,257 个顶点，使用 ADR 0016 的相同点积规则重放。
+  新程序拆分取样与新程序普通 RGBA32F 取样的 XYZW 完全相同；与旧程序直接读取
+  RGBA32F 的 XYZW 也完全相同。屏幕坐标偏差为 **0 像素**。
+- 旧 RGBA16F 与原始 RGBA32F 的最大偏差仍约 **1.08091 像素**，不是把对照数据改成
+  半精度后得到的“零误差”。24 对角色预绘制/着色位置相同，D24S8/LEQUAL 重放缺口为 0。
+
+以上是捕获网格的 GPU 证据，不等于所有角色、动画和场景通过。比较工具
+`tools/diagnostics/compare_vertex_precision.py` 校验两组 draw 名称、元数据、位置数量、
+有限值与正 W，拒绝全零位置或无输入；对相同原始/新输出返回 0，对位置变化返回 1，
+对缺失/不合格证据返回 2。
+
+可复述私有证据保存在 `build/rg32f-original-tf-cases/`、`build/rg32f-tf-cases/`、
+`build/rg32f-precision-checked.json`、`build/rg32f-final-depth.log`、
+`build/rg32f-translation-audit.json`。构建在外部 `build/mhgu-rg32f-20261103/`，
+新索引 SHA256 为 `ed60817f89aa33c0c97c6d5f9a170f06a7d6ae47d4bdfed194cacc6ccceac6d8`。
+生成物和捕获数据均不进入 Git。
+
+### 淘汰的写法与运行接入教训
+
+Cg helper 函数以及部分库写法虽然能编译，但产生当前模拟器无法翻译的调用结构。
+有一版 CLI 甚至返回 0，同时报告 `Node type not supported`，最终坐标全零。
+“编译成功且退出码为零”不能作为 GPU 画面通过。改为直接展开后恢复完整程序；
+再改为直接写第二次取样的 BA，减少临时寄存器，才使全部 117 个程序按原选项编译通过。
+不能据此认定普通条件分支全部不可用。
+
+首轮村庄运行 302.100 秒正常退出，但人物全部缺失，**该轮失败、未采纳**。
+原因不是矩阵压缩，而是新 admission 检查错误地只接受 type 1：原始角色 TIC
+`word4=e38003ff` 的 type 为 **7（2DNoMipmap）**，depth=1、mip=0。
+[deko3d 的枚举](https://github.com/devkitPro/deko3d/blob/master/source/maxwell/texture_image_control_block.h)
+以及 [pitch-linear 描述符生成](https://github.com/devkitPro/deko3d/blob/master/source/maxwell/tic_generate.cpp)
+与此相符。TSC `00026092,00000391` 的 min/mag 为 point，mip 字段为 linear；
+该字段对无 mip 的视图不产生多级取样，原生描述符显式关闭它。现在用该真实描述符
+组合做宿主回归，接受 type 7，继续拒绝数组/3D/cube 等未实现的数据布局。
+
+该轮记录位于 `build/runs/rg32f-20261103/`；原始存档、marker 和已安装 eboot 均恢复核验。
+修正后的实际运行结果另列，不能用首轮明亮但无人场景的截图冒充修复成功。
+
+### L3 定位：模拟器把浮点数据当作整数上传
+
+接受真实 type 7 后的运行仍缺少人物，因此没有直接采纳。逐层检查结果为：
+
+1. native 描述符为 2048×64、F32F32_GR，CPU 数据与 GPU 可见内存副本的前四项相同；
+   `tex0_rgba32f_packed` 预期为 2，uniform 实际保存也是 2。
+2. 把实际运行缓存中的 GLSL 用同一批原始输入重放，125 个 draw 的拆分输出仍与
+   原程序 RGBA32F 完全相同，没有非有限值。因此“模拟器两通道提示丢失了 BA”
+   在该路径中被反证，未修改 USSE 翻译器。
+3. 临时 GL 探针捕获到 `format=33320 (GL_RG_INTEGER)`、`type=5126 (GL_FLOAT)`；
+   上传 2048×64 后实际尺寸为 0×0，错误为 1282/1281，GPU 读回为空。
+   原始 CPU 数据仍有正常矩阵值，确认问题在模拟器的 GL 上传。
+4. 外部 Vita3K 的 `texture_formats.cpp` 将 F32F32 和 U32U32 一起返回
+   `GL_RG_INTEGER`。修正为 F32F32 返回 `GL_RG`，U32U32 保持原值，内部
+   `GL_RG32F` 和传输 `GL_FLOAT` 保持原有实现。
+
+私有运行证据位于 `build/runs/rg32f-live-trace-20261103/`、
+`build/runs/rg32f-glprobe-20261103/` 与 `build/rg32f-runtime-cached-glsl-check.json`。
+两轮定位后均恢复原始 eboot、存档和 marker，模拟器也恢复到此前的点积修正版。
+补丁生成器、输入/输出源码身份与配套要求见 ADR 0017。最终候选保留 ADR 0016 和
+既有兼容后端修正，不包含定位用的 GPU 强制读回。
+
+### 最终运行与本地采用
+
+修正上传映射后的 Vita3K v0.2.1 4106-d7edcbe9 / OpenGL、540p，运行 362.598 秒，
+进程正常退出、返回 0。250/280/300/320/340/350 秒的有效截图中村长、玩家及背景
+NPC 恢复显示，村庄光照没有此前整片变暗；200 秒加载画面被遮挡，取证器明确拒绝，
+不计入通过截图。用户在本次实际运行中反馈“当前画面里也不再有黑点黑块了”。
+这记录为当前村庄 L3 结果和用户局部观察，不扩展为全部玩法 L5。
+
+- VPK SHA256：`fd7432b75cb38be39483218893fd31972b5fa09b768d31eadf9625c8c7398463`。
+- SELF/eboot SHA256：`d9d28e97846de490d50b862ccc8d91b3a3c021b846cf6330d21db93ef8e9c2ed`。
+- 配套模拟器 SHA256：`dd68489a2ddb1cc7910712c2eb5925a0b2af70c507f6703a28d3a43815479d13`。
+- 静态索引 SHA256：`ed60817f89aa33c0c97c6d5f9a170f06a7d6ae47d4bdfed194cacc6ccceac6d8`。
+
+新 RG32F admission/缺少 selector 的错误为 0，`batch_failed=0`。累计 `draw_fail=83`
+仍非零，日志包含既有 render-area/depth-view 拒绝，因此不能声称全部绘制路径无错误。
+250 秒窗口约 6 FPS，后续约 7 FPS，只有瞬时读数，不作性能提升结论；本轮期间另有
+桌面 GPU 重放，不能把该次运行当性能基准。宿主测试 30/30 及 native VPK 构建通过。
+
+验证结束后原始存档（2 文件）、marker 和旧 eboot 全部恢复核验，再将验证过的 VPK、
+SELF、静态包与模拟器共同选为本地默认。源包冻结于
+`build/static-shaders-rg32f-20261103/`，完整前版保存在
+`build/reports/vertex-rg32f-20261103/previous/`；选择回执为同目录 `selection.json`。
+运行截图、日志和恢复回执在 `build/runs/rg32f-runtimefix-20261103/`，不进入 Git。
+尚未覆盖真机、任务/住宅、全部角色动画和长时间稳定性，也未单独取得本轮羊的截图。

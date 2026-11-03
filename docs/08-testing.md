@@ -45,7 +45,7 @@ CI 使用 Ubuntu + GCC。
 
 ### 2.2 覆盖范围
 
-跨平台测试（28 项）：
+跨平台测试（29 项，需要 Python 3.10+）：
 
 - `audio_downmix`、`audio_ipc`
 - `batch_policy`
@@ -60,6 +60,7 @@ CI 使用 Ubuntu + GCC。
 - `pair_cache_policy`、`render_resolution`
 - `static_shader_index`、`texture_snapshot`、`time_calendar`
 - `vertex_format`、`vertex_window`
+- `vertex_rg32f_lowering`（Python）：顶点浮点纹理展开、逻辑尺寸与片元路径边界
 
 仅 POSIX/Linux（4 项）：
 
@@ -73,7 +74,7 @@ CI 使用 Ubuntu + GCC。
 测试 include；标记缺失会在 configure 阶段失败，避免静默测试一份复制实现。
 
 仅 Windows 另有 `session_gate`：使用真实 Win32 信号量和八线程，检查共享门锁的
-互斥、递归、先释放后等待、过期唤醒 token 与错误传播。当前 Windows 共 29 项。
+互斥、递归、先释放后等待、过期唤醒 token 与错误传播。当前 Windows 共 30 项。
 
 附加的播片计时工具测试：
 

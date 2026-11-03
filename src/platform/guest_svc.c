@@ -1365,6 +1365,10 @@ typedef struct {
     uint64_t va;
     unsigned width,height,format,header,pitch,bh,stamp,swizzle,pins;
     unsigned texture_type,mip_count;
+    /* Upload identity, not just the guest TIC format: RGBA32F is decoded as
+     * either RGBA16F (fragment/legacy) or lossless RG32F (vertex). A cache
+     * hit must never mix those two buffers for the same guest descriptor. */
+    unsigned upload;
     size_t bytes,rgba_bytes;
     uint8_t *raw,*rgba;
     SceUID raw_uid,rgba_uid;
@@ -1461,21 +1465,54 @@ static void texture_asset_dump_maybe(VPGuestSvc *svc, const VPGpuTextureInfo *t,
 }
 
 static int texture_cache_key_matches(const VPTextureCache *c,
-                                     const VPGpuTextureInfo *t,unsigned mips) {
+                                     const VPGpuTextureInfo *t,unsigned mips,
+                                     unsigned upload) {
     return c->raw && c->va==t->va && c->width==t->width && c->height==t->height &&
         c->format==t->format && c->header==t->header && c->pitch==t->pitch &&
         c->bh==t->block_height && c->swizzle==t->swizzle && c->bytes==t->storage &&
-        c->texture_type==t->texture_type && c->mip_count==mips;
+        c->texture_type==t->texture_type && c->mip_count==mips &&
+        c->upload==upload;
 }
 
-static unsigned texture_cache_hint_index(const VPGpuTextureInfo *t,unsigned mips) {
+static unsigned texture_cache_hint_index(const VPGpuTextureInfo *t,unsigned mips,
+                                         unsigned upload) {
     uint64_t k=t->va;
     k^=(uint64_t)t->width<<17;k^=(uint64_t)t->height<<34;
     k^=(uint64_t)t->format<<7;k^=(uint64_t)t->header<<3;
     k^=(uint64_t)t->pitch<<45;k^=(uint64_t)t->block_height<<24;
     k^=(uint64_t)t->swizzle<<11;k^=(uint64_t)t->storage<<28;
     k^=(uint64_t)t->texture_type<<55;k^=(uint64_t)mips<<38;
+    k^=(uint64_t)upload<<3;
     return (unsigned)((k^(k>>32)^(k>>17))&(VP_TEXTURE_CACHE_HINTS-1u));
+}
+
+/* Vertex-only upload selection. RGBA32F uses the lossless RG32F split; the
+ * measured contract is checked here so no unsupported sampler or layout falls
+ * back to the lossy fragment representation. Other formats keep the existing
+ * shared decode identity. */
+static unsigned texture_vertex_upload_format(const VPGpuTextureInfo *t,
+                                             const char **reason) {
+    VPTextureVertexRg32fView view;
+    *reason=NULL;
+    if (t->texture_type==3u) return 0u;
+    if (t->format!=0x01u)
+        return vp_texture_upload_format(t->format,t->swizzle);
+    memset(&view,0,sizeof(view));
+    view.width=t->width;
+    view.height=t->height;
+    view.tic_word0=t->swizzle;
+    view.tic_format=t->format;
+    view.tic_header=t->header;
+    view.texture_type=t->texture_type;
+    view.depth=t->depth;
+    view.block_depth=t->block_depth;
+    view.max_mip_level=t->max_mip_level;
+    view.pitch=t->pitch;
+    view.storage=t->storage;
+    view.sampler[0]=t->sampler[0];
+    view.sampler[1]=t->sampler[1];
+    *reason=vp_texture_vertex_rg32f_check(&view);
+    return *reason != NULL ? 0u : VP_TEXTURE_UPLOAD_RGBA32F_RG32F;
 }
 
 /* Bounded hint probe followed by the original full scan. Return 0 on miss,
@@ -1485,16 +1522,16 @@ static unsigned texture_cache_hint_index(const VPGpuTextureInfo *t,unsigned mips
  * compare is not repeated during the scan, but its position still takes part
  * in that ordering. */
 static int texture_cache_lookup(const VPGpuTextureInfo *t,unsigned mips,
-                                const uint8_t *source,unsigned *hit_index,
-                                unsigned *reuse_index) {
-    unsigned hint=texture_cache_hint[texture_cache_hint_index(t,mips)];
+                                unsigned upload,const uint8_t *source,
+                                unsigned *hit_index,unsigned *reuse_index) {
+    unsigned hint=texture_cache_hint[texture_cache_hint_index(t,mips,upload)];
     unsigned hint_index=hint?hint-1u:~0u;
     int hint_key_match=0;
     int skip_bytes=vp_gxm_texture_skip_bytes_enabled();
     *hit_index=~0u;*reuse_index=~0u;
     if (hint_index<VP_TEXTURE_CACHE_SLOTS) {
         const VPTextureCache *c=&texture_cache[hint_index];
-        if (texture_cache_key_matches(c,t,mips)) {
+        if (texture_cache_key_matches(c,t,mips,upload)) {
             hint_key_match=1;
             if (skip_bytes || vp_texture_bytes_equal(c->raw,source,t->storage)) {
                 if (skip_bytes) texture_skip_hits++;
@@ -1509,7 +1546,7 @@ static int texture_cache_lookup(const VPGpuTextureInfo *t,unsigned mips,
             if (!c->pins && *reuse_index==~0u) *reuse_index=i;
             continue;
         }
-        if (!texture_cache_key_matches(c,t,mips)) continue;
+        if (!texture_cache_key_matches(c,t,mips,upload)) continue;
         if (skip_bytes || vp_texture_bytes_equal(c->raw,source,t->storage)) {
             if (skip_bytes) texture_skip_hits++;
             *hit_index=i;
@@ -1520,7 +1557,13 @@ static int texture_cache_lookup(const VPGpuTextureInfo *t,unsigned mips,
     return 0;
 }
 
-static uint8_t *texture_cached_decode(VPGuestSvc *svc,const VPGpuTextureInfo *t,const uint8_t *source) {
+enum {
+    VP_TEXTURE_DECODE_FRAGMENT = 0u,
+    VP_TEXTURE_DECODE_VERTEX = 1u
+};
+
+static uint8_t *texture_cached_decode(VPGuestSvc *svc,const VPGpuTextureInfo *t,
+    const uint8_t *source,unsigned decode_kind) {
     VPTextureCache *slot=NULL, *reuse=NULL;
     unsigned hit_index=~0u,reuse_index=~0u;
     uint64_t lookup_started = svc_play_perf_enabled() ? sceKernelGetProcessTimeWide() : 0u;
@@ -1549,6 +1592,24 @@ static uint8_t *texture_cached_decode(VPGuestSvc *svc,const VPGpuTextureInfo *t,
     unsigned mips=t->max_mip_level+1u;
     unsigned upload=cube?0u:vp_texture_upload_format(t->format,t->swizzle);
     int native_bc=t->format==0x27u || t->format==0x28u;
+    if (!cube && decode_kind==VP_TEXTURE_DECODE_VERTEX) {
+        const char *vertex_reason=NULL;
+        unsigned vertex_upload=texture_vertex_upload_format(t,&vertex_reason);
+        if (vertex_reason!=NULL) {
+            static unsigned vertex_format_logs;
+            if (vertex_format_logs++<32u)
+                slog(svc,"VP_TEX_VERTEX_RG32F_REJECT va=0x%llx fmt=%u "
+                     "word0=%08x size=%ux%u header=%u type=%u depth=%u "
+                     "block_d=%u mips=%u pitch=%u storage=%u tsc=%08x,%08x "
+                     "reason=%s\n",(unsigned long long)t->va,t->format,
+                     t->swizzle,t->width,t->height,t->header,t->texture_type,
+                     t->depth,t->block_depth,t->max_mip_level,t->pitch,
+                     (unsigned)t->storage,t->sampler[0],t->sampler[1],
+                     vertex_reason);
+            return NULL;
+        }
+        upload=vertex_upload;
+    }
     if (native_bc && !upload) {
         static unsigned format_refusal_logs;
         if (format_refusal_logs++<32u)
@@ -1562,7 +1623,7 @@ static uint8_t *texture_cached_decode(VPGuestSvc *svc,const VPGpuTextureInfo *t,
         vp_texture_upload_bytes(t->width,t->height,upload);
     if (!t->storage || t->storage+rgba_bytes>VP_TEXTURE_CACHE_BYTES) return NULL;
     {
-        int found=texture_cache_lookup(t,mips,source,&hit_index,&reuse_index);
+        int found=texture_cache_lookup(t,mips,upload,source,&hit_index,&reuse_index);
         if (found) {
             VPTextureCache *c=&texture_cache[hit_index];
             c->stamp=++texture_cache_stamp;
@@ -1571,7 +1632,7 @@ static uint8_t *texture_cached_decode(VPGuestSvc *svc,const VPGpuTextureInfo *t,
             if (found==1u) texture_hint_hits++;
             /* Only an actual hit establishes a hint; the stored value is a
              * slot index, never a content identity. */
-            texture_cache_hint[texture_cache_hint_index(t,mips)]=(uint8_t)(hit_index+1u);
+            texture_cache_hint[texture_cache_hint_index(t,mips,upload)]=(uint8_t)(hit_index+1u);
             if (lookup_started) texture_lookup_us += sceKernelGetProcessTimeWide()-lookup_started;
             return c->rgba;
         }
@@ -1601,7 +1662,8 @@ static uint8_t *texture_cached_decode(VPGuestSvc *svc,const VPGpuTextureInfo *t,
             VPTextureCache *c=&texture_cache[i];
             if (!c->raw || c->pins) continue;
             if (!old || c->stamp<old->stamp) old=c;
-            if (c->bytes==t->storage && c->rgba_bytes==rgba_bytes &&
+            if (c->upload==upload && c->bytes==t->storage &&
+                c->rgba_bytes==rgba_bytes &&
                 (!fit || c->stamp<fit->stamp)) fit=c;
         }
         /* Reuse an existing allocation pair before freeing a different size. */
@@ -1653,6 +1715,7 @@ static uint8_t *texture_cached_decode(VPGuestSvc *svc,const VPGpuTextureInfo *t,
     unsigned family;
     if (cube) family=3u;
     else if (upload==VP_TEXTURE_UPLOAD_RGBA16F) family=1u;
+    else if (upload==VP_TEXTURE_UPLOAD_RGBA32F_RG32F) family=4u;
     else if (upload) family=2u;
     else if (t->format==8u) family=0u;
     else family=4u;
@@ -1661,6 +1724,9 @@ static uint8_t *texture_cached_decode(VPGuestSvc *svc,const VPGpuTextureInfo *t,
     if (cube) {
         rc=vp_texture_cube_rgba(source,t->storage,rgba,rgba_bytes,t->width,t->height,
                                t->format,t->block_height,mips,t->swizzle);
+    } else if (upload==VP_TEXTURE_UPLOAD_RGBA32F_RG32F) {
+        rc=vp_texture_rgba32f_pitch_to_rg32f(source,t->storage,rgba,rgba_bytes,
+            t->width,t->height,t->pitch,t->swizzle);
     } else if (upload==VP_TEXTURE_UPLOAD_RGBA16F) {
         if (t->header==2u && t->format==0x01u)
             rc=vp_texture_rgba32f_pitch_to_rgba16f(source,t->storage,rgba,
@@ -1689,11 +1755,14 @@ static uint8_t *texture_cached_decode(VPGuestSvc *svc,const VPGpuTextureInfo *t,
     memcpy(raw,source,t->storage);
     if (tail_started) texture_update_tail_us += sceKernelGetProcessTimeWide()-tail_started;
     texture_asset_dump_maybe(svc,t,source);
-    *slot=(VPTextureCache){t->va,t->width,t->height,t->format,t->header,t->pitch,
-        t->block_height,++texture_cache_stamp,t->swizzle,1u,t->texture_type,mips,
-        t->storage,rgba_bytes,raw,rgba,raw_uid,rgba_uid};
+    *slot=(VPTextureCache){.va=t->va,.width=t->width,.height=t->height,
+        .format=t->format,.header=t->header,.pitch=t->pitch,
+        .bh=t->block_height,.stamp=++texture_cache_stamp,.swizzle=t->swizzle,
+        .pins=1u,.texture_type=t->texture_type,.mip_count=mips,.upload=upload,
+        .bytes=t->storage,.rgba_bytes=rgba_bytes,.raw=raw,.rgba=rgba,
+        .raw_uid=raw_uid,.rgba_uid=rgba_uid};
     /* Admitted decode: now the hint may name this slot. */
-    texture_cache_hint[texture_cache_hint_index(t,mips)]=(uint8_t)((unsigned)(slot-texture_cache)+1u);
+    texture_cache_hint[texture_cache_hint_index(t,mips,upload)]=(uint8_t)((unsigned)(slot-texture_cache)+1u);
     if (!reuse) texture_cache_bytes+=t->storage+rgba_bytes;
     return rgba;
 }
@@ -2811,7 +2880,8 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
             !frame_target_seen(tex.va) && tex.storage != 0u) {
             uint32_t source = 0;
             if (bridge_quiet && gpu_va_to_cpu(ctx->session,tex.va,tex.storage,&source)) {
-                linear=texture_cached_decode(ctx->svc,&tex,(const uint8_t *)(uintptr_t)source);
+                linear=texture_cached_decode(ctx->svc,&tex,(const uint8_t *)(uintptr_t)source,
+                                             VP_TEXTURE_DECODE_FRAGMENT);
                 linear_borrowed=linear!=NULL;
                 if (linear_borrowed) {
                     req.tex_format=vp_texture_upload_format(tex.format,tex.swizzle);
@@ -3029,7 +3099,8 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
                          plane.format,plane.header,(unsigned)plane.storage,map_rc);
                 continue;
             }
-            extra->texels=texture_cached_decode(ctx->svc,&plane,(const uint8_t *)(uintptr_t)ptr);
+            extra->texels=texture_cached_decode(ctx->svc,&plane,
+                (const uint8_t *)(uintptr_t)ptr,VP_TEXTURE_DECODE_FRAGMENT);
             extra->texels_owned=extra->texels!=NULL;
             if (!extra->texels) {
                 if (extra_error_logs++<32u)
@@ -3053,6 +3124,8 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
         uint32_t source=0;
         VPGxmExtraTexture *extra=&req.vertex_texture;
         int resolve_rc=-1;
+        const char *vertex_reason=NULL;
+        unsigned vertex_upload=0u;
         int resources_active=vp_gxm_static_resources_active();
         int layout_rc=0;
         VPResourceTexture layout;
@@ -3076,8 +3149,22 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
                                           &vertex_tex);
                 extra->width=vertex_tex.width;
                 extra->height=vertex_tex.height;
-                extra->tex_format=vertex_tex.texture_type==3u?0u:
-                    vp_texture_upload_format(vertex_tex.format,vertex_tex.swizzle);
+                vertex_upload=texture_vertex_upload_format(&vertex_tex,&vertex_reason);
+                extra->tex_format=vertex_reason != NULL ? 0u : vertex_upload;
+                if (vertex_reason != NULL) {
+                    static unsigned vertex_contract_logs;
+                    if (vertex_contract_logs++<32u)
+                        slog(ctx->svc,"VP_VERTEX_TEXTURE_CONTRACT hash=0x%x "
+                             "va=0x%llx size=%ux%u fmt=%u header=%u pitch=%u "
+                             "storage=%u tsc=%08x,%08x sampler=%08x,%08x "
+                             "reason=%s\n", req.hash,
+                             (unsigned long long)vertex_tex.va,vertex_tex.width,
+                             vertex_tex.height,vertex_tex.format,
+                             vertex_tex.header,vertex_tex.pitch,
+                             (unsigned)vertex_tex.storage,vertex_tex.tsc[0],
+                             vertex_tex.tsc[1],vertex_tex.sampler[0],
+                             vertex_tex.sampler[1],vertex_reason);
+                }
                 extra->cube=vertex_tex.texture_type==3u;
                 extra->mip_count=extra->cube ?
                     (vertex_tex.max_mip_level+1u<
@@ -3118,10 +3205,10 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
                              vertex_tex.width, vertex_tex.height,
                              vertex_tex.format, vertex_tex.texture_type,
                              vertex_tex.header);
-                } else if (vertex_tex.storage &&
+                } else if (vertex_reason == NULL && vertex_tex.storage &&
                     gpu_va_to_cpu(ctx->session,vertex_tex.va,vertex_tex.storage,&source)) {
                     extra->texels=texture_cached_decode(ctx->svc,&vertex_tex,
-                        (const uint8_t *)(uintptr_t)source);
+                        (const uint8_t *)(uintptr_t)source,VP_TEXTURE_DECODE_VERTEX);
                     extra->texels_owned=extra->texels!=NULL;
                 }
             }

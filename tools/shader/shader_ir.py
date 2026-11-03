@@ -23,6 +23,7 @@ from pathlib import Path
 import re
 
 import shadow_helpers
+import vertex_rg32f
 
 class Unsupported(ValueError): pass
 
@@ -1329,7 +1330,16 @@ def emit_cg(ir):
         }
     if cbuf_vectors+aux_vectors+shadow_vectors>128:
         raise Unsupported('combined cbufs exceed initial GXM 128-vector budget')
-    return '\n'.join(lines),resources
+    source = '\n'.join(lines)
+    if stage == 'vertex':
+        source, packed_samplers = vertex_rg32f.lower_cg(source)
+        if cbuf_vectors + aux_vectors + len(packed_samplers) > 128:
+            raise Unsupported('vertex data texture uniforms exceed GXM 128-vector budget')
+        for resource in resources:
+            if resource['name'] in packed_samplers:
+                resource['inv_size'] = True
+                resource['rgba32f_packed'] = 1
+    return source,resources
 
 def cg_shadow_statement(s,indent,emitter):
     """Lower one standalone shadow call to scoped inline statements."""

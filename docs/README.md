@@ -60,3 +60,4 @@
 - [0014 框架级原生播片](decisions/0014-native-movie-player.md)
 - [0015 渲染性能安全迁移](decisions/0015-safe-render-performance.md)
 - [0016 本地 OpenGL 验证后端的顶点点积顺序](decisions/0016-local-vertex-dot-order.md)
+- [0017 角色浮点数据纹理保留 32 位精度](decisions/0017-lossless-vertex-float-textures.md)

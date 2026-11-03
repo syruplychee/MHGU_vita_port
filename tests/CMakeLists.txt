@@ -6,6 +6,9 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
 
 enable_testing()
+find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
+add_test(NAME vertex_rg32f_lowering
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_vertex_rg32f.py")
 
 set(VP_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../src")
 set(VP_INCLUDES

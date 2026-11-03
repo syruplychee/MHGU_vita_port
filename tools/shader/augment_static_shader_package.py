@@ -239,12 +239,12 @@ def main():
         if len(matches) != 1:
             raise ValueError('replace target missing/ambiguous: stage %d key %s' %
                              (stage_index, old_key))
-        if stage_index in replace_by_index:
+        identity = (stage_index, matches[0]['key'])
+        if identity in replace_by_index:
             raise ValueError('duplicate replace request')
-        replace_by_index[stage_index] = matches[0]['key']
+        replace_by_index[identity] = matches[0]['key']
     retained = [variant for variant in variants
-                if not (variant['stage_index'] in replace_by_index and
-                        variant['key'] == replace_by_index[variant['stage_index']])]
+                if (variant['stage_index'], variant['key']) not in replace_by_index]
 
     added = []
     for entry in spec.get('add', []):

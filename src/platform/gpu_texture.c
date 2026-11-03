@@ -86,6 +86,11 @@ size_t vp_texture_upload_bytes(unsigned w,unsigned h,unsigned fmt) {
     if (!w || !h || w>4096u || h>4096u) return 0;
     if (!fmt) return (size_t)w*h*4u;
     if (fmt==VP_TEXTURE_UPLOAD_RGBA16F) return (size_t)w*h*8u;
+    if (fmt==VP_TEXTURE_UPLOAD_RGBA32F_RG32F) {
+        if (w>VP_TEXTURE_RG32F_LOGICAL_MAX_WIDTH ||
+            h>VP_TEXTURE_RG32F_MAX_HEIGHT) return 0;
+        return (size_t)w*h*16u;
+    }
     base=fmt&0xffu;
     if (base==0x24u || base==0x27u) bpp=8u;
     else if (base==0x26u || base==0x28u) bpp=16u;
@@ -154,6 +159,80 @@ int vp_texture_rgba32f_pitch_to_rgba16f(const uint8_t *src,size_t src_bytes,
     return 0;
 }
 
+/* Selector values follow the reviewed Maxwell mapping already used by the
+ * BC4/BC5 swizzle tables: zero, channels R..A and float one. Selectors 1 and 6
+ * have no established numeric meaning here and are refused, not guessed. */
+static int rgba32f_select_bits(uint32_t word,const uint32_t input[4],
+                               uint32_t output[4]) {
+    for (unsigned c=0;c<4u;c++) {
+        unsigned s=(word>>(19u+3u*c))&7u;
+        if (s==0u) output[c]=0u;
+        else if (s>=2u && s<=5u) output[c]=input[s-2u];
+        else if (s==7u) output[c]=0x3f800000u;
+        else return -1;
+    }
+    return 0;
+}
+
+int vp_texture_rgba32f_pitch_to_rg32f(const uint8_t *src,size_t src_bytes,
+    uint8_t *dst,size_t dst_bytes,unsigned width,unsigned height,size_t pitch,
+    uint32_t word) {
+    size_t required,produced;
+    if (!src || !dst || !width || !height ||
+        width>VP_TEXTURE_RG32F_LOGICAL_MAX_WIDTH ||
+        height>VP_TEXTURE_RG32F_MAX_HEIGHT ||
+        pitch<(size_t)width*16u || (size_t)height>SIZE_MAX/pitch) return -1;
+    required=pitch*height;
+    if (src_bytes<required || (size_t)width>SIZE_MAX/(height*16u)) return -1;
+    produced=(size_t)width*height*16u;
+    if (dst_bytes<produced) return -1;
+    for (unsigned y=0;y<height;y++) for (unsigned x=0;x<width;x++) {
+        uint32_t input[4],output[4];
+        const uint8_t *pixel=src+(size_t)y*pitch+(size_t)x*16u;
+        memcpy(input,pixel,sizeof(input));
+        if (rgba32f_select_bits(word,input,output)<0) return -1;
+        /* Physical texel 2x is RG, physical texel 2x+1 is BA. */
+        memcpy(dst+((size_t)y*width+x)*16u,output,sizeof(output));
+    }
+    return 0;
+}
+
+const char *vp_texture_vertex_rg32f_check(const VPTextureVertexRg32fView *view) {
+    unsigned u_mode,v_mode;
+    if (view==NULL) return "missing";
+    if (view->width==0u || view->height==0u) return "zero-size";
+    if (view->width>VP_TEXTURE_RG32F_LOGICAL_MAX_WIDTH) return "logical-width";
+    if (view->height>VP_TEXTURE_RG32F_MAX_HEIGHT) return "height";
+    if (view->tic_format!=0x01u) return "format";
+    if (view->tic_header!=2u) return "header";
+    /* Maxwell 7 is 2DNoMipmap, used by the captured pitch-linear palettes. */
+    if (view->texture_type!=1u && view->texture_type!=7u) return "type";
+    if (view->depth!=1u) return "depth";
+    if (view->block_depth!=0u) return "block-depth";
+    if (view->max_mip_level!=0u) return "mip";
+    /* The observed descriptor has all four component fields marked FLOAT.
+     * Treating other bits as F32F32 would reinterpret the source numbers. */
+    if (((view->tic_word0>>7)&0xfffu)!=0xfffu) return "component-type";
+    for (unsigned c=0;c<4u;c++) {
+        unsigned s=(view->tic_word0>>(19u+3u*c))&7u;
+        if (s!=0u && (s<2u || s>5u) && s!=7u) return "swizzle-selector";
+    }
+    if (view->pitch<(size_t)view->width*16u ||
+        (size_t)view->height>SIZE_MAX/view->pitch) return "pitch";
+    if (view->storage<(size_t)view->pitch*view->height) return "storage";
+    /* Point min/mag. The one-level TIC view makes a valid TSC mip-filter field
+     * ineffective; the native split descriptor explicitly disables mips. */
+    if ((view->sampler[1]&3u)!=1u || ((view->sampler[1]>>4)&3u)!=1u)
+        return "filter";
+    if (((view->sampler[1]>>6)&3u)==3u) return "mip-filter";
+    u_mode=view->sampler[0]&7u;
+    v_mode=(view->sampler[0]>>3)&7u;
+    if (u_mode>4u || v_mode>4u) return "addr-mode";
+    if (u_mode==3u || v_mode==3u) return "border";
+    if (u_mode!=0u && u_mode!=2u) return "packed-u-mode";
+    if (view->width%4u) return "row-alignment";
+    return NULL;
+}
 static size_t cube_mip_bytes(unsigned w,unsigned h,unsigned mip_count) {
     size_t bytes=0;
     unsigned mip=0;
