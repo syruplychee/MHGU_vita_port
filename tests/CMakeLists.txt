@@ -74,6 +74,10 @@ vp_host_test(audio_downmix)
 vp_host_test(audio_ipc "${VP_SRC}/platform/audio_ipc.c")
 vp_host_test(batch_policy)
 vp_host_test(engine_submit_probe)
+vp_host_test(engine_material "${VP_SRC}/platform/engine_material.c")
+vp_host_test(engine_state "${VP_SRC}/platform/engine_state.c")
+vp_host_test(engine_queue_native "${VP_SRC}/platform/engine_queue_native.c"
+    "${VP_SRC}/platform/engine_state.c" "${VP_SRC}/platform/engine_material.c")
 vp_host_test(engine_layout "${VP_SRC}/platform/engine_layout.c" "${VP_SRC}/platform/gpu_stream.c")
 target_compile_definitions(engine_layout PRIVATE VP_ENGINE_LAYOUT_CORE_ONLY=1)
 # audio_auto_catchup needs MAP_32BIT and is built in the UNIX block below.

@@ -70,6 +70,51 @@ VP_HOST_BRIDGE_FUNCTION vp_movie_color_nv12_leave, 0x24f
 /* Locked main resource-submit sites; handlers replay the displaced words. */
 VP_HOST_BRIDGE_FUNCTION vp_engine_submit_enter, 0x250
 VP_HOST_BRIDGE_FUNCTION vp_engine_submit_leave, 0x251
+VP_HOST_BRIDGE_FUNCTION vp_engine_full_failed, 0x252
+
+/* Full queue replacement: C owns its local state; original caller ABI stays
+ * on the guest stack. Failures enter the normal host bridge and stop. */
+.balign 4
+.global vp_engine_full_entry
+.type vp_engine_full_entry,%function
+vp_engine_full_entry:
+    push {r4,lr}
+    bl vp_engine_full_run
+    pop {r4,lr}
+    cmp r0,#0
+    bne vp_engine_full_failed
+    bx lr
+.size vp_engine_full_entry,.-vp_engine_full_entry
+
+/* Invoke the exact locked NVN slot with core, stack and hard-float arguments.
+ * Call offsets: r[]=8, stack[]=24, s[]=60. Keep 8-byte SP alignment. */
+.balign 4
+.global vp_engine_nvn_call
+.type vp_engine_nvn_call,%function
+vp_engine_nvn_call:
+    push {r4-r11,ip,lr}
+    sub sp,sp,#32
+    mov r4,r0
+    mov r5,r1
+    mov r6,r2
+    add ip,r5,#24
+    ldm ip,{r0-r3,r8-r11}
+    stm sp,{r0-r3,r8-r11}
+    vldr s0,[r5,#60]
+    vldr s1,[r5,#64]
+    vldr s2,[r5,#68]
+    vldr s3,[r5,#72]
+    add ip,r5,#8
+    ldm ip,{r0-r3}
+    blx r4
+    cmp r6,#0
+    strne r0,[r6]
+    strne r1,[r6,#4]
+    movne r2,#1
+    strne r2,[r6,#8]
+    add sp,sp,#32
+    pop {r4-r11,ip,pc}
+.size vp_engine_nvn_call,.-vp_engine_nvn_call
 
 /* Only the two fixed-count layout encoders are replaced. The C helper uses
  * guest-TLS-safe memory operations and original SDK calls on

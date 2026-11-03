@@ -4,6 +4,7 @@
 #include "audio_sink.h"
 #include "gpu_stream.h"
 #include "engine_layout.h"
+#include "engine_full.h"
 #include "gpu_texture.h"
 #include "texture_snapshot.h"
 #include "gpu_indices.h"
@@ -4352,7 +4353,10 @@ static void vp_guest_gpu_decode_entry_locked(VPGuestSvc *svc, VPGuestSession *st
      * stays the producer's; decoder state never borrows a mutable pointer. */
     memcpy(decode->commands.words,(const void *)(uintptr_t)cpu,
            (size_t)words * sizeof(uint32_t));
-    if (!(++decode->layout_report_entries&1023u)) vp_engine_layout_report(svc->log);
+    if (!(++decode->layout_report_entries&1023u)) {
+        vp_engine_layout_report(svc->log);
+        vp_engine_full_report(svc->log);
+    }
     if (perf) {
         phase_end = sceKernelGetProcessTimeWide();
         gpu_cpu_perf.command_copy_us += phase_end - phase;

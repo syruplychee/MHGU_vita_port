@@ -16,6 +16,7 @@
 #include "session_gate.h"
 #include "engine_submit_probe.h"
 #include "engine_layout.h"
+#include "engine_full.h"
 #include <stddef.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/kernel/cpu.h>
@@ -40,6 +41,7 @@ extern void vp_movie_color_rgb_enter(void),vp_movie_color_rgb_leave(void);
 extern void vp_movie_color_nv12_enter(void),vp_movie_color_nv12_leave(void);
 extern void vp_engine_submit_enter(void),vp_engine_submit_leave(void);
 extern void vp_engine_layout_entry(void);
+extern void vp_engine_full_entry(void);
 uint32_t vp_engine_layout_resume;
 uint32_t vp_engine_layout_fallback;
 extern const unsigned char vp_sdk_svc_site_template[],vp_sdk_svc_site_end[];
@@ -532,10 +534,50 @@ static int engine_layout_patch(FILE *log,VPNativeModule modules[4]) {
     return rc;
 }
 
+static int engine_full_patch(FILE *log,VPNativeModule *m) {
+    FILE *marker=fopen("ux0:data/mhgu-vita-port/engine-full.enable","rb");
+    int enabled=marker!=NULL;
+    if (marker) fclose(marker);
+    fprintf(log,"ENGINE_FULL_MODE enabled=%d\n",enabled);
+    if (!enabled) return 0;
+    if (engine_submit_probe_enabled || vp_engine_layout_resume) return VP_PATCH_BINDING;
+    static const struct {uint32_t offset,bytes;const char *sha;} checks[]={
+        {0xbbe9c8u,7004u,"32a31fb8ec825cfab9c184d0864fab8411c12b41c93767fd26e9a8f5399b3b67"},
+        {0xbc0e98u,1328u,"57a40e584db356275bd74acc66213efda539a6f1891225dfcd0046083a158478"},
+        {0xbc13e0u,856u,"05ff02d5f4b4628c3d72728eb4a2047a15aaf002e5d1672a7098f33140ed6df9"},
+        {0xbc1764u,3192u,"e71e66bba88c89c18ad8d2e4651dd3188ccb3aedf53484af9b30d210c8b4657e"}};
+    static const char digits[]="0123456789abcdef";
+    for (unsigned i=0;i<4u;i++) {
+        const uint32_t offset=checks[i].offset,bytes=checks[i].bytes;
+        if (offset>m->nso.segments[0].bytes || bytes>m->nso.segments[0].bytes-offset)
+            return VP_PATCH_RANGE;
+        unsigned char sha[32];
+        vp_sha256(m->image+offset,bytes,sha);
+        for (unsigned j=0;j<32u;j++)
+            if (digits[sha[j]>>4]!=checks[i].sha[j*2u] ||
+                digits[sha[j]&15u]!=checks[i].sha[j*2u+1u]) return VP_PATCH_BINDING;
+    }
+    uint32_t off=m->island_offset+m->island_bytes;
+    if ((off&3u) || off>m->capacity || 8u>m->capacity-off) return VP_PATCH_RANGE;
+    int64_t delta=(int64_t)off-0xbbe9c8u-8;
+    if (delta<-(int64_t)VP_PATCH_BRANCH_REACH || delta>=VP_PATCH_BRANCH_REACH) return VP_PATCH_REACH;
+    if (vp_engine_full_init(m->base)) return VP_PATCH_ARGUMENT;
+    uint32_t veneer[2]={0xe51ff004u,(uint32_t)(uintptr_t)vp_engine_full_entry};
+    memcpy(m->image+off,veneer,sizeof(veneer));
+    VPPatchTarget target;
+    int rc=vp_patch_open(&target,m->image,m->nso.span,m->base);
+    if (!rc) rc=vp_patch_site(&target,0xbbe9c8u,0xe92d4ff0u,m->base+off);
+    if (!rc) m->island_bytes+=8u;
+    fprintf(log,"ENGINE_FULL_PATCH site=00bbe9c8 original=e92d4ff0 status=%d\n",rc);
+    return rc;
+}
+
 int vp_sdk_dso_patch(FILE *log,VPNativeModule modules[4]) {
     int engine_rc=engine_submit_probe_patch(log,&modules[1]);
     if (engine_rc) return engine_rc;
     engine_rc=engine_layout_patch(log,modules);
+    if (engine_rc) return engine_rc;
+    engine_rc=engine_full_patch(log,&modules[1]);
     if (engine_rc) return engine_rc;
     int color_rc=movie_color_probe_patch(log,&modules[2]);
     if (color_rc) {
@@ -986,6 +1028,12 @@ static int engine_submit_probe_service(Session *s,VPExecutor *e,VPBridgeFrame *f
 
 static int dispatch_locked(VPExecutor *e,VPBridgeFrame *f) {
     Session *s=e->user;
+    if (f->service==0x252u) {
+        fprintf(s->log,"ENGINE_FULL_FATAL rc=%d\n",(int32_t)f->regs[0]);
+        vp_engine_full_report(s->log);
+        fflush(s->log);
+        return VP_BRIDGE_ARGUMENT;
+    }
     if (f->service==0x250u || f->service==0x251u) return engine_submit_probe_service(s,e,f);
     if (f->service>=0x24cu && f->service<=0x24fu) return movie_color_probe_service(s,e,f);
     if (f->service==0x24bu) {

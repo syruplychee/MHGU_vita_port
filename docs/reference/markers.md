@@ -7,6 +7,7 @@ Marker 是 `ux0:data/mhgu-vita-port/` 下的空文件或短文本文件。运行
 
 | Marker | 作用 |
 |---|---|
+| `engine-full.enable` | 实验：替换公共队列、program／材质资源及状态准备；与 engine-layout／engine-submit-probe 互斥；默认关闭，目前画面验收未通过，见 ADR 0019 |
 | `play.enable` | 进入可玩路径；runner 默认写入 |
 | `display-bridge.enable` | 启用显示桥 |
 | `display-bridge.disable` | 显式关闭显示桥 |

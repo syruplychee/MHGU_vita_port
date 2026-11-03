@@ -56,6 +56,10 @@ add_executable(vita_port_native_loader
     src/platform/gpu_stream.c
     src/platform/gpu_texture.c
     src/platform/engine_layout.c
+    src/platform/engine_material.c
+    src/platform/engine_state.c
+    src/platform/engine_queue_native.c
+    src/platform/engine_full.c
     src/platform/gxm_depth.c
     src/platform/gxm_depth_clear_native.c
     src/platform/gxm_depth_view.c
@@ -90,6 +94,12 @@ target_include_directories(vita_port_native_loader PRIVATE
     src/app src/loader src/bridge src/bridge/armv7 src/platform src/generated
     "${VITA_PORT_GENERATED_DIR}")
 target_compile_features(vita_port_native_loader PRIVATE c_std_11)
+set_source_files_properties(src/platform/engine_material.c src/platform/engine_state.c
+    src/platform/engine_queue_native.c PROPERTIES
+    COMPILE_DEFINITIONS "memcpy=vp_engine_copy;memset=vp_engine_clear"
+    COMPILE_OPTIONS "-fno-builtin;-fno-tree-loop-distribute-patterns")
+set_source_files_properties(src/platform/engine_full.c PROPERTIES
+    COMPILE_OPTIONS "-fno-builtin;-fno-tree-loop-distribute-patterns")
 target_compile_options(vita_port_native_loader PRIVATE
     -O2 -mcpu=cortex-a9 -mfpu=neon-vfpv3 -mfloat-abi=hard
     -Wall -Wextra -Werror)

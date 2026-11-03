@@ -1,0 +1,165 @@
+#include "engine_full.h"
+#include "engine_queue_native.h"
+#include <stddef.h>
+
+static uint32_t image_base;
+static uint32_t calls, failures, nvn_calls, draws, last_site, last_slot, last_context;
+extern void vp_engine_nvn_call(uint32_t, const VPEngineNvnCall *, VPEngineNvnResult *);
+
+_Static_assert(offsetof(VPEngineNvnCall, r) == 8, "NVN core-register ABI");
+_Static_assert(offsetof(VPEngineNvnCall, stack) == 24, "NVN stack ABI");
+_Static_assert(offsetof(VPEngineNvnCall, s) == 60, "NVN float-register ABI");
+_Static_assert(sizeof(VPEngineNvnCall) == 80, "NVN call record ABI");
+_Static_assert(offsetof(VPEngineNvnResult, has_value) == 8, "NVN return ABI");
+
+/* These helpers also serve the reconstructed functions while guest TLS is
+ * installed. Never enter Vita libc with the original game's TLS. */
+__attribute__((optimize("no-tree-loop-distribute-patterns")))
+void *vp_engine_copy(void *dst, const void *src, size_t size) {
+    unsigned char *d=dst;
+    const unsigned char *s=src;
+    for (size_t i=0;i<size;i++) d[i]=s[i];
+    return dst;
+}
+__attribute__((optimize("no-tree-loop-distribute-patterns")))
+void *vp_engine_clear(void *dst, int value, size_t size) {
+    unsigned char *d=dst;
+    for (size_t i=0;i<size;i++) d[i]=(unsigned char)value;
+    return dst;
+}
+static uint32_t load(uint32_t address) { return *(const uint32_t *)(uintptr_t)address; }
+static void *resolve(void *opaque, uint32_t address) {
+    (void)opaque;
+    return (void *)(uintptr_t)address;
+}
+static void emit(void *opaque, const VPEngineNvnCall *call, VPEngineNvnResult *out) {
+    (void)opaque;
+    __atomic_store_n(&last_site,call->site,__ATOMIC_RELAXED);
+    __atomic_store_n(&last_slot,call->slot,__ATOMIC_RELAXED);
+    __atomic_fetch_add(&nvn_calls,1u,__ATOMIC_RELAXED);
+    if (call->slot>=VP_SLOT_DRAW_ARRAYS && call->slot<=VP_SLOT_DRAW_ELEMENTS_INSTANCED)
+        __atomic_fetch_add(&draws,1u,__ATOMIC_RELAXED);
+    vp_engine_nvn_call(load(image_base+call->slot),call,out);
+}
+static void memclr(void *opaque, uint32_t site, uint32_t pointer, uint32_t size) {
+    (void)opaque;
+    uint32_t offset=site==0xbc1134u ? 0x13efd7cu : 0x13efdc4u;
+    ((void (*)(uint32_t,uint32_t))(uintptr_t)(image_base+offset))(pointer,size);
+}
+static void resource(void *opaque, uint32_t site, uint32_t a, uint32_t b) {
+    (void)opaque;
+    /* The call site chooses the same original resource operation. */
+    uint32_t offset=site==0xbbf58cu ? 0xb03d98u:0xb03d2cu;
+    ((void (*)(uint32_t,uint32_t))(uintptr_t)(image_base+offset))(a,b);
+}
+static double numeric(void *opaque, uint32_t site, double a, double b) {
+    (void)opaque; (void)site;
+    return ((double (*)(double,double))(uintptr_t)(image_base+0x13f0ea4u))(a,b);
+}
+static void simple(uint32_t site,uint32_t slot,uint32_t a,uint32_t b,uint32_t c,uint32_t d) {
+    VPEngineNvnCall call;
+    vp_engine_clear(&call,0,sizeof(call));
+    call.site=site; call.slot=slot;
+    call.r[0]=a;call.r[1]=b;call.r[2]=c;call.r[3]=d;
+    emit(NULL,&call,NULL);
+}
+#define BIND3(name,slot) \
+static void name(void *opaque,uint32_t site,uint32_t cmd,unsigned n,uint32_t object) { \
+    (void)opaque; simple(site,slot,cmd,n,object,0); }
+BIND3(attrib,VP_SLOT_BIND_VERTEX_ATTRIB_STATE)
+BIND3(stream,VP_SLOT_BIND_VERTEX_STREAM_STATE)
+#undef BIND3
+/* Program callback has (cmd, program, flags), unlike the count/object binds. */
+static void bind_program(void *opaque,uint32_t site,uint32_t cmd,uint32_t p,uint32_t flags) {
+    (void)opaque; simple(site,VP_SLOT_BIND_PROGRAM,cmd,p,flags,0);
+}
+static uint64_t buffer(void *opaque,uint32_t site,uint32_t object) {
+    (void)opaque;
+    VPEngineNvnCall call;
+    VPEngineNvnResult out;
+    vp_engine_clear(&call,0,sizeof(call));call.site=site;
+    call.slot=VP_SLOT_BUFFER_GET_ADDRESS;call.r[0]=object;
+    emit(NULL,&call,&out);
+    return out.value;
+}
+static uint64_t handle(void *opaque,uint32_t site,uint32_t device,uint32_t texture,uint32_t sampler) {
+    (void)opaque;
+    VPEngineNvnCall call;
+    VPEngineNvnResult out;
+    vp_engine_clear(&call,0,sizeof(call));call.site=site;
+    call.slot=VP_SLOT_DEVICE_GET_TEXTURE_HANDLE;
+    call.r[0]=device;call.r[1]=texture;call.r[2]=sampler;
+    emit(NULL,&call,&out);
+    return out.value;
+}
+static void uniform(void *opaque,uint32_t site,uint32_t cmd,unsigned stage,unsigned index,
+    uint64_t address,uint32_t size) {
+    (void)opaque;
+    VPEngineNvnCall call;
+    vp_engine_clear(&call,0,sizeof(call));call.site=site;call.slot=VP_SLOT_BIND_UNIFORM_BUFFER;
+    call.r[0]=cmd;call.r[1]=stage;call.r[2]=index;
+    call.stack[0]=(uint32_t)address;call.stack[1]=(uint32_t)(address>>32);
+    call.stack[2]=size;call.stack_words=3u;emit(NULL,&call,NULL);
+}
+static void texture(void *opaque,uint32_t site,uint32_t cmd,unsigned stage,unsigned index,uint64_t h) {
+    (void)opaque;
+    VPEngineNvnCall call;
+    vp_engine_clear(&call,0,sizeof(call));call.site=site;call.slot=VP_SLOT_BIND_TEXTURE;
+    call.r[0]=cmd;call.r[1]=stage;call.r[2]=index;
+    call.stack[0]=(uint32_t)h;call.stack[1]=(uint32_t)(h>>32);
+    call.stack_words=2u;emit(NULL,&call,NULL);
+}
+#define BIND2(name,slot) \
+static void name(void *opaque,uint32_t site,uint32_t cmd,uint32_t object) { \
+    (void)opaque; simple(site,slot,cmd,object,0,0); }
+BIND2(barrier,VP_SLOT_BARRIER)
+BIND2(color,VP_SLOT_BIND_COLOR_STATE)
+BIND2(multisample,VP_SLOT_BIND_MULTISAMPLE_STATE)
+#undef BIND2
+static void alpha(void *opaque,uint32_t site,uint32_t cmd,float value) {
+    (void)opaque;
+    VPEngineNvnCall call;
+    vp_engine_clear(&call,0,sizeof(call));call.site=site;call.slot=VP_SLOT_SET_ALPHA_REF;
+    call.r[0]=cmd;vp_engine_copy(&call.s[0],&value,4u);call.s_words=1u;
+    emit(NULL,&call,NULL);
+}
+int vp_engine_full_init(uint32_t base) {
+    if (image_base) return -1;
+    image_base=base;
+    return 0;
+}
+int vp_engine_full_run(uint32_t context) {
+    uint32_t state[VP_ENGINE_STATE_BYTES/4u],scratch[0x100u/4u];
+    VPEngineNvnEnv env;
+    VPEngineMaterialEnv mat;
+    vp_engine_clear(&env,0,sizeof(env));vp_engine_clear(&mat,0,sizeof(mat));
+    env.resolve=resolve;env.emit=emit;env.memclr=memclr;
+    env.external_resource=resource;env.numeric_pow=numeric;
+    env.gpu_root=load(image_base+0x183944cu);
+    env.default_viewport=load(image_base+0x183f2b0u);
+    env.srgb_config=load(image_base+0x1838db0u);
+    env.scratch=(uint32_t)(uintptr_t)scratch;env.scratch_size=sizeof(scratch);
+    mat.resolve=resolve;mat.gpu_root=env.gpu_root;
+    mat.bind_program=bind_program;mat.bind_vertex_attrib_state=attrib;
+    mat.bind_vertex_stream_state=stream;mat.buffer_get_address=buffer;
+    mat.bind_uniform_buffer=uniform;mat.device_get_texture_handle=handle;
+    mat.bind_texture=texture;mat.barrier=barrier;mat.set_alpha_ref=alpha;
+    mat.bind_color_state=color;mat.bind_multisample_state=multisample;
+    __atomic_fetch_add(&calls,1u,__ATOMIC_RELAXED);
+    __atomic_store_n(&last_context,context,__ATOMIC_RELAXED);
+    int rc=vp_engine_queue_native_run(&env,&mat,context,(uint32_t)(uintptr_t)state);
+    if (rc) __atomic_fetch_add(&failures,1u,__ATOMIC_RELAXED);
+    return rc;
+}
+void vp_engine_full_report(FILE *log) {
+    if (!image_base) return;
+    fprintf(log,"ENGINE_FULL_STATS calls=%u failures=%u nvn_calls=%u draws=%u "
+        "last_site=%08x last_slot=%08x last_context=%08x\n",
+        __atomic_load_n(&calls,__ATOMIC_RELAXED),
+        __atomic_load_n(&failures,__ATOMIC_RELAXED),
+        __atomic_load_n(&nvn_calls,__ATOMIC_RELAXED),
+        __atomic_load_n(&draws,__ATOMIC_RELAXED),
+        __atomic_load_n(&last_site,__ATOMIC_RELAXED),
+        __atomic_load_n(&last_slot,__ATOMIC_RELAXED),
+        __atomic_load_n(&last_context,__ATOMIC_RELAXED));
+}

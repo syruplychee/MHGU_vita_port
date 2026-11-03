@@ -63,3 +63,4 @@
 - [0016 本地 OpenGL 验证后端的顶点点积顺序](decisions/0016-local-vertex-dot-order.md)
 - [0017 角色浮点数据纹理保留 32 位精度](decisions/0017-lossless-vertex-float-textures.md)
 - [0018 游戏公共入口复用已准备的顶点布局](decisions/0018-engine-prepared-vertex-layout.md)
+- [0019 公共队列、程序／材质和状态准备的完整接管实验](decisions/0019-engine-full-prepare.md)
