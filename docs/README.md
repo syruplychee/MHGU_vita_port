@@ -29,6 +29,7 @@
 12. [develop 开发起点与旧项目交接](12-development-baseline.md)
 13. [渲染性能安全迁移：结论、反例与测量教训](13-render-performance-lessons.md)
 14. [村庄黑块：原始代码、GXM 与模拟器的证据边界](14-render-black-block-investigation.md)
+15. [游戏内部渲染提交：入口线索与下一阶段计划](15-engine-render-submission-plan.md)
 
 ## 参考
 
