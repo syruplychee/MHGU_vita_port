@@ -8,6 +8,8 @@ option(VITA_PORT_NATIVE_SDK_DSO
     "Execute the original SDK DSO; required for the production runtime" ON)
 option(VITA_PORT_SAVE_SELFTEST
     "Run the save backend self-test at service init (diagnostic only)" OFF)
+option(VITA_PORT_ENGINE_CAPTURE
+    "Capture one full preparation and SDK encoding, then stop (diagnostic only)" OFF)
 
 set(VITA_PORT_EXEFS "" CACHE PATH
     "Directory containing the locked 1.4.0 ExeFS: rtld, main, subsdk0, sdk, main.npdm")

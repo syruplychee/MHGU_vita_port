@@ -499,6 +499,7 @@ static void test_type0_draw(void)
     CHECK(world.events[0].slot == VP_SLOT_SET_PRIMITIVE_RESTART,
           "initial SetPrimitiveRestart");
     CHECK(world.events[0].r[1] == 1u, "initial restart flag");
+    CHECK(world.events[0].r[2] == 0xffffu, "initial restart index");
     CHECK(world.events[1].slot == VP_SLOT_SET_LINE_WIDTH,
           "initial SetLineWidth");
     CHECK(world.events[1].s[0] == 0x3f800000u, "line width 1.0");

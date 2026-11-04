@@ -1,6 +1,9 @@
 #include "engine_full.h"
 #include "engine_queue_native.h"
 #include <stddef.h>
+#ifdef VP_ENGINE_CAPTURE
+#include "engine_capture.h"
+#endif
 
 static uint32_t image_base;
 static uint32_t calls, failures, nvn_calls, draws, last_site, last_slot, last_context;
@@ -30,6 +33,9 @@ void *vp_engine_clear(void *dst, int value, size_t size) {
 static uint32_t load(uint32_t address) { return *(const uint32_t *)(uintptr_t)address; }
 static void *resolve(void *opaque, uint32_t address) {
     (void)opaque;
+#ifdef VP_ENGINE_CAPTURE
+    vp_engine_capture_range(address,0xd0u);
+#endif
     return (void *)(uintptr_t)address;
 }
 static void emit(void *opaque, const VPEngineNvnCall *call, VPEngineNvnResult *out) {
@@ -39,7 +45,14 @@ static void emit(void *opaque, const VPEngineNvnCall *call, VPEngineNvnResult *o
     __atomic_fetch_add(&nvn_calls,1u,__ATOMIC_RELAXED);
     if (call->slot>=VP_SLOT_DRAW_ARRAYS && call->slot<=VP_SLOT_DRAW_ELEMENTS_INSTANCED)
         __atomic_fetch_add(&draws,1u,__ATOMIC_RELAXED);
-    vp_engine_nvn_call(load(image_base+call->slot),call,out);
+    uint32_t function=load(image_base+call->slot);
+#ifdef VP_ENGINE_CAPTURE
+    vp_engine_capture_before(call,function);
+#endif
+    vp_engine_nvn_call(function,call,out);
+#ifdef VP_ENGINE_CAPTURE
+    vp_engine_capture_after(out);
+#endif
 }
 static void memclr(void *opaque, uint32_t site, uint32_t pointer, uint32_t size) {
     (void)opaque;
@@ -126,6 +139,9 @@ static void alpha(void *opaque,uint32_t site,uint32_t cmd,float value) {
 int vp_engine_full_init(uint32_t base) {
     if (image_base) return -1;
     image_base=base;
+#ifdef VP_ENGINE_CAPTURE
+    if (vp_engine_capture_init(base)) return -1;
+#endif
     return 0;
 }
 int vp_engine_full_run(uint32_t context) {
@@ -147,12 +163,23 @@ int vp_engine_full_run(uint32_t context) {
     mat.bind_color_state=color;mat.bind_multisample_state=multisample;
     __atomic_fetch_add(&calls,1u,__ATOMIC_RELAXED);
     __atomic_store_n(&last_context,context,__ATOMIC_RELAXED);
+#ifdef VP_ENGINE_CAPTURE
+    vp_engine_capture_begin(calls,context,(uint32_t)(uintptr_t)state,
+        env.scratch,env.gpu_root);
+#endif
     int rc=vp_engine_queue_native_run(&env,&mat,context,(uint32_t)(uintptr_t)state);
+#ifdef VP_ENGINE_CAPTURE
+    int capture_rc=vp_engine_capture_end();
+    if (capture_rc) return capture_rc;
+#endif
     if (rc) __atomic_fetch_add(&failures,1u,__ATOMIC_RELAXED);
     return rc;
 }
 void vp_engine_full_report(FILE *log) {
     if (!image_base) return;
+#ifdef VP_ENGINE_CAPTURE
+    vp_engine_capture_report(log);
+#endif
     fprintf(log,"ENGINE_FULL_STATS calls=%u failures=%u nvn_calls=%u draws=%u "
         "last_site=%08x last_slot=%08x last_context=%08x\n",
         __atomic_load_n(&calls,__ATOMIC_RELAXED),

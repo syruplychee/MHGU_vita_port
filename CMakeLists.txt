@@ -100,6 +100,12 @@ set_source_files_properties(src/platform/engine_material.c src/platform/engine_s
     COMPILE_OPTIONS "-fno-builtin;-fno-tree-loop-distribute-patterns")
 set_source_files_properties(src/platform/engine_full.c PROPERTIES
     COMPILE_OPTIONS "-fno-builtin;-fno-tree-loop-distribute-patterns")
+if(VITA_PORT_ENGINE_CAPTURE)
+    target_sources(vita_port_native_loader PRIVATE src/platform/engine_capture.c)
+    target_compile_definitions(vita_port_native_loader PRIVATE VP_ENGINE_CAPTURE=1)
+    set_source_files_properties(src/platform/engine_capture.c PROPERTIES
+        COMPILE_OPTIONS "-fno-builtin;-fno-tree-loop-distribute-patterns")
+endif()
 target_compile_options(vita_port_native_loader PRIVATE
     -O2 -mcpu=cortex-a9 -mfpu=neon-vfpv3 -mfloat-abi=hard
     -Wall -Wextra -Werror)

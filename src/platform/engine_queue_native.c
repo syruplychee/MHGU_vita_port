@@ -930,7 +930,7 @@ int vp_engine_queue_native_run(const VPEngineNvnEnv *env,
 
     /* 0xBBEA50..0xBBEAAC: initial NVN state. */
     emit_call(&q, SITE_SET_RESTART, VP_SLOT_SET_PRIMITIVE_RESTART, q.cmd, 1u,
-              0, 0);
+              0xffffu, 0);
     emit_float(&q, SITE_SET_LINE_WIDTH, VP_SLOT_SET_LINE_WIDTH, q.cmd, 0, 0,
                0, 0x3f800000u);
     emit_float(&q, SITE_SET_POINT_SIZE, VP_SLOT_SET_POINT_SIZE, q.cmd, 0, 0,

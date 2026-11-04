@@ -7,7 +7,7 @@ ROOT, image, REPO = inputs('queue')
 if hashlib.sha256(image).hexdigest()!='24c208c395c65727b21b5fa91af8381396e70cf421b0fcfee0345d8743298110':
  raise ValueError('Locked main image identity mismatch')
 slots={int(v,16):name for name,v in re.findall(r'#define (VP_SLOT_\w+)\s+(0x[0-9a-f]+)u',(REPO/'src/platform/engine_nvn.h').read_text())}
-three={0x191fd44,0x191fd48,0x191fd4c,0x191fc78,0x191fc70,0x191fc74,0x191fdc0};five={0x191fd0c,0x191fd18}
+three={0x191fd44,0x191fd48,0x191fd4c,0x191fc78,0x191fc70,0x191fc74,0x191fdc0,0x191fcb8};five={0x191fd0c,0x191fd18}
 results=[]
 def canonical(slot,c,st,s,read):
  if slot==0x191fdb4:return(slot,tuple(c[:2]),read(c[2],c[1]*4).hex(),read(c[3],c[1]*4).hex(),tuple(st[:2]))
