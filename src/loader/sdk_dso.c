@@ -98,8 +98,20 @@ typedef struct {
 } VPMovieColorTiming;
 static int movie_color_probe_enabled;
 static int engine_submit_probe_enabled;
+static int engine_full_ab_enabled;
+static uint32_t engine_full_ab_trampoline;
 static uint32_t engine_submit_replay;
 static uint32_t engine_submit_leave_replay;
+/* Same-process A/B accounting. entry_us/t_us use the process clock on the host
+ * side; command is the root context's command buffer and before/after are its
+ * write offsets. mode is the mode selected when this call entered, so a control
+ * file change applies only to later root calls. */
+#define VP_ENGINE_AB_CONTROL_PATH "ux0:data/mhgu-vita-port/engine-full-mode.txt"
+#define VP_ENGINE_AB_POLL_US 500000ull
+typedef struct {
+    uint64_t entry_us;
+    uint32_t context,command,before,block_before,mode,active;
+} VPEnginePrepareTiming;
 typedef struct {
     uint64_t started;
     uint32_t active,object,state,command,before,family,same_object,same_layout;
@@ -119,6 +131,10 @@ typedef struct {
     VPMovieColorTiming movie_color[64]; /* Main plus the 63 guest worker slots. */
     unsigned movie_color_samples;
     VPEngineSubmitTiming engine_submit[64];
+    VPEnginePrepareTiming engine_prepare[64];
+    uint64_t engine_ab_poll_us;
+    uint32_t engine_ab_mode;
+    unsigned engine_ab_mode_valid;
     VPEngineSubmitStats engine_stats;
     unsigned movie_readback_stacks;
     VPUnwindRegistry exceptions;
@@ -534,13 +550,66 @@ static int engine_layout_patch(FILE *log,VPNativeModule modules[4]) {
     return rc;
 }
 
+/* The A/B control file is host state, never guest memory. Exactly one '0', '1'
+ * or '2' is required; trailing whitespace is accepted and any other byte is
+ * invalid. Missing and malformed files are distinct so the caller can report
+ * the actual failure instead of falling back to a path. */
+static int engine_ab_read_control(uint32_t *mode) {
+    FILE *f=fopen(VP_ENGINE_AB_CONTROL_PATH,"rb");
+    if (!f) return 1;
+    int first=fgetc(f),rc=0;
+    if (first!='0' && first!='1' && first!='2') rc=2;
+    if (!rc) {
+        int c;
+        while ((c=fgetc(f))!=EOF) {
+            if (c!=' ' && c!='\t' && c!='\n' && c!='\v' && c!='\f' && c!='\r') {
+                rc=2;break;
+            }
+        }
+    }
+    if (ferror(f)) rc=2;
+    fclose(f);
+    if (!rc) *mode=(uint32_t)(first-'0');
+    return rc;
+}
+static const char *engine_ab_mode_name(uint32_t mode) {
+    return mode==2u?"fast":mode==1u?"native":"original";
+}
+
 static int engine_full_patch(FILE *log,VPNativeModule *m) {
     FILE *marker=fopen("ux0:data/mhgu-vita-port/engine-full.enable","rb");
-    int enabled=marker!=NULL;
+    int full=marker!=NULL;
     if (marker) fclose(marker);
-    fprintf(log,"ENGINE_FULL_MODE enabled=%d\n",enabled);
-    if (!enabled) return 0;
-    if (engine_submit_probe_enabled || vp_engine_layout_resume) return VP_PATCH_BINDING;
+    FILE *ab_marker=fopen("ux0:data/mhgu-vita-port/engine-full-ab.enable","rb");
+    int ab=ab_marker!=NULL;
+    if (ab_marker) fclose(ab_marker);
+    FILE *fast_marker=fopen("ux0:data/mhgu-vita-port/engine-full-fast.enable","rb");
+    int fast=fast_marker!=NULL;
+    if (fast_marker) fclose(fast_marker);
+    int enabled=full||ab||fast;
+    vp_engine_full_fast_enabled=fast?1u:0u;
+    fprintf(log,"ENGINE_FULL_MODE enabled=%d ab=%d\n",enabled,ab);
+    if (!enabled) {
+        engine_full_ab_enabled=0;
+        vp_engine_full_profile_enabled=0;
+        return 0;
+    }
+#ifdef VP_ENGINE_CAPTURE
+    /* The capture build stops by design on a fixed call count. Running it in
+     * the A/B profile would inject that stop into the measured interval, so
+     * the combination is refused instead of producing a contaminated sample. */
+    if (ab || fast) {
+        fprintf(log,"ENGINE_FULL_AB_REJECT reason=engine-capture-build ab=%d fast=%d\n",ab,fast);
+        fflush(log);
+        return VP_PATCH_BINDING;
+    }
+#endif
+    if (engine_submit_probe_enabled || vp_engine_layout_resume) {
+        fprintf(log,"ENGINE_FULL_AB_REJECT reason=exclusive-marker layout=%d probe=%d\n",
+            vp_engine_layout_resume!=0,engine_submit_probe_enabled!=0);
+        fflush(log);
+        return VP_PATCH_BINDING;
+    }
     static const struct {uint32_t offset,bytes;const char *sha;} checks[]={
         {0xbbe9c8u,7004u,"32a31fb8ec825cfab9c184d0864fab8411c12b41c93767fd26e9a8f5399b3b67"},
         {0xbc0e98u,1328u,"57a40e584db356275bd74acc66213efda539a6f1891225dfcd0046083a158478"},
@@ -557,18 +626,57 @@ static int engine_full_patch(FILE *log,VPNativeModule *m) {
             if (digits[sha[j]>>4]!=checks[i].sha[j*2u] ||
                 digits[sha[j]&15u]!=checks[i].sha[j*2u+1u]) return VP_PATCH_BINDING;
     }
+    if (ab) {
+        uint32_t initial=0;
+        int control=engine_ab_read_control(&initial);
+        if (control) {
+            fprintf(log,"ENGINE_PREPARE_CONTROL_ERROR path=%s reason=%s status=%d\n",
+                VP_ENGINE_AB_CONTROL_PATH,control==1?"missing":"invalid",control);
+            fflush(log);
+            return VP_PATCH_ARGUMENT;
+        }
+        fprintf(log,"ENGINE_FULL_AB_MODE control=%s initial=%s\n",
+            VP_ENGINE_AB_CONTROL_PATH,engine_ab_mode_name(initial));
+    }
+    if (m->island_offset>m->capacity || m->island_bytes>m->capacity-m->island_offset)
+        return VP_PATCH_RANGE;
     uint32_t off=m->island_offset+m->island_bytes;
-    if ((off&3u) || off>m->capacity || 8u>m->capacity-off) return VP_PATCH_RANGE;
+    uint32_t island_bytes=ab?20u:8u;
+    if ((off&3u) || off>m->capacity || island_bytes>m->capacity-off) return VP_PATCH_RANGE;
+    if (ab && ((off+8u)&3u)) return VP_PATCH_RANGE;
     int64_t delta=(int64_t)off-0xbbe9c8u-8;
     if (delta<-(int64_t)VP_PATCH_BRANCH_REACH || delta>=VP_PATCH_BRANCH_REACH) return VP_PATCH_REACH;
     if (vp_engine_full_init(m->base)) return VP_PATCH_ARGUMENT;
+    engine_full_ab_enabled=ab;
+    vp_engine_full_profile_enabled=ab?1u:0u;
+    uint32_t original[4]={0,0,0,0};
+    memcpy(original,m->image+0xbbe9c8u,sizeof(original));
+    if (ab)
+        fprintf(log,"ENGINE_FULL_AB_ORIGINAL site=0xbbe9c8 bytes=%08x,%08x,%08x,%08x\n",
+            original[0],original[1],original[2],original[3]);
     uint32_t veneer[2]={0xe51ff004u,(uint32_t)(uintptr_t)vp_engine_full_entry};
     memcpy(m->image+off,veneer,sizeof(veneer));
+    if (ab) {
+        /* Replay the displaced PUSH, then jump absolutely into the untouched
+         * original body at main+0xBBE9CC. PC-relative instructions inside the
+         * body stay at their linked addresses; no function bytes are copied. */
+        uint32_t trampoline[3]={0xe92d4ff0u,0xe51ff004u,m->base+0xbbe9ccu};
+        memcpy(m->image+off+8u,trampoline,sizeof(trampoline));
+        engine_full_ab_trampoline=m->base+off+8u;
+        fprintf(log,"ENGINE_FULL_AB_TRAMPOLINE address=0x%08x range=[0x%x,0x%x) "
+            "bytes=%08x,%08x,%08x target=0x%08x\n",
+            engine_full_ab_trampoline,m->base+off+8u,m->base+off+20u,
+            trampoline[0],trampoline[1],trampoline[2],m->base+0xbbe9ccu);
+    }
     VPPatchTarget target;
     int rc=vp_patch_open(&target,m->image,m->nso.span,m->base);
     if (!rc) rc=vp_patch_site(&target,0xbbe9c8u,0xe92d4ff0u,m->base+off);
-    if (!rc) m->island_bytes+=8u;
-    fprintf(log,"ENGINE_FULL_PATCH site=00bbe9c8 original=e92d4ff0 status=%d\n",rc);
+    if (!rc) m->island_bytes+=island_bytes;
+    fprintf(log,"ENGINE_FULL_PATCH site=0xbbe9c8 original=e92d4ff0 veneer=0x%08x "
+        "trampoline=0x%08x island=[0x%x,0x%x) island_bytes=%u capacity=%u "
+        "branch_delta=%lld ab=%d status=%d\n",
+        m->base+off,ab?engine_full_ab_trampoline:0u,m->base+off,m->base+off+island_bytes,
+        island_bytes,m->capacity,(long long)delta,ab,rc);
     return rc;
 }
 
@@ -996,7 +1104,7 @@ static int engine_submit_probe_service(Session *s,VPExecutor *e,VPBridgeFrame *f
             old_layout=word((void *)(uintptr_t)(old+8u));
         }
         uint32_t command=word((void *)(uintptr_t)(state+4u));
-        if (command>UINT32_MAX-16u || !vp_guest_svc_readable(&s->svc,command,16u))
+        if (command>UINT32_MAX-0x2cu || !vp_guest_svc_readable(&s->svc,command,0x2cu))
             return VP_BRIDGE_ARGUMENT;
         *t=(VPEngineSubmitTiming){.active=1u,.object=object,.state=state,
             .command=command,.before=word((void *)(uintptr_t)(command+12u)),
@@ -1026,6 +1134,144 @@ static int engine_submit_probe_service(Session *s,VPExecutor *e,VPBridgeFrame *f
     return 0;
 }
 
+/* The vi:obj BufferQueue model releases a queued slot when the producer asks
+ * for a new buffer. That counter is cumulative; the analyzer uses deltas
+ * between recorded samples, never the absolute value as an interval count. */
+static uint32_t engine_prepare_presents(const Session *s) {
+    uint32_t presents=0;
+    for (unsigned i=0;i<VP_GUEST_HANDLE_LIMIT;++i) {
+        const VPGuestHandle *h=&s->svc.handles[i];
+        if (h->kind!=2u || strcmp(h->name,"vi:obj")) continue;
+        if (h->session<1u || h->session>VP_GUEST_SESSION_LIMIT) continue;
+        uint32_t add=s->svc.sessions[h->session-1u].binder_presents;
+        presents=add>UINT32_MAX-presents?UINT32_MAX:presents+add;
+    }
+    return presents;
+}
+
+/* Poll at most twice per second, always before the root entry timestamp. The
+ * poll and its file I/O are therefore part of the frame but not of the reported
+ * root interval, and both paths pay the same cadence. */
+static int engine_prepare_ab_poll(Session *s,uint64_t now) {
+    if (s->engine_ab_mode_valid && now>=s->engine_ab_poll_us
+        && now-s->engine_ab_poll_us<VP_ENGINE_AB_POLL_US) return 0;
+    s->engine_ab_poll_us=now;
+    uint32_t mode=0;
+    int rc=engine_ab_read_control(&mode);
+    if (rc) {
+        fprintf(s->log,"ENGINE_PREPARE_CONTROL_ERROR path=%s reason=%s status=%d thread=0x%x\n",
+            VP_ENGINE_AB_CONTROL_PATH,rc==1?"missing":"invalid",rc,
+            s->svc.current_thread_handle);
+        fflush(s->log);
+        return VP_BRIDGE_ARGUMENT;
+    }
+    if (!s->engine_ab_mode_valid || mode!=s->engine_ab_mode) {
+        fprintf(s->log,"ENGINE_PREPARE_PHASE mode=%s t_us=%llu previous=%s thread=0x%x\n",
+            engine_ab_mode_name(mode),(unsigned long long)now,
+            s->engine_ab_mode_valid?engine_ab_mode_name(s->engine_ab_mode):"none",
+            s->svc.current_thread_handle);
+        fflush(s->log);
+    }
+    s->engine_ab_mode=mode;
+    s->engine_ab_mode_valid=1;
+    return 0;
+}
+
+static int engine_prepare_ab_service(Session *s,VPExecutor *e,VPBridgeFrame *f) {
+    if (!engine_full_ab_enabled) return VP_BRIDGE_UNSUPPORTED;
+    VPGuestThread *thread=thread_for_executor(e);
+    unsigned slot;
+    if (e==s->main_executor) slot=0u;
+    else if (thread && thread->handle && thread>=thread_pool.threads
+        && (unsigned)(thread-thread_pool.threads)<VP_GUEST_THREAD_LIMIT)
+        slot=1u+(unsigned)(thread-thread_pool.threads);
+    else return VP_BRIDGE_ARGUMENT;
+    VPEnginePrepareTiming *t=&s->engine_prepare[slot];
+    if (f->service==0x253u) {
+        if (t->active) {
+            fprintf(s->log,"ENGINE_PREPARE_NESTED slot=%u thread=0x%x context=0x%08x mode=%s\n",
+                slot,s->svc.current_thread_handle,f->regs[0],
+                engine_ab_mode_name(t->mode));
+            fflush(s->log);
+            return VP_BRIDGE_ARGUMENT;
+        }
+        /* Poll first, then take the start timestamp. The file access is
+         * deliberate frame work on both paths; it is not charged to root time. */
+        int rc=engine_prepare_ab_poll(s,sceKernelGetProcessTimeWide());
+        if (rc) return rc;
+        uint64_t started=sceKernelGetProcessTimeWide();
+        uint32_t context=f->regs[0];
+        if (context>UINT32_MAX-0x98u
+            || !vp_guest_svc_readable(&s->svc,context+0x94u,4u)) {
+            fprintf(s->log,"ENGINE_PREPARE_ENTER_ERROR slot=%u thread=0x%x reason=context context=0x%08x\n",
+                slot,s->svc.current_thread_handle,context);
+            fflush(s->log);
+            return VP_BRIDGE_ARGUMENT;
+        }
+        uint32_t command=word((void *)(uintptr_t)(context+0x94u));
+        if (command>UINT32_MAX-0x2cu || !vp_guest_svc_readable(&s->svc,command,0x2cu)) {
+            fprintf(s->log,"ENGINE_PREPARE_ENTER_ERROR slot=%u thread=0x%x reason=command command=0x%08x\n",
+                slot,s->svc.current_thread_handle,command);
+            fflush(s->log);
+            return VP_BRIDGE_ARGUMENT;
+        }
+        uint32_t mode=s->engine_ab_mode;
+        uint32_t target=mode==2u?(uint32_t)(uintptr_t)vp_engine_full_run_fast:
+            mode==1u?(uint32_t)(uintptr_t)vp_engine_full_run:engine_full_ab_trampoline;
+        if (!s->engine_ab_mode_valid || mode>2u || !target) {
+            fprintf(s->log,"ENGINE_PREPARE_ENTER_ERROR slot=%u thread=0x%x reason=target mode=%u target=0x%08x\n",
+                slot,s->svc.current_thread_handle,mode,target);
+            fflush(s->log);
+            return VP_BRIDGE_ARGUMENT;
+        }
+        t->entry_us=started;
+        t->context=context;
+        t->command=command;
+        t->before=word((void *)(uintptr_t)(command+12u));
+        t->block_before=word((void *)(uintptr_t)(command+0x28u));
+        t->mode=mode;
+        t->active=1u;
+        /* r0 stays context; the bridge restores it and this write supplies ip. */
+        f->regs[12]=target;
+        return 0;
+    }
+    if (f->service!=0x254u) return VP_BRIDGE_UNSUPPORTED;
+    uint64_t ended=sceKernelGetProcessTimeWide();
+    if (!t->active) {
+        fprintf(s->log,"ENGINE_PREPARE_LEAVE_ERROR slot=%u thread=0x%x reason=not-active\n",
+            slot,s->svc.current_thread_handle);
+        fflush(s->log);
+        return VP_BRIDGE_ARGUMENT;
+    }
+    /* Only the native C body has a declared result. The original root may
+     * return any r0 and its callers do not consume it. */
+    if (t->mode && f->regs[0]) {
+        fprintf(s->log,"ENGINE_FULL_FATAL rc=%d\n",(int32_t)f->regs[0]);
+        vp_engine_full_report(s->log);
+        fflush(s->log);
+        t->active=0u;
+        return VP_BRIDGE_ARGUMENT;
+    }
+    uint32_t bytes=0u,growth=1u;
+    if (t->command<=UINT32_MAX-0x2cu
+        && vp_guest_svc_readable(&s->svc,t->command,0x2cu)) {
+        uint32_t after=word((void *)(uintptr_t)(t->command+12u));
+        if (after>=t->before && after-t->before<0x100000u &&
+            word((void *)(uintptr_t)(t->command+0x28u))==t->block_before) {
+            bytes=after-t->before;
+            growth=0u;
+        }
+    }
+    uint64_t elapsed=ended>=t->entry_us?ended-t->entry_us:0u;
+    fprintf(s->log,"ENGINE_PREPARE_TIME mode=%s thread=0x%x context=0x%08x "
+        "entry_us=%llu t_us=%llu elapsed_us=%llu encoded_bytes=%u growth=%u presents=%u\n",
+        engine_ab_mode_name(t->mode),s->svc.current_thread_handle,t->context,
+        (unsigned long long)t->entry_us,(unsigned long long)ended,
+        (unsigned long long)elapsed,bytes,growth,engine_prepare_presents(s));
+    t->active=0u;
+    return 0;
+}
+
 static int dispatch_locked(VPExecutor *e,VPBridgeFrame *f) {
     Session *s=e->user;
     if (f->service==0x252u) {
@@ -1034,6 +1280,7 @@ static int dispatch_locked(VPExecutor *e,VPBridgeFrame *f) {
         fflush(s->log);
         return VP_BRIDGE_ARGUMENT;
     }
+    if (f->service==0x253u || f->service==0x254u) return engine_prepare_ab_service(s,e,f);
     if (f->service==0x250u || f->service==0x251u) return engine_submit_probe_service(s,e,f);
     if (f->service>=0x24cu && f->service<=0x24fu) return movie_color_probe_service(s,e,f);
     if (f->service==0x24bu) {

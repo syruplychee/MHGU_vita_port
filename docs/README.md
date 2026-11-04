@@ -65,3 +65,5 @@
 - [0018 游戏公共入口复用已准备的顶点布局](decisions/0018-engine-prepared-vertex-layout.md)
 - [0019 公共队列、程序／材质和状态准备的完整接管实验](decisions/0019-engine-full-prepare.md)
 - [0020 原 SDK 实际编码、资源对照与 restart 索引修复](decisions/0020-engine-sdk-encoding-reference.md)
+- [0021 公共渲染准备的同进程 A/B 计时框架](decisions/0021-engine-prepare-ab.md)
+- [0022 省掉共享查询往返与接管框架重复工作](decisions/0022-engine-prepare-shared-queries.md)

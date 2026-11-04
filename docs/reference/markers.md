@@ -7,7 +7,10 @@ Marker 是 `ux0:data/mhgu-vita-port/` 下的空文件或短文本文件。运行
 
 | Marker | 作用 |
 |---|---|
-| `engine-full.enable` | 实验：替换公共队列、program／材质资源及状态准备；与 engine-layout／engine-submit-probe 互斥；默认关闭，目前画面验收未通过，见 ADR 0019 |
+| `engine-full.enable` | 实验：替换公共队列、program／材质资源及状态准备；与 engine-layout／engine-submit-probe 互斥；默认关闭，restart 修正后村庄采样画面恢复，见 ADR 0019–0020 |
+| `engine-full-fast.enable` | 实验：启用已核对的纯查询直接计算、减少准备开销；存在时启用完整接管，默认关闭，见 ADR 0022 |
+| `engine-full-ab.enable` | 实验：同进程交替运行完整接管的原入口与 C 路径。存在时即使没有 `engine-full.enable` 也启用完整接管；与 engine-layout／engine-submit-probe 互斥；`VITA_PORT_ENGINE_CAPTURE` 诊断构建显式拒绝；见 ADR 0021 |
+| `engine-full-mode.txt` | A/B 控制文件（不是 marker）：内容必须是一个 `0`、`1` 或 `2`，允许尾部空白。`0`=原 root，`1`=基础 C，`2`=优化 C。仅 `engine-full-ab.enable` 存在时读取；补丁阶段先校验，运行时每 500 ms 轮询，缺失或非法时显式失败，不回退 |
 | `play.enable` | 进入可玩路径；runner 默认写入 |
 | `display-bridge.enable` | 启用显示桥 |
 | `display-bridge.disable` | 显式关闭显示桥 |

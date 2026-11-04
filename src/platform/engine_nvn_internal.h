@@ -2,6 +2,7 @@
 #define VP_ENGINE_NVN_INTERNAL_H
 
 #include "engine_nvn.h"
+#include "engine_memory.h"
 
 #include <string.h>
 
@@ -30,23 +31,17 @@ static inline void *vpm_ptr(VPEngineMem *m, uint32_t address)
 
 static inline uint8_t vpm_r8(VPEngineMem *m, uint32_t address)
 {
-    uint8_t v;
-    memcpy(&v, vpm_ptr(m, address), sizeof(v));
-    return v;
+    return *(const uint8_t *)vpm_ptr(m,address);
 }
 
 static inline uint16_t vpm_r16(VPEngineMem *m, uint32_t address)
 {
-    uint16_t v;
-    memcpy(&v, vpm_ptr(m, address), sizeof(v));
-    return v;
+    return vp_engine_read16(vpm_ptr(m,address));
 }
 
 static inline uint32_t vpm_r32(VPEngineMem *m, uint32_t address)
 {
-    uint32_t v;
-    memcpy(&v, vpm_ptr(m, address), sizeof(v));
-    return v;
+    return vp_engine_read32(vpm_ptr(m,address));
 }
 
 static inline uint64_t vpm_r64(VPEngineMem *m, uint32_t address)
@@ -57,17 +52,17 @@ static inline uint64_t vpm_r64(VPEngineMem *m, uint32_t address)
 
 static inline void vpm_w8(VPEngineMem *m, uint32_t address, uint8_t value)
 {
-    memcpy(vpm_ptr(m, address), &value, sizeof(value));
+    *(uint8_t *)vpm_ptr(m,address)=value;
 }
 
 static inline void vpm_w16(VPEngineMem *m, uint32_t address, uint16_t value)
 {
-    memcpy(vpm_ptr(m, address), &value, sizeof(value));
+    vp_engine_write16(vpm_ptr(m,address),value);
 }
 
 static inline void vpm_w32(VPEngineMem *m, uint32_t address, uint32_t value)
 {
-    memcpy(vpm_ptr(m, address), &value, sizeof(value));
+    vp_engine_write32(vpm_ptr(m,address),value);
 }
 
 static inline void vpm_w64(VPEngineMem *m, uint32_t address, uint64_t value)

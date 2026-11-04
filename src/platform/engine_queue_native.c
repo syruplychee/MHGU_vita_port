@@ -159,6 +159,8 @@ static void emit_float(Queue *q, uint32_t site, uint32_t slot, uint32_t r0,
 
 static uint64_t query(Queue *q, uint32_t site, uint32_t slot, uint32_t r0)
 {
+    if (slot==VP_SLOT_BUFFER_GET_ADDRESS && q->m.env->buffer_address)
+        return q->m.env->buffer_address(q->m.env->opaque,site,r0);
     return vpm_query(&q->m, site, slot, r0, 0, 0, 0);
 }
 

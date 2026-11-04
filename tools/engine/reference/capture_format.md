@@ -52,6 +52,11 @@ record_size=280、count、pages、blob_bytes、main_base、ctx、state、scratch
 创建零页。数值 `pow` 仍使用宿主数学函数，不扩大为原 SDK 数学库逐位等价证明。
 成功只证明采样队列，不能代替正确图像、其他阶段或真机验收。
 
+优化查询可用保留全部实际查询返回的完整旧采集验证：显式指定
+`--native-entry vp_engine_full_run_fast --allow-query-elision`。只允许新路径省略纯查询，
+仍逐字节检查所有非查询命令与完整状态写回，资源清单也仍检查。默认严格模式不变。
+不支持优化 marker 与采集编译同时启用，该组合在加载时明确拒绝。
+
 `resources.json` 给出 SDK 编码时使用的 program header / 命令包、buffer / pool / vtable、
 vertex layout、状态对象和 target / view 的地址、长度和 SHA-256。两条路径的清单必须一致。
 buffer 同时记录 pool offset、原始大小和 64 位 GPU 地址。这里比较的是编码器读取的

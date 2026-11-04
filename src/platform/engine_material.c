@@ -1,4 +1,5 @@
 #include "engine_material.h"
+#include "engine_memory.h"
 
 #include <string.h>
 
@@ -46,7 +47,7 @@ static int read_u32(const VPEngineMaterialEnv *env, uint32_t address,
 {
     const void *p = guest_ptr(env, address);
     if (!p) return VP_ENGINE_MATERIAL_ERR_MEMORY;
-    memcpy(out, p, sizeof(*out));
+    *out=vp_engine_read32(p);
     return VP_ENGINE_MATERIAL_OK;
 }
 

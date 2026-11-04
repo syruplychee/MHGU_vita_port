@@ -92,7 +92,8 @@ def relocated(u, base, data):
                 u.mem_write(base + address, struct.pack('<I', value & 0xffffffff))
 
 
-def execute(native, main, sdk, info, pages, records, captured, loads, symbols, sdk_base):
+def execute(native, main, sdk, info, pages, records, captured, loads, symbols, sdk_base,
+            native_entry, allow_query_elision):
     u = Uc(UC_ARCH_ARM, UC_MODE_ARM)
     # The original SDK contains VSEL; this is an offline decoder, not a shipped CPU path.
     u.ctl_set_cpu_model(UC_CPU_ARM_MAX)
@@ -141,6 +142,7 @@ def execute(native, main, sdk, info, pages, records, captured, loads, symbols, s
     index = 0
     encoded = bytearray()
     queries = 0
+    elided_queries = 0
     resource_calls = []
     resources = {}
     native_state = []
@@ -170,6 +172,15 @@ def execute(native, main, sdk, info, pages, records, captured, loads, symbols, s
             raise ValueError(f'Resource changed within one captured queue: {key}')
         resources[key] = value
 
+    def inspect_buffer(p):
+        pool = word(p+12)
+        address = struct.unpack('<Q', read(pool+0x28, 8))[0] + word(p+0x10)
+        resource('buffer_header', p, 24, pool=hex(pool),
+                 pool_offset=word(p+0x10), buffer_bytes=word(p+0x14),
+                 gpu_address=hex(address), payload_captured=False)
+        resource('pool_header', pool, 0x40)
+        resource('pool_vtable', word(pool), 0x40)
+
     def inspect_resources(slot):
         if slot == 0x191fc78:
             p = reg(1)
@@ -177,14 +188,7 @@ def execute(native, main, sdk, info, pages, records, captured, loads, symbols, s
             resource('program_packet', word(p+8), word(p+0x10)*4,
                      program=hex(p), stages=word(p+0x14))
         elif slot == 0x191f8cc:
-            p = reg(0)
-            pool = word(p+12)
-            address = struct.unpack('<Q', read(pool+0x28, 8))[0] + word(p+0x10)
-            resource('buffer_header', p, 24, pool=hex(pool),
-                     pool_offset=word(p+0x10), buffer_bytes=word(p+0x14),
-                     gpu_address=hex(address), payload_captured=False)
-            resource('pool_header', pool, 0x40)
-            resource('pool_vtable', word(pool), 0x40)
+            inspect_buffer(reg(0))
         elif slot in (0x191fc70,0x191fc74):
             resource('vertex_attrib' if slot==0x191fc70 else 'vertex_stream',
                      reg(2), reg(1)*(4 if slot==0x191fc70 else 8))
@@ -238,11 +242,13 @@ def execute(native, main, sdk, info, pages, records, captured, loads, symbols, s
         pending = None
 
     def hook(uc, pc, size, data):
-        nonlocal pending
+        nonlocal pending, index, elided_queries
         if pending is not None and pc == pending['return']:
             finish()
         if native and pc == (symbols['vp_engine_queue_native_run'] & ~1):
             native_state.append(reg(3))
+        if native and allow_query_elision and pc == (symbols['buffer'] & ~1):
+            inspect_buffer(reg(2))
         if pc in (base + 0x13efd7c, base + 0x13efdc4):
             u.mem_write(reg(0), bytes(reg(1)))
             u.reg_write(UC_ARM_REG_PC, u.reg_read(UC_ARM_REG_LR))
@@ -260,6 +266,12 @@ def execute(native, main, sdk, info, pages, records, captured, loads, symbols, s
             if index >= len(records):
                 raise ValueError('Unexpected extra SDK call')
             slot = functions[pc]
+            if native and allow_query_elision:
+                while index<len(records) and records[index][1] in QUERY and records[index][1]!=slot:
+                    index += 1
+                    elided_queries += 1
+                if index>=len(records):
+                    raise ValueError('Extra SDK call after elided query tail')
             current.update(event=index, slot=hex(slot), function=hex(pc))
             inspect_resources(slot)
             pending = {'slot': slot, 'return': u.reg_read(UC_ARM_REG_LR), 'cmd': reg(0)}
@@ -283,7 +295,7 @@ def execute(native, main, sdk, info, pages, records, captured, loads, symbols, s
     u.reg_write(UC_ARM_REG_LR, STOP)
     u.reg_write(UC_ARM_REG_R0, ctx)
     try:
-        u.emu_start(symbols['vp_engine_full_run'] if native else base+0xbbe9c8,
+        u.emu_start(symbols[native_entry] if native else base+0xbbe9c8,
                     STOP, count=20000000)
         if pending is not None and u.reg_read(UC_ARM_REG_PC) == pending['return']:
             finish()
@@ -291,7 +303,8 @@ def execute(native, main, sdk, info, pages, records, captured, loads, symbols, s
             raise ValueError('Instruction budget exhausted or incomplete call stream')
     except Exception as error:
         raise ValueError(f'{"native" if native else "original"}: {current}: {error}') from error
-    return {'calls': index, 'queries': queries, 'bytes': len(encoded),
+    return {'calls': index-elided_queries, 'reference_calls': index,
+            'queries': queries, 'elided_queries': elided_queries, 'bytes': len(encoded),
             'encoded_sha256': sha(encoded), 'external_calls': len(resource_calls),
             'encoding_differences': differences,
             'resources': resources,
@@ -303,6 +316,9 @@ def main_cli():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('main', 'sdk', 'elf', 'capture', 'function-map', 'output'):
         parser.add_argument('--'+name, required=True, type=Path)
+    parser.add_argument('--native-entry',default='vp_engine_full_run')
+    parser.add_argument('--allow-query-elision',action='store_true',
+                        help='Allow native code to omit pure queries; all commands and resource descriptions still match')
     args = parser.parse_args()
     if args.output.exists():
         parser.error('Output must be a fresh directory')
@@ -331,8 +347,11 @@ def main_cli():
                    'engine-full-pages.bin','engine-full-encoded.bin')]
         summary.update(capture=info, sdk_base=hex(sdk_base),
                        identities={str(p):sha(p.read_bytes()) for p in inputs})
-        old = execute(False, main, sdk, info, pages, records, blob, loads, symbols, sdk_base)
-        new = execute(True, main, sdk, info, pages, records, blob, loads, symbols, sdk_base)
+        summary.update(native_entry=args.native_entry,allow_query_elision=args.allow_query_elision)
+        old = execute(False, main, sdk, info, pages, records, blob, loads, symbols, sdk_base,
+                      args.native_entry,False)
+        new = execute(True, main, sdk, info, pages, records, blob, loads, symbols, sdk_base,
+                      args.native_entry,args.allow_query_elision)
         for name in ('state','context'):
             summary[name+'_equal'] = old[name] == new[name]
             summary[name+'_difference_bytes'] = sum(a!=b for a,b in zip(old[name],new[name]))

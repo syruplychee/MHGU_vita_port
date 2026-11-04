@@ -37,6 +37,9 @@ typedef struct VPEngineNvnEnv {
     void *(*resolve)(void *opaque, uint32_t guest_address);
     void (*emit)(void *opaque, const VPEngineNvnCall *call,
                  VPEngineNvnResult *result);
+    /* Optional typed query path. It bypasses temporary NVN call-record setup;
+     * the runtime still checks the pool getter or calls the original SDK. */
+    uint64_t (*buffer_address)(void *opaque,uint32_t site,uint32_t object);
 
     /* Confirmed call shape: the imported 0x13EFD7C/0x13EFDC4 sites pass
      * (pointer, size) and the parent does not rely on a fill argument.

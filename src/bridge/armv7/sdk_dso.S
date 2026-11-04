@@ -71,20 +71,68 @@ VP_HOST_BRIDGE_FUNCTION vp_movie_color_nv12_leave, 0x24f
 VP_HOST_BRIDGE_FUNCTION vp_engine_submit_enter, 0x250
 VP_HOST_BRIDGE_FUNCTION vp_engine_submit_leave, 0x251
 VP_HOST_BRIDGE_FUNCTION vp_engine_full_failed, 0x252
+/* A/B profile boundary around one complete root call. The enter handler keeps
+ * r0=context and returns the selected target (native C or original trampoline)
+ * in ip; the leave handler accounts the completed call before restoring the
+ * caller's callee-saved registers. */
+VP_HOST_BRIDGE_FUNCTION vp_engine_full_ab_enter, 0x253
+VP_HOST_BRIDGE_FUNCTION vp_engine_full_ab_leave, 0x254
 
 /* Full queue replacement: C owns its local state; original caller ABI stays
- * on the guest stack. Failures enter the normal host bridge and stop. */
+ * on the guest stack. Failures enter the normal host bridge and stop. The
+ * profile flag is read once at the root entry so the single-path build keeps
+ * the original fast path. */
 .balign 4
 .global vp_engine_full_entry
 .type vp_engine_full_entry,%function
 vp_engine_full_entry:
+    ldr ip, 1f
+    ldr ip, [ip]
+    cmp ip, #0
+    bne vp_engine_full_ab_entry
+    ldr ip, 2f
+    ldr ip, [ip]
+    cmp ip, #0
+    bne vp_engine_full_fast_entry
     push {r4,lr}
     bl vp_engine_full_run
     pop {r4,lr}
     cmp r0,#0
     bne vp_engine_full_failed
     bx lr
+1:  .word vp_engine_full_profile_enabled
+2:  .word vp_engine_full_fast_enabled
 .size vp_engine_full_entry,.-vp_engine_full_entry
+
+.balign 4
+.type vp_engine_full_fast_entry,%function
+vp_engine_full_fast_entry:
+    push {r4,lr}
+    bl vp_engine_full_run_fast
+    pop {r4,lr}
+    cmp r0,#0
+    bne vp_engine_full_failed
+    bx lr
+.size vp_engine_full_fast_entry,.-vp_engine_full_fast_entry
+
+/* Alternating A/B wrapper. push {r4,lr} keeps SP 8-byte aligned and preserves
+ * the caller's r4 and return address. The bridge enter leaves r0=context and
+ * writes the path target to ip; blx ip runs either the native C body or the
+ * original-entry trampoline. The leave bridge checks the C return value only
+ * in native mode, so an arbitrary original-root r0 is never treated as an
+ * error. On success the two bridges restore the complete register/FPSCR/VFP
+ * frame and this wrapper returns the untouched original caller ABI. */
+.balign 4
+.global vp_engine_full_ab_entry
+.type vp_engine_full_ab_entry,%function
+vp_engine_full_ab_entry:
+    push {r4,lr}
+    bl vp_engine_full_ab_enter
+    blx ip
+    bl vp_engine_full_ab_leave
+    pop {r4,lr}
+    bx lr
+.size vp_engine_full_ab_entry,.-vp_engine_full_ab_entry
 
 /* Invoke the exact locked NVN slot with core, stack and hard-float arguments.
  * Call offsets: r[]=8, stack[]=24, s[]=60. Keep 8-byte SP alignment. */
