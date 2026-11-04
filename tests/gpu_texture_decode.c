@@ -1,6 +1,7 @@
 #include "gpu_texture.h"
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static uint8_t input[4096], output[64 * 64 * 4];
@@ -458,6 +459,122 @@ int main(void) {
             assert(vp_texture_upload_format(0x28, (w5 & ~(0xfffu << 19)) |
                    ((3u << 19) | (2u << 22) | (0u << 25) | (7u << 28))) == 0);
         }
+    }
+    {
+        /* Differential decode: the fused path must be byte-identical to the
+         * reviewed decode + swizzle pair for every GOB layout, tail, padded
+         * row and selector combination below. This compares two independent
+         * traversals rather than mirroring the new implementation. */
+        static const unsigned widths[] =
+            {1,2,3,4,7,8,15,16,17,31,32,33,47,48,63,64,65,127,128,129};
+        static const unsigned heights[] = {1,2,3,7,8,9,15,16,17,33};
+        static const uint32_t selector_words[] = {
+            0xb1au<<19,                            /* identity R,G,B,A */
+            0x00000000u,                           /* zero,zero,zero,zero */
+            (2u<<19)|(0u<<22)|(0u<<25)|(7u<<28),   /* R,0,0,1 */
+            (1u<<19)|(2u<<22)|(3u<<25)|(4u<<28),   /* undefined 1 -> zero */
+            (6u<<19)|(7u<<22)|(5u<<25)|(4u<<28),   /* 6/7 both -> 255 */
+            (5u<<19)|(4u<<22)|(3u<<25)|(2u<<28),   /* reversed channels */
+            (7u<<19)|(7u<<22)|(7u<<25)|(7u<<28),   /* all one */
+            (2u<<19)|(2u<<22)|(0u<<25)|(1u<<28)    /* duplicates/zero */
+        };
+        uint32_t lcg = 0x12345678u;
+        for (unsigned wi = 0; wi < sizeof(widths)/sizeof(widths[0]); ++wi)
+        for (unsigned hi = 0; hi < sizeof(heights)/sizeof(heights[0]); ++hi)
+        for (unsigned bh = 0; bh <= 5u; ++bh)
+        for (unsigned si = 0;
+             si < sizeof(selector_words)/sizeof(selector_words[0]); ++si) {
+            unsigned w = widths[wi], h = heights[hi];
+            size_t storage = vp_texture_storage(w, h, 8u, bh);
+            size_t pixels = (size_t)w * h;
+            uint8_t *source, *old, *fused;
+            if (!storage) continue;
+            source = (uint8_t *)malloc(storage);
+            old = (uint8_t *)malloc(pixels * 4u);
+            fused = (uint8_t *)malloc(pixels * 4u);
+            assert(source != NULL && old != NULL && fused != NULL);
+            for (size_t i = 0; i < storage; ++i) {
+                lcg = lcg * 1664525u + 1013904223u;
+                source[i] = (uint8_t)(lcg >> 24);
+            }
+            assert(vp_texture_rgba(source, storage - (storage > 1u ? 1u : 0u),
+                                   old, w, h, 8u, bh) ==
+                   (storage > 1u ? -1 : 0));
+            assert(vp_texture_rgba(source, storage, old, w, h, 8u, bh) == 0);
+            vp_texture_swizzle(old, pixels, selector_words[si]);
+            assert(vp_texture_rgba8_untile_swizzle(source, storage, fused, w, h,
+                                                   bh, selector_words[si]) ==
+                   0);
+            assert(memcmp(old, fused, pixels * 4u) == 0);
+            free(source);
+            free(old);
+            free(fused);
+        }
+        puts("PASS fused RGBA8 tiled decode equals the reviewed decode+swizzle");
+    }
+    {
+        /* Pitch-linear RGBA8 (TIC header 2) fusion, including padded rows. */
+        static const unsigned widths[] = {1,2,3,4,5,7,15,16,17,33,64};
+        static const uint32_t selector_words[] = {
+            0xb1au<<19, 0x00000000u,
+            (2u<<19)|(0u<<22)|(0u<<25)|(7u<<28),
+            (1u<<19)|(2u<<22)|(3u<<25)|(4u<<28),
+            (6u<<19)|(7u<<22)|(5u<<25)|(4u<<28)
+        };
+        uint32_t lcg = 0x9e3779b9u;
+        for (unsigned wi = 0; wi < sizeof(widths)/sizeof(widths[0]); ++wi)
+        for (unsigned extra = 0u; extra <= 12u; extra += 4u)
+        for (unsigned si = 0;
+             si < sizeof(selector_words)/sizeof(selector_words[0]); ++si) {
+            unsigned w = widths[wi], h = 5u;
+            size_t pitch = (size_t)w * 4u + extra;
+            size_t pixels = (size_t)w * h;
+            uint8_t *source = (uint8_t *)malloc(pitch * h);
+            uint8_t *old = (uint8_t *)malloc(pixels * 4u);
+            uint8_t *fused = (uint8_t *)malloc(pixels * 4u);
+            assert(source != NULL && old != NULL && fused != NULL);
+            for (size_t i = 0; i < pitch * h; ++i) {
+                lcg = lcg * 1664525u + 1013904223u;
+                source[i] = (uint8_t)(lcg >> 24);
+            }
+            for (unsigned y = 0; y < h; ++y)
+                memcpy(old + (size_t)y * w * 4u, source + (size_t)y * pitch,
+                       (size_t)w * 4u);
+            vp_texture_swizzle(old, pixels, selector_words[si]);
+            assert(vp_texture_rgba8_linear_swizzle(source, pitch * h, fused, w,
+                                                   h, pitch,
+                                                   selector_words[si]) == 0);
+            assert(memcmp(old, fused, pixels * 4u) == 0);
+            assert(vp_texture_rgba8_linear_swizzle(source, pitch * h - 1u,
+                                                   fused, w, h, pitch,
+                                                   selector_words[si]) == -1);
+            free(source);
+            free(old);
+            free(fused);
+        }
+        puts("PASS fused pitch-linear RGBA8 decode equals decode+swizzle");
+    }
+    {
+        /* Identity RG32F split is a pure row copy; every raw 32-bit pattern,
+         * including NaN, -0 and subnormals, must survive unchanged. */
+        const uint32_t patterns[4] = {
+            0x7fc00001u, 0x80000000u, 0x00000001u, 0xff800000u
+        };
+        uint8_t source[2 * 144 + 16], output[2 * 8 * 16];
+        uint32_t lcg = 0x5a5a5a5au;
+        for (size_t i = 0; i < sizeof(source); ++i) {
+            lcg = lcg * 1664525u + 1013904223u;
+            source[i] = (uint8_t)(lcg >> 24);
+        }
+        for (unsigned i = 0; i < 4u; ++i)
+            memcpy(source + i * 16u, &patterns[i], 4u);
+        memset(output, 0xa5, sizeof(output));
+        assert(vp_texture_rgba32f_pitch_to_rg32f(source, 2u * 144u, output,
+                                                 sizeof(output), 8, 2, 144,
+                                                 0x58d7ff81u) == 0);
+        assert(memcmp(output, source, 8u * 16u) == 0);
+        assert(memcmp(output + 8u * 16u, source + 144, 8u * 16u) == 0);
+        puts("PASS identity RG32F split preserves every 32-bit channel pattern");
     }
     puts("PASS RGBA GOB sectors, BC1 color/transparency, RGBA32F-to-RGBA16F, bounds");
     return 0;

@@ -1,4 +1,6 @@
 #include "gxm_runtime.h"
+#include "texture_pipeline.h"
+#include "texture_regions.h"
 #include "batch_policy.h"
 #include "clear_fusion.h"
 #include "engine_full.h"
@@ -895,6 +897,17 @@ static int gxm_notify_newer(uint32_t value, uint32_t reference) {
 static int gxm_notify_reached(uint32_t completed, uint32_t pending) {
     return !gxm_notify_newer(pending, completed);
 }
+
+/* Acquire observation of the notification word. Vita GCC uses the atomic
+ * builtin; the MSVC host test relies on x86 load ordering, which is acquire
+ * for ordinary cached loads. */
+static uint32_t gxm_notify_observe(volatile unsigned *address) {
+#if defined(_MSC_VER)
+    return *(volatile uint32_t *)address;
+#else
+    return __atomic_load_n(address, __ATOMIC_ACQUIRE);
+#endif
+}
 /* VP_HOST_TEST_EXTRACT:notify_end */
 static int gxm_scene_pipeline_enabled(void);
 static void gxm_pending_scene_retire_upto(uint32_t value);
@@ -984,8 +997,24 @@ static int gxm_clear_fusion_enabled(void) {
  * zero unless the play-perf marker gates the timestamps on. */
 static uint64_t gxm_endscene_calls, gxm_endscene_us;
 static uint64_t gxm_notify_wait_calls, gxm_notify_wait_us;
+static uint64_t gxm_notify_poll_hits, gxm_notify_real_waits;
 static uint64_t gxm_finish_calls, gxm_finish_us;
 static uint64_t gxm_pending_complete_calls, gxm_pending_wait_us;
+/* A combined drain submits the current scene first and proves all older
+ * pending scenes complete with one wait for the newest value. */
+static uint64_t gxm_combined_drains;
+static uint64_t gxm_deferred_scenes;
+/* Direct decoder-owned texture counters (deep mode only). */
+static uint64_t gxm_direct_binds, gxm_direct_bytes_avoided;
+static uint64_t gxm_direct_retains;
+static uint64_t gxm_direct_bind_failures;
+static int gxm_direct_seen;
+static VPTextureRegions gxm_texture_region_arena;
+/* Tentative declarations used by the early statistics logger; the
+ * authoritative definitions live in the extracted direct/pending sections. */
+static uint64_t gxm_direct_releases;
+static uint64_t gxm_direct_quarantined;
+static unsigned gxm_pending_scene_count;
 /* Age since EndScene, not blocking; the worker may have encoded a whole scene
  * while the deferred scene ran. Kept only for overlap diagnostics. */
 static uint64_t gxm_pipeline_waits, gxm_pipeline_age_us, gxm_pipeline_age_max;
@@ -1442,6 +1471,7 @@ static unsigned gxm_upload_capacity = VP_UPLOAD_CACHE_BYTES;
 static int gxm_upload_capacity_state = -1;
 static unsigned gxm_upload_stamp;
 static uint64_t gxm_upload_hits, gxm_upload_copies, gxm_upload_saved_bytes;
+static uint64_t gxm_upload_fill_bytes;
 /* Owned-source association probes that resolved without a byte comparison.
  * Each lookup site is counted; these are not unique payloads and must not be
  * compared with the exact-compare hit counters. */
@@ -2981,6 +3011,7 @@ static int frame_end_scene(SceGxmContext *context) {
  * failure. There is no teardown/reinitialization path yet, so the flag is
  * intentionally not cleared and no resource is silently recreated. */
 static int frame_poison_context(int rc) {
+    if (vp_texture_direct_active()) vp_texture_direct_fail_submission();
     if (!gxm_scene_poisoned) {
         gxm_scene_poisoned = 1;
         glog("VP_GXM_CONTEXT poison rc=%d action=reject-draw-clear-present "
@@ -3018,6 +3049,9 @@ typedef struct {
 typedef struct {
     int parsed;
     int enabled;
+    unsigned passdump;
+    unsigned live;
+    unsigned live_inputs;
     unsigned delay_ms;
     unsigned max_dumps;
     unsigned max_presents;
@@ -3046,6 +3080,7 @@ static void b34_dump_init(void) {
     fclose(f);
     text[got] = 0;
     b34_dump.enabled = 1;
+    b34_dump.passdump = 1;
     for (char *line = text; line != NULL && *line != 0;) {
         char *end = strchr(line, '\n');
         char *value;
@@ -3098,6 +3133,8 @@ static void b34_live_poll(void) {
         b34_live_generation = sequence;
         b34_live_inputs = inputs;
         b34_dump.enabled = 1;
+        b34_dump.live = 1;
+        b34_dump.live_inputs = inputs;
         b34_dump.delay_ms = 0u;
         b34_dump.max_dumps = b34_dump.dumps + (inputs ? 8u : 0u);
         b34_dump.max_presents = b34_dump.presents + 1u;
@@ -3115,6 +3152,21 @@ static int b34_dump_due(void) {
     now = sceKernelGetProcessTimeWide();
     if (now < b34_dump.start_us) return 0;
     return (now - b34_dump.start_us) / 1000u >= (uint64_t)b34_dump.delay_ms;
+}
+
+/* Only a surface/pass readback requires the synchronous scene path. A
+ * capture-live request with inputs=0 records the present pair only; that read
+ * already happens after gxm_pending_scene_complete("present"). Returning false
+ * here therefore restores the asynchronous pipeline for present-only captures
+ * and after the requested input dumps complete. The explicit old
+ * b34-passdump.enable marker keeps its documented synchronous behaviour. */
+static int b34_dump_surface_capture_active(void) {
+    b34_dump_init();
+    b34_live_poll();
+    if (!b34_dump.enabled) return 0;
+    if (b34_dump.passdump) return 1;
+    return b34_dump.live && b34_dump.live_inputs != 0u &&
+           b34_dump.dumps < b34_dump.max_dumps;
 }
 
 static unsigned b34_dump_note_writes(uint64_t va) {
@@ -4567,6 +4619,41 @@ static void static_log_stats(void) {
          gxm_sampler_plan_hits, gxm_sampler_plan_misses,
          static_shared_pair_hits, static_shared_uniform_reuses,
          static_shared_blend_reuses, static_plan_generation);
+    if (gxm_direct_seen || vp_texture_direct_active()) {
+        glog("VP_GXM_TEXTURE_PIPELINE_STATS active=%d direct_binds=%llu "
+             "direct_bytes_avoided=%llu direct_retains=%llu "
+             "direct_releases=%llu direct_fail=%llu direct_quarantined=%llu "
+             "staging_memcpy_bytes=%llu copy_path_us=%llu upload_fill_bytes=%llu "
+             "deferred_scenes=%llu notif_poll_hits=%llu "
+             "notif_real_waits=%llu notify_calls=%llu combined_drains=%llu "
+             "pending_scenes=%u\n",
+             vp_texture_direct_active(),
+             (unsigned long long)gxm_direct_binds,
+             (unsigned long long)gxm_direct_bytes_avoided,
+             (unsigned long long)gxm_direct_retains,
+             (unsigned long long)gxm_direct_releases,
+             (unsigned long long)gxm_direct_bind_failures,
+             (unsigned long long)gxm_direct_quarantined,
+             (unsigned long long)gxm_tex_bytes,
+             (unsigned long long)gxm_tex_us,
+             (unsigned long long)gxm_upload_fill_bytes,
+             (unsigned long long)gxm_deferred_scenes,
+             (unsigned long long)gxm_notify_poll_hits,
+             (unsigned long long)gxm_notify_real_waits,
+             (unsigned long long)gxm_notify_wait_calls,
+             (unsigned long long)gxm_combined_drains,
+             gxm_pending_scene_count);
+        glog("VP_GXM_TEXTURE_REGION_STATS physical_bytes=%u peak_bytes=%u "
+             "kernel_allocs=%llu kernel_frees=%llu suballocs=%llu "
+             "subfrees=%llu live=%u failed=%u\n",
+             (unsigned)gxm_texture_region_arena.physical_bytes,
+             (unsigned)gxm_texture_region_arena.peak_bytes,
+             (unsigned long long)gxm_texture_region_arena.kernel_allocs,
+             (unsigned long long)gxm_texture_region_arena.kernel_frees,
+             (unsigned long long)gxm_texture_region_arena.suballocs,
+             (unsigned long long)gxm_texture_region_arena.subfrees,
+             gxm_texture_region_arena.live, gxm_texture_region_arena.failed);
+    }
     static_log_batch_hist();
     glog("VP_GXM_CLEAR_FUSION_STATS deferred=%llu combined_deferred=%llu "
          "in_scene=%llu materialized=%llu blue_first=%llu\n",
@@ -5732,6 +5819,78 @@ typedef struct {
  * guest may free its pushbuffer, vertices and textures as soon as the worker
  * submission returns. Descriptors and their staging pages live until the
  * arena's completion notification. */
+/* VP_HOST_TEST_EXTRACT:direct_refs_begin */
+#define VP_GXM_DIRECT_TEXTURE_MAX (VP_GXM_FRAGMENT_SAMPLER_LIMIT + 1u)
+#define VP_GXM_DIRECT_QUARANTINE_MAX 64u
+typedef struct {
+    unsigned count;
+    VPTexturePoolToken token[VP_GXM_DIRECT_TEXTURE_MAX];
+} VPGxmDirectRefs;
+static VPTexturePoolToken gxm_direct_quarantine[VP_GXM_DIRECT_QUARANTINE_MAX];
+static unsigned gxm_direct_quarantine_count;
+static uint64_t gxm_direct_quarantined;
+static uint64_t gxm_direct_releases;
+
+static int gxm_direct_refs_add(VPGxmDirectRefs *refs, VPTexturePoolToken token) {
+    if (refs == NULL || refs->count >= VP_GXM_DIRECT_TEXTURE_MAX) return -1;
+    refs->token[refs->count++] = token;
+    return 0;
+}
+
+static unsigned gxm_direct_refs_release(VPGxmDirectRefs *refs) {
+    unsigned released;
+    if (refs == NULL) return 0u;
+    released = refs->count;
+    for (unsigned i = 0; i < refs->count; ++i) {
+        vp_texture_direct_release_gpu(refs->token[i]);
+        gxm_direct_releases++;
+    }
+    refs->count = 0u;
+    return released;
+}
+
+/* A failed EndScene/notification cannot prove the GPU stopped reading these
+ * payloads. Move the tokens out of the entry before any memset/reset so they
+ * stay retained; the process is poisoned and the pool must not reuse them. */
+static unsigned gxm_direct_refs_quarantine(VPGxmDirectRefs *refs) {
+    unsigned moved = 0u;
+    if (refs == NULL) return 0u;
+    for (unsigned i = 0; i < refs->count; ++i) {
+        gxm_direct_quarantined++;
+        if (gxm_direct_quarantine_count < VP_GXM_DIRECT_QUARANTINE_MAX)
+            gxm_direct_quarantine[gxm_direct_quarantine_count++] =
+                refs->token[i];
+        /* A dropped token still leaves the slot's gpu_refs incremented: the
+         * payload is leaked, never reused or released by mistake. */
+        moved++;
+    }
+    refs->count = 0u;
+    return moved;
+}
+
+/* Production rollback policy shared by the draw-failure paths and its host
+ * regression. A draw that never reached sceGxmDraw can always release. A draw
+ * that did reach it may release only after the scene completion was proven
+ * (EndScene + notification + Finish all succeeded). */
+typedef enum {
+    VP_GXM_DIRECT_ROLLBACK_RELEASE = 0,
+    VP_GXM_DIRECT_ROLLBACK_QUARANTINE = 1
+} VPGxmDirectRollback;
+static VPGxmDirectRollback gxm_direct_rollback_decision(
+        int draw_consumed, int scene_completion_proven) {
+    return draw_consumed && !scene_completion_proven
+               ? VP_GXM_DIRECT_ROLLBACK_QUARANTINE
+               : VP_GXM_DIRECT_ROLLBACK_RELEASE;
+}
+static void gxm_direct_rollback_refs(VPGxmDirectRefs *refs,
+                                     VPGxmDirectRollback decision) {
+    if (decision == VP_GXM_DIRECT_ROLLBACK_QUARANTINE)
+        gxm_direct_refs_quarantine(refs);
+    else
+        gxm_direct_refs_release(refs);
+}
+/* VP_HOST_TEST_EXTRACT:direct_refs_end */
+
 typedef struct {
     int used;
     VPGxmDrawRequest req;
@@ -5766,6 +5925,11 @@ typedef struct {
     SceGxmTexture extra_texture[VP_GXM_FRAGMENT_SAMPLER_LIMIT - 1u];
     SceGxmTexture extra_surface_texture[VP_GXM_FRAGMENT_SAMPLER_LIMIT - 1u];
     SceGxmTexture vertex_texture;
+    /* Decoder-owned direct bindings retained for this draw's GPU lifetime.
+     * Released only after a proven scene completion (or quarantined on an
+     * unknown failure). */
+    VPGxmDirectRefs direct;
+    unsigned direct_consumed;
 } VPGxmBatchEntry;
 
 enum {
@@ -5848,6 +6012,8 @@ static unsigned gxm_batch_arena;
 static int gxm_batch_arena_ready;
 
 static int gxm_scene_pipeline_state = -1;
+static int gxm_pipeline_capture_sync = -1;
+static unsigned gxm_pipeline_capture_logs;
 static int gxm_scene_pipeline_enabled(void) {
     if (gxm_scene_pipeline_state < 0) {
         FILE *marker = fopen("ux0:data/mhgu-vita-port/scene-pipeline.disable", "rb");
@@ -6931,6 +7097,9 @@ static VPGxmUpload *gxm_upload_prepare(const VPTextureSnapshotKey *key,
         return entry;
     }
     /* Only populate between scenes. An open-scene miss uses owned staging. */
+    if (!gxm_upload_memory && !vp_texture_direct_active() &&
+        !gxm_batch.scene_open)
+        gxm_upload_memory = gpu_alloc(gxm_upload_capacity, 0, NULL);
     if (!gxm_upload_memory || gxm_batch.scene_open || !source || !bytes ||
         bytes > gxm_upload_capacity) return NULL;
     unsigned pages = (bytes + VP_UPLOAD_PAGE_BYTES - 1u) / VP_UPLOAD_PAGE_BYTES;
@@ -6947,6 +7116,7 @@ static VPGxmUpload *gxm_upload_prepare(const VPTextureSnapshotKey *key,
         if (entry && run == pages) {
             void *data = gxm_upload_memory + first * VP_UPLOAD_PAGE_BYTES;
             memcpy(data, source, bytes);
+            gxm_upload_fill_bytes += bytes;
             memset(gxm_upload_pages + first, 1, pages);
             *entry = (VPGxmUpload){{*key, data, bytes, owned_source}, first,
                                   pages, ++gxm_upload_stamp, 1u, 0u};
@@ -7034,6 +7204,72 @@ static int gxm_snapshot_memo_lookup(const VPTextureSnapshotKey *key,
         }
     }
     return 0;
+}
+
+/* Deep direct-binding contract. The payload bytes produced by the decoder are
+ * exactly the bytes the copy path would memcpy into its own GXM backing, so a
+ * direct binding is only allowed when the same descriptor format and byte
+ * count validate. Primary textures are never cubes in the existing primary
+ * descriptor path. */
+static int gxm_direct_candidate(const void *texels, unsigned owned,
+                                unsigned width, unsigned height,
+                                unsigned format, unsigned cube,
+                                unsigned mip_count, int primary,
+                                SceGxmTextureFormat *fmt_out,
+                                size_t *bytes_out) {
+    SceGxmTextureFormat fmt;
+    size_t bytes;
+    if (!vp_texture_direct_active() || !owned || texels == NULL ||
+        width == 0u || height == 0u)
+        return 0;
+    if (primary && cube) return 0;
+    if (frame_gxm_texture_format(format, &fmt) < 0) return 0;
+    bytes = cube ? vp_texture_cube_upload_bytes_mips(width, height, mip_count)
+                 : vp_texture_upload_bytes(width, height, format);
+    if (bytes == 0u || !vp_texture_direct_compatible(texels, bytes)) return 0;
+    if (cube && (mip_count == 0u ||
+                 mip_count > vp_texture_cube_mip_count(width, height)))
+        return 0;
+    if (fmt_out != NULL) *fmt_out = fmt;
+    if (bytes_out != NULL) *bytes_out = bytes;
+    return 1;
+}
+
+static void *gxm_batch_texture_copy(VPGxmBatchEntry *entry,
+    const VPTextureSnapshotKey *key, const void *source, size_t bytes,
+    const void *owned_source);
+
+/* Direct sources are retained through the decoder's live-slot identity, never
+ * through an address range. A failed retain is an internal contract failure:
+ * in deep mode the draw fails explicitly instead of silently copying. */
+static void *gxm_batch_texture_bind(VPGxmBatchEntry *entry,
+    const VPTextureSnapshotKey *key, const void *source, size_t bytes,
+    const void *owned_source, int direct_eligible) {
+    if (direct_eligible) {
+        VPTexturePoolToken token;
+        if (!vp_texture_direct_active() ||
+            !vp_texture_direct_retain_gpu(source, &token)) {
+            gxm_direct_bind_failures++;
+            glog("VP_GXM_DIRECT_BIND_FAIL bytes=%u action=draw-fail\n",
+                 (unsigned)bytes);
+            vp_texture_direct_fail_submission();
+            return NULL;
+        }
+        if (gxm_direct_refs_add(&entry->direct, token) < 0) {
+            vp_texture_direct_release_gpu(token);
+            gxm_direct_bind_failures++;
+            glog("VP_GXM_DIRECT_BIND_FAIL bytes=%u reason=token-limit\n",
+                 (unsigned)bytes);
+            vp_texture_direct_fail_submission();
+            return NULL;
+        }
+        gxm_direct_binds++;
+        gxm_direct_retains++;
+        gxm_direct_bytes_avoided += bytes;
+        gxm_direct_seen = 1;
+        return (void *)source;
+    }
+    return gxm_batch_texture_copy(entry, key, source, bytes, owned_source);
 }
 
 static void *gxm_batch_texture_copy(VPGxmBatchEntry *entry,
@@ -7206,7 +7442,10 @@ static size_t gxm_batch_reserve_for(const VPGxmDrawRequest *req,
     }
     if (req->texture_source != VP_GXM_EXTRA_SOURCE_DEPTH &&
         req->texels != NULL && req->tex_width != 0u && req->tex_height != 0u &&
-        (req->texture_va == 0u || surface_find(req->texture_va) == NULL))
+        (req->texture_va == 0u || surface_find(req->texture_va) == NULL) &&
+        !gxm_direct_candidate(req->texels, req->texels_owned,
+            req->tex_width, req->tex_height, req->tex_format, 0u, 1u, 1,
+            NULL, NULL))
     {
         VPTextureSnapshotKey key = gxm_snapshot_key(req->texture_va,
             req->tex_width, req->tex_height, req->tex_format, 0u, 1u);
@@ -7221,6 +7460,10 @@ static size_t gxm_batch_reserve_for(const VPGxmDrawRequest *req,
         size_t bytes;
         if (extra->source != VP_GXM_EXTRA_SOURCE_CPU ||
             extra->texels == NULL || extra->width == 0u || extra->height == 0u)
+            continue;
+        if (gxm_direct_candidate(extra->texels, extra->texels_owned,
+                extra->width, extra->height, extra->tex_format, extra->cube,
+                extra->cube ? extra->mip_count : 1u, 0, NULL, NULL))
             continue;
         bytes = extra->cube
             ? vp_texture_cube_upload_bytes_mips(extra->width, extra->height,
@@ -7240,7 +7483,10 @@ static size_t gxm_batch_reserve_for(const VPGxmDrawRequest *req,
          * texels; a GPU-classified descriptor may still carry its CPU snapshot.
          * Reserve the same bytes the copy will consume. */
         if (extra->source != VP_GXM_EXTRA_SOURCE_DEPTH &&
-            extra->texels != NULL && extra->width != 0u && extra->height != 0u) {
+            extra->texels != NULL && extra->width != 0u && extra->height != 0u &&
+            !gxm_direct_candidate(extra->texels, extra->texels_owned,
+                extra->width, extra->height, extra->tex_format, extra->cube,
+                extra->cube ? extra->mip_count : 1u, 0, NULL, NULL)) {
             size_t bytes = extra->cube
                 ? vp_texture_cube_upload_bytes_mips(extra->width, extra->height,
                                                     extra->mip_count)
@@ -7272,8 +7518,6 @@ static int gxm_batch_ensure_staging(void) {
     }
     gxm_batch_staging_sets[gxm_batch_arena][gxm_batch.staging_page] = gxm_batch.staging;
     gxm_batch.staging_used = 0u;
-    if (gxm_upload_memory == NULL)
-        gxm_upload_memory = gpu_alloc(gxm_upload_capacity, 0, NULL);
     glog("VP_GXM_BATCH staging_ready bytes=%u draws=%u arena=%u\n",
          (unsigned)gxm_batch.staging_size, VP_BATCH_MAX_DRAWS, gxm_batch_arena);
     return 0;
@@ -7318,9 +7562,14 @@ static void *gxm_batch_entry_alloc(VPGxmBatchEntry *entry, size_t bytes,
     return entry->staging_page + at;
 }
 
-static void gxm_batch_discard_current(void) {
+/* The decision parameter comes from gxm_direct_rollback_decision: release is
+ * only legal when no draw was issued or scene completion was proven; otherwise
+ * the leases are quarantined and stay retained. */
+static void gxm_batch_discard_current_impl(VPGxmDirectRollback decision) {
     VPGxmBatchEntry *entry = gxm_batch_current_entry;
     if (entry == NULL) return;
+    if (entry->direct.count != 0u)
+        gxm_direct_rollback_refs(&entry->direct, decision);
     if (entry->staging_base <= gxm_batch.staging_used)
         gxm_batch.staging_used = entry->staging_base;
     if (entry->uniform_bytes <= gxm_batch.uniform_bytes)
@@ -7332,8 +7581,28 @@ static void gxm_batch_discard_current(void) {
     gxm_batch_current_entry = NULL;
 }
 
+static void gxm_batch_discard_current(void) {
+    gxm_batch_discard_current_impl(VP_GXM_DIRECT_ROLLBACK_RELEASE);
+}
+
+static void gxm_batch_discard_current_decision(int draw_consumed,
+                                               int scene_completion_proven) {
+    gxm_batch_discard_current_impl(
+        gxm_direct_rollback_decision(draw_consumed,
+                                     scene_completion_proven));
+}
+
 static void gxm_batch_reset_scene_state(void) {
     gxm_batch_arena_init();
+    /* A reset that still owns a current entry is a failure path (successful
+     * flushes publish and clear the pointer first). The entry may have issued
+     * part of a two-pass draw, so retain its direct leases in quarantine; a
+     * later memset or arena reuse must never silently drop them. */
+    if (gxm_batch_current_entry != NULL) {
+        if (gxm_batch_current_entry->direct.count != 0u)
+            gxm_direct_refs_quarantine(&gxm_batch_current_entry->direct);
+        gxm_batch_current_entry = NULL;
+    }
     /* The memo points into this arena's staging; no entry may survive a reset
      * even though the current call order always re-runs the reserve first. */
     gxm_snapshot_memo_count = 0u;
@@ -7364,7 +7633,6 @@ static void gxm_batch_reset_scene_state(void) {
     gxm_batch.render_height = 0u;
     gxm_batch.scope = 0u;
     gxm_batch.opened_us = 0u;
-    gxm_batch_current_entry = NULL;
 }
 
 /* Publish one encoded draw only after the scene's EndScene/notification/Finish
@@ -7469,6 +7737,7 @@ static void gxm_batch_publish_entry(VPGxmBatchEntry *entry) {
 
 /* VP_HOST_TEST_EXTRACT:pending_state_begin */
 /* One notification address per arena: NotificationWait tests equality. */
+#define VP_GXM_PENDING_DIRECT_MAX (128u * VP_GXM_DIRECT_TEXTURE_MAX)
 typedef struct {
     int used;
     unsigned arena;
@@ -7478,17 +7747,33 @@ typedef struct {
     unsigned pin_count;
     unsigned cls;
     unsigned char pins[VP_UPLOAD_CACHE_SLOTS];
+    unsigned direct_count;
+    VPTexturePoolToken direct[VP_GXM_PENDING_DIRECT_MAX];
 } VPGxmPendingScene;
 static VPGxmPendingScene gxm_pending_scenes[VP_GXM_BATCH_ARENAS];
 static unsigned gxm_pending_scene_count;
 /* VP_HOST_TEST_EXTRACT:pending_state_end */
 
 static int gxm_scene_pipeline_active(void) {
+    int capture;
     if (!gxm_scene_pipeline_enabled()) return 0;
     if (gxm_batch_test_mode >= 0) return 0;
-    b34_dump_init();
-    if (b34_dump.enabled) return 0;
-    return 1;
+    /* Capture state is the only diagnostic condition that changes the scene
+     * mode. A present-only capture (inputs=0) keeps the pipeline asynchronous
+     * because its readback happens after the present drain; pass-level input
+     * dumps force the synchronous path while they are due. */
+    capture = b34_dump_surface_capture_active();
+    if (capture != gxm_pipeline_capture_sync) {
+        gxm_pipeline_capture_sync = capture;
+        if (gxm_pipeline_capture_logs++ < 16u)
+            glog("VP_GXM_PIPELINE_CAPTURE sync=%d passdump=%u "
+                 "live_inputs=%u dumps=%u/%u presents=%u/%u "
+                 "detail=surface-capture-only\n",
+                 capture, b34_dump.passdump, b34_dump.live_inputs,
+                 b34_dump.dumps, b34_dump.max_dumps, b34_dump.presents,
+                 b34_dump.max_presents);
+    }
+    return capture ? 0 : 1;
 }
 
 /* Reasons after which the caller mutates guest-visible resources or reads GPU
@@ -7521,6 +7806,7 @@ static void gxm_pending_scene_record(unsigned arena, uint32_t value,
     pending->submit_us = submit_us;
     pending->draws = draws;
     pending->cls = cls;
+    pending->direct_count = 0u;
     for (unsigned i = 0; i < VP_UPLOAD_CACHE_SLOTS; ++i) {
         if (!gxm_uploads[i].pinned) continue;
         gxm_uploads[i].pending++;
@@ -7535,15 +7821,32 @@ static void gxm_pending_scene_record(unsigned arena, uint32_t value,
  * failed wait does not prove the GPU stopped reading them. */
 static int gxm_pending_scene_wait(VPGxmPendingScene *pending, const char *why) {
     SceGxmNotification notification;
+    volatile unsigned *address;
     uint64_t started, finished, blocked = 0u, now = 0u;
     int rc;
+    int real_wait;
 
-    notification.address = sceGxmGetNotificationRegion() + 1u + pending->arena;
+    address = sceGxmGetNotificationRegion() + 1u + pending->arena;
+    notification.address = address;
     notification.value = pending->notify_value;
     started = gxm_prof_now();
-    rc = sceGxmNotificationWait(&notification);
+    /* The SDK wait is an equality wait on this address. Once the acquire load
+     * already observes the pending value, no further SVC can block and the
+     * duplicate call is skipped. Pending scenes are retired on success and an
+     * arena is drained before reuse, so the value cannot belong to an older
+     * generation of the same arena. */
+    if (vp_texture_direct_active() &&
+        gxm_notify_observe(address) == pending->notify_value) {
+        gxm_notify_poll_hits++;
+        rc = 0;
+        real_wait = 0;
+    } else {
+        gxm_notify_real_waits++;
+        rc = sceGxmNotificationWait(&notification);
+        real_wait = 1;
+    }
     finished = gxm_prof_now();
-    if (started != 0u) {
+    if (started != 0u && real_wait) {
         blocked = finished - started;
         gxm_notify_wait_calls++;
         gxm_notify_wait_us += blocked;
@@ -7592,6 +7895,13 @@ static void gxm_pending_scene_retire_one(VPGxmPendingScene *pending) {
     for (unsigned i = 0; i < VP_UPLOAD_CACHE_SLOTS; ++i)
         if (pending->pins[i] && gxm_uploads[i].pending)
             gxm_uploads[i].pending--;
+    /* Direct leases belong to the GPU work proven complete by the successful
+     * notification wait that led here. A failed wait never reaches this. */
+    for (unsigned i = 0; i < pending->direct_count; ++i) {
+        vp_texture_direct_release_gpu(pending->direct[i]);
+        gxm_direct_releases++;
+    }
+    pending->direct_count = 0u;
     memset(pending, 0, sizeof(*pending));
     gxm_pending_scene_count--;
 }
@@ -7643,6 +7953,47 @@ static int gxm_pending_scene_complete(const char *why) {
 }
 /* VP_HOST_TEST_EXTRACT:pending_functions_end */
 
+/* Direct-lease handoff helpers. A successful synchronous scene already waited
+ * for GPU completion; a deferred scene keeps its leases in the pending record
+ * until the notification wait proves completion. */
+static void gxm_batch_release_direct_entries(unsigned arena, unsigned draws) {
+    if (arena >= VP_GXM_BATCH_ARENAS) return;
+    if (draws > VP_BATCH_MAX_DRAWS) draws = VP_BATCH_MAX_DRAWS;
+    for (unsigned i = 0; i < draws; ++i)
+        gxm_direct_refs_release(&gxm_batch_entry_sets[arena][i].direct);
+}
+
+static void gxm_batch_quarantine_direct_entries(unsigned arena, unsigned draws) {
+    if (arena >= VP_GXM_BATCH_ARENAS) return;
+    if (draws > VP_BATCH_MAX_DRAWS) draws = VP_BATCH_MAX_DRAWS;
+    for (unsigned i = 0; i < draws; ++i)
+        gxm_direct_refs_quarantine(&gxm_batch_entry_sets[arena][i].direct);
+}
+
+/* Move every direct token out of the arena's committed entries before the
+ * arena can be reused. The pending capacity is exactly draws *
+ * VP_GXM_DIRECT_TEXTURE_MAX; an unexpected overflow quarantines the remaining
+ * tokens rather than letting a later memento drop them. */
+static int gxm_batch_move_direct_to_pending(unsigned arena, unsigned draws,
+                                            VPGxmPendingScene *pending) {
+    if (arena >= VP_GXM_BATCH_ARENAS || pending == NULL) return -1;
+    if (draws > VP_BATCH_MAX_DRAWS) draws = VP_BATCH_MAX_DRAWS;
+    for (unsigned i = 0; i < draws; ++i) {
+        VPGxmDirectRefs *refs = &gxm_batch_entry_sets[arena][i].direct;
+        for (unsigned j = 0; j < refs->count; ++j) {
+            if (pending->direct_count >= VP_GXM_PENDING_DIRECT_MAX) {
+                gxm_direct_refs_quarantine(refs);
+                glog("VP_GXM_DIRECT_PENDING_OVERFLOW arena=%u draws=%u "
+                     "action=quarantine\n", arena, draws);
+                return -1;
+            }
+            pending->direct[pending->direct_count++] = refs->token[j];
+        }
+        refs->count = 0u;
+    }
+    return 0;
+}
+
 /* Complete a scene whose draws were all encoded successfully. Called on
  * submission end and on every API/resource boundary. */
 static int gxm_batch_flush_worker(unsigned reason) {
@@ -7651,14 +8002,22 @@ static int gxm_batch_flush_worker(unsigned reason) {
     int rc;
     int pipeline;
     int deferred = 0;
+    int needs_sync;
+    int combine;
     uint32_t deferred_value = 0u;
 
     if (reason >= GXM_BATCH_REASON_COUNT) reason = GXM_BATCH_REASON_RESOURCE;
     gxm_batch_arena_init();
     pipeline = gxm_scene_pipeline_active();
+    needs_sync = gxm_batch_reason_needs_sync(reason);
+    combine = vp_texture_direct_active();
     gxm_batch.reason_counts[reason]++;
     static_stats.batch_reason_hist[reason]++;
-    if (gxm_pending_scene_count && (!pipeline || gxm_batch_reason_needs_sync(reason))) {
+    /* In pipeline mode a CPU boundary submits the current scene first and then
+     * proves every earlier scene with one wait for the newest notification.
+     * An empty scene has nothing to submit, so it still drains here. */
+    if (gxm_pending_scene_count &&
+        (!pipeline || (needs_sync && (!combine || !gxm_batch.scene_open)))) {
         /* CPU-visible boundaries drain pending work before touching backing. */
         int wait_rc = gxm_pending_scene_complete("flush");
         if (wait_rc < 0) {
@@ -7666,6 +8025,8 @@ static int gxm_batch_flush_worker(unsigned reason) {
                                                      &gxm_batch.stats);
             static_stats.batch_failed += dropped;
             gxm_perf_global_fail += dropped;
+            gxm_batch_quarantine_direct_entries(gxm_batch_arena,
+                                                gxm_batch.count);
             glog("VP_GXM_PIPELINE_FAIL reason=%s pending_wait=%d dropped=%u\n",
                  gxm_batch_reason_name(reason), wait_rc, dropped);
             gxm_batch_reset_scene_state();
@@ -7681,6 +8042,8 @@ static int gxm_batch_flush_worker(unsigned reason) {
             gxm_scene_poisoned = 1;
             glog("VP_GXM_BATCH_STATE_FAIL reason=%s pending_without_scene=%u\n",
                  gxm_batch_reason_name(reason), dropped);
+            gxm_batch_quarantine_direct_entries(gxm_batch_arena,
+                                                gxm_batch.count);
             gxm_batch_reset_scene_state();
             return -1;
         }
@@ -7698,6 +8061,9 @@ static int gxm_batch_flush_worker(unsigned reason) {
         glog("VP_GXM_BATCH_STATE_FAIL reason=%s pending=%u entries=%u "
              "cleanup_rc=%d action=poison-no-publish\n",
              gxm_batch_reason_name(reason), pending, gxm_batch.count, cleanup);
+        /* cleanup may have ended the scene; without a successful completion
+         * the GPU-held leases stay quarantined. */
+        gxm_batch_quarantine_direct_entries(gxm_batch_arena, gxm_batch.count);
         gxm_batch_reset_scene_state();
         return -1;
     }
@@ -7733,10 +8099,18 @@ static int gxm_batch_flush_worker(unsigned reason) {
         glog("VP_GXM_BATCH_FLUSH_FAIL reason=%s pending=%u end_rc=%d "
              "action=poison-no-publish dropped=%u\n",
              gxm_batch_reason_name(reason), pending, rc, pending);
+        /* EndScene failed: the GPU may have consumed some of these textures.
+         * Never release the direct leases on an unproven boundary. */
+        gxm_batch_quarantine_direct_entries(gxm_batch_arena, pending);
         gxm_batch_reset_scene_state();
         return rc;
     }
     gxm_batch_perf.flushes++;
+    if (!deferred) {
+        /* frame_end_scene_timed already waited for the notification and
+         * sceGxmFinish, so every direct payload is safe to release. */
+        gxm_batch_release_direct_entries(gxm_batch_arena, pending);
+    }
     {
         uint64_t end_us = t_end - t_start, notify_us = t_notify - t_end;
         uint64_t finish_us = t_finished - t_notify;
@@ -7769,7 +8143,8 @@ static int gxm_batch_flush_worker(unsigned reason) {
         gxm_batch_publish_entry(&gxm_batch.entries[i]);
         /* Captures disable the asynchronous pipeline; their readback is
          * synchronized and represents the target after the whole scene. */
-        if (!gxm_batch.entries[i].depth_only && gxm_batch.entries[i].target != NULL)
+        if (!deferred && !gxm_batch.entries[i].depth_only &&
+            gxm_batch.entries[i].target != NULL)
             b34_dump_surface("batch-flush",
                              gxm_batch.entries[i].target,
                              &gxm_batch.entries[i].req, NULL);
@@ -7803,24 +8178,180 @@ static int gxm_batch_flush_worker(unsigned reason) {
                  gxm_batch.stats.max_bytes, gxm_batch.flush_logs);
     }
     gxm_batch.flush_logs++;
-    if (deferred)
+    if (deferred) {
         gxm_pending_scene_record(gxm_batch_arena, deferred_value, t_end,
                                  committed,
                                  gxm_scene_class_of(gxm_batch.render_width,
                                                     gxm_batch.render_height,
                                                     gxm_batch.depth_only));
+        gxm_deferred_scenes++;
+        if (gxm_batch_move_direct_to_pending(
+                gxm_batch_arena, committed,
+                &gxm_pending_scenes[gxm_batch_arena]) < 0) {
+            frame_poison_context(-1);
+            gxm_batch_reset_scene_state();
+            return -1;
+        }
+    }
     if (pipeline) {
         unsigned next = (gxm_batch_arena + 1u) % VP_GXM_BATCH_ARENAS;
-        rc = gxm_pending_scene_complete_arena(next, "arena-reuse");
-        if (rc < 0) return rc;
+        if (combine && deferred && needs_sync) {
+            /* The combined wait below covers this arena as well because GPU
+             * scenes complete in submission order. */
+            gxm_combined_drains++;
+        } else {
+            rc = gxm_pending_scene_complete_arena(next, "arena-reuse");
+            if (rc < 0) return rc;
+        }
         gxm_batch_arena_set(next);
     }
     gxm_batch_reset_scene_state();
-    if (deferred && gxm_batch_reason_needs_sync(reason)) {
+    if (deferred && needs_sync) {
+        /* One wait for the newest notification proves every earlier scene,
+         * including the current one submitted above. */
         rc = gxm_pending_scene_complete("flush-sync");
         if (rc < 0) return rc;
     }
     return 0;
+}
+
+/* ---- Deep texture-pool GPU backing and drain --------------------------- */
+
+typedef struct {
+    void *base;
+    SceUID uid;
+} VPGxmTextureRegion;
+static VPGxmTextureRegion gxm_texture_regions[VP_TEXTURE_REGION_CHUNKS];
+
+static void *gxm_texture_chunk_create(void *user, size_t bytes) {
+    unsigned slot;
+    SceUID uid;
+    void *base = NULL;
+    (void)user;
+    for (slot = 0; slot < VP_TEXTURE_REGION_CHUNKS; ++slot)
+        if (!gxm_texture_regions[slot].base) break;
+    if (slot == VP_TEXTURE_REGION_CHUNKS) return NULL;
+    uid = sceKernelAllocMemBlock("vpTexPool",
+        SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, bytes, NULL);
+    if (uid < 0) {
+        glog("VP_TEX_POOL_ALLOC_FAIL bytes=%u rc=%d kind=chunk\n",
+             (unsigned)bytes, uid);
+        return NULL;
+    }
+    if (sceKernelGetMemBlockBase(uid, &base) < 0 || !base ||
+        sceGxmMapMemory(base, bytes, SCE_GXM_MEMORY_ATTRIB_READ) < 0) {
+        sceKernelFreeMemBlock(uid);
+        return NULL;
+    }
+    gxm_texture_regions[slot] = (VPGxmTextureRegion){base, uid};
+    return base;
+}
+
+static int gxm_texture_chunk_release(void *user, void *base) {
+    (void)user;
+    for (unsigned slot = 0; slot < VP_TEXTURE_REGION_CHUNKS; ++slot) {
+        VPGxmTextureRegion *region = &gxm_texture_regions[slot];
+        int rc;
+        if (region->base != base) continue;
+        {
+            /* No lease names this payload. Remove persistent driver bindings
+             * before unmapping, including currently inactive sampler units. */
+            for (unsigned unit = 0; unit < SCE_GXM_MAX_TEXTURE_UNITS; ++unit) {
+                rc = sceGxmSetFragmentTexture(gxm_context, unit, &gxm_texture);
+                if (rc < 0) return rc;
+                rc = sceGxmSetVertexTexture(gxm_context, unit, &gxm_texture);
+                if (rc < 0) return rc;
+            }
+            rc = sceGxmUnmapMemory(base);
+            if (rc < 0) return rc;
+        }
+        rc = sceKernelFreeMemBlock(region->uid);
+        if (rc < 0) return rc;
+        memset(region, 0, sizeof(*region));
+        return 0;
+    }
+    return -1;
+}
+
+void *vp_gxm_texture_region_create(void *user, size_t bytes, int gpu_read) {
+    (void)user;
+    (void)gpu_read;
+    gxm_texture_region_arena.create = gxm_texture_chunk_create;
+    gxm_texture_region_arena.destroy = gxm_texture_chunk_release;
+    return vp_texture_regions_alloc(&gxm_texture_region_arena, bytes);
+}
+
+int vp_gxm_texture_region_release(void *user, void *base) {
+    (void)user;
+    return vp_texture_regions_free(&gxm_texture_region_arena, base);
+}
+
+int vp_gxm_texture_regions_reset(void) {
+    return vp_texture_regions_reset(&gxm_texture_region_arena);
+}
+
+int vp_gxm_texture_copy_cache_reset(void) {
+    if (!gxm_upload_memory) return 0;
+    for (unsigned i = 0; i < VP_UPLOAD_CACHE_SLOTS; ++i)
+        if (gxm_uploads[i].pending || gxm_uploads[i].pinned) return -1;
+    for (unsigned i = 0; i < block_count; ++i) {
+        if (blocks[i].ptr != gxm_upload_memory) continue;
+        for (unsigned unit = 0; unit < SCE_GXM_MAX_TEXTURE_UNITS; ++unit) {
+            int rc = sceGxmSetFragmentTexture(gxm_context, unit, &gxm_texture);
+            if (rc < 0) return rc;
+            rc = sceGxmSetVertexTexture(gxm_context, unit, &gxm_texture);
+            if (rc < 0) return rc;
+        }
+        int rc = sceGxmUnmapMemory(gxm_upload_memory);
+        if (rc < 0) return rc;
+        rc = sceKernelFreeMemBlock(blocks[i].id);
+        if (rc < 0) return rc;
+        for (unsigned j = i + 1u; j < block_count; ++j)
+            blocks[j - 1u] = blocks[j];
+        block_count--;
+        gxm_upload_memory = NULL;
+        memset(gxm_uploads, 0, sizeof(gxm_uploads));
+        memset(gxm_upload_pages, 0, sizeof(gxm_upload_pages));
+        gxm_snapshot_memo_count = 0u;
+        glog("VP_GXM_UPLOAD_CACHE_RELEASE bytes=%u reason=direct-pipeline\n",
+             gxm_upload_capacity);
+        return 0;
+    }
+    return -1;
+}
+
+void vp_gxm_texture_descriptor_cache_reset(void) {
+    memset(gxm_texture_desc_cache, 0, sizeof(gxm_texture_desc_cache));
+}
+
+static int gxm_texture_pipeline_reclaim_worker(void) {
+    int rc;
+    if (gxm_scene_poisoned) return -1;
+    /* Inline on the GXM worker: no second worker wait can deadlock here. The
+     * RESOURCE boundary submits the open scene and waits for the newest
+     * notification, which also proves every older deferred scene. */
+    rc = gxm_batch_flush_worker(GXM_BATCH_REASON_RESOURCE);
+    if (rc < 0) return rc;
+    rc = gxm_pending_scene_complete("texture-pool");
+    if (rc < 0) return rc;
+    return 0;
+}
+
+static void gxm_texture_pipeline_reclaim_cb(void *opaque) {
+    int *rc = (int *)opaque;
+    *rc = gxm_texture_pipeline_reclaim_worker();
+}
+
+int vp_gxm_texture_pipeline_reclaim(void) {
+    if (vp_gxm_worker_is_current())
+        return gxm_texture_pipeline_reclaim_worker();
+    {
+        int rc = 0;
+        int exec_rc = vp_gxm_worker_execute(gxm_texture_pipeline_reclaim_cb,
+                                            &rc);
+        if (exec_rc < 0) return exec_rc;
+        return rc;
+    }
 }
 
 /* A draw-local refusal happened after earlier draws were already encoded into
@@ -7834,7 +8365,13 @@ static int gxm_batch_finish_aborted_worker(const char *why, int draw_rc) {
 
     if (gxm_pending_scene_count) {
         rc = gxm_pending_scene_complete("abort");
-        if (rc < 0) return rc;
+        if (rc < 0) {
+            /* The earlier pending scene could not be proven complete; the
+             * open scene's direct leases must stay retained. */
+            gxm_batch_quarantine_direct_entries(gxm_batch_arena,
+                                                gxm_batch.count);
+            return rc;
+        }
     }
     if (!gxm_batch.scene_open) {
         gxm_batch_discard_current();
@@ -7850,9 +8387,12 @@ static int gxm_batch_finish_aborted_worker(const char *why, int draw_rc) {
         gxm_perf_global_fail += pending;
         glog("VP_GXM_BATCH_ABORT reason=%s draw_rc=%d pending=%u end_rc=%d "
              "action=poison-no-publish\n", why, draw_rc, pending, rc);
+        gxm_batch_quarantine_direct_entries(gxm_batch_arena, pending);
         gxm_batch_reset_scene_state();
         return -1;
     }
+    /* frame_end_scene_timed waited for GPU completion above. */
+    gxm_batch_release_direct_entries(gxm_batch_arena, pending);
     for (i = 0; i < gxm_batch.count; ++i)
         gxm_batch_publish_entry(&gxm_batch.entries[i]);
     committed = vp_batch_policy_commit(&gxm_batch.policy, &gxm_batch.stats);
@@ -8790,6 +9330,8 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
                 VPGxmBatchEntry *entry =
                     &gxm_batch.entries[gxm_batch.policy.draws];
                 size_t base = gxm_batch.staging_used;
+                if (entry->used && entry->direct.count != 0u)
+                    gxm_direct_refs_quarantine(&entry->direct);
                 memset(entry, 0, sizeof(*entry));
                 entry->used = 1;
                 entry->reserve_bytes = batch_reserve;
@@ -9311,9 +9853,12 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
         if (batch_entry != NULL) {
             VPTextureSnapshotKey key = gxm_snapshot_key(req->texture_va,
                 req->tex_width, req->tex_height, req->tex_format, 0u, 1u);
-            void *tex_mem = gxm_batch_texture_copy(batch_entry, &key,
+            int direct_eligible = gxm_direct_candidate(
+                req->texels, req->texels_owned, req->tex_width,
+                req->tex_height, req->tex_format, 0u, 1u, 1, NULL, NULL);
+            void *tex_mem = gxm_batch_texture_bind(batch_entry, &key,
                 req->texels, texture_bytes,
-                req->texels_owned ? req->texels : NULL);
+                req->texels_owned ? req->texels : NULL, direct_eligible);
             if (tex_mem == NULL) {
                 frame_release_fs(frame_fs, frame_fs_owned);
                 return -1;
@@ -9612,9 +10157,14 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
                 VPTextureSnapshotKey key = gxm_snapshot_key(extra->va,
                     extra->width, extra->height, extra->tex_format, extra->cube,
                     mip_count);
-                void *tex_mem = gxm_batch_texture_copy(batch_entry, &key,
+                int direct_eligible = gxm_direct_candidate(
+                    extra->texels, extra->texels_owned, extra->width,
+                    extra->height, extra->tex_format, extra->cube, mip_count,
+                    0, NULL, NULL);
+                void *tex_mem = gxm_batch_texture_bind(batch_entry, &key,
                     extra->texels, texture_bytes,
-                    extra->texels_owned ? extra->texels : NULL);
+                    extra->texels_owned ? extra->texels : NULL,
+                    direct_eligible);
                 SceGxmTexture *tex = &batch_entry->extra_texture[e];
                 if (tex_mem == NULL) {
                     frame_release_fs(frame_fs, frame_fs_owned);
@@ -9764,9 +10314,14 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
                 VPTextureSnapshotKey key = gxm_snapshot_key(extra->va,
                     extra->width, extra->height, extra->tex_format, extra->cube,
                     mip_count);
-                void *tex_mem = gxm_batch_texture_copy(batch_entry, &key,
+                int direct_eligible = gxm_direct_candidate(
+                    extra->texels, extra->texels_owned, extra->width,
+                    extra->height, extra->tex_format, extra->cube, mip_count,
+                    0, NULL, NULL);
+                void *tex_mem = gxm_batch_texture_bind(batch_entry, &key,
                     extra->texels, texture_bytes,
-                    extra->texels_owned ? extra->texels : NULL);
+                    extra->texels_owned ? extra->texels : NULL,
+                    direct_eligible);
                 if (tex_mem == NULL) {
                     frame_release_fs(frame_fs, frame_fs_owned);
                     return -1;
@@ -10402,6 +10957,9 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
             if (rc < 0) goto frame_fail;
             frame_set_cull(face_pass_cull[face_pass]);
         }
+        /* A restart draw can issue several commands before a later segment
+         * fails. Retain its payload until completion even on that failure. */
+        if (batch_entry != NULL) batch_entry->direct_consumed = 1u;
         if (strip_joined) {
             rc = index_count ? sceGxmDraw(gxm_context, prim, index_format, index_source, index_count) : 0;
             if (rc >= 0 && index_count) { gxm_strip_draws++; gxm_strip_segments += joined_segments; }
@@ -10431,6 +10989,9 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
                  req->draw_index, rc, face_pass);
             goto frame_fail;
         }
+        /* At least one draw command was issued into this pass. Even a later
+         * pass failure therefore makes the direct leases GPU-visible. */
+        if (batch_entry != NULL) batch_entry->direct_consumed = 1u;
     }
     gxm_draw_stage = 12u;
     t_drawn=gxm_prof_now();
@@ -10459,6 +11020,9 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
             depth_only ? 0u : 1u, req->color_mask,
             depth_binding.enabled ? 1u : 0u);
         batch_entry->t_encoded = t_drawn;
+        /* Every sceGxmDraw call above succeeded; the direct payloads are now
+         * potentially read by the GPU until the scene notification. */
+        batch_entry->direct_consumed = 1u;
         decision = vp_batch_policy_admit(
             &gxm_batch.policy, req->batch_scope, depth_only,
             req->target_va, req->target_width, req->target_height,
@@ -10479,8 +11043,10 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
                  "reserve=%u action=poison\n", req->draw_index, decision,
                  gxm_batch.policy.draws, (unsigned)batch_reserve);
             gxm_scene_poisoned = 1;
+            /* The aborted worker releases this draw's leases only when its
+             * EndScene/wait proved completion; otherwise it quarantines them
+             * through reset_scene_state. */
             (void)gxm_batch_finish_aborted_worker("push-fail", -1);
-            gxm_batch_discard_current();
             return -1;
         }
         gxm_batch.count = gxm_batch.policy.draws;
@@ -10779,7 +11345,8 @@ frame_fail:
             int batch_rc = 0;
             if (gxm_batch.scene_open)
                 batch_rc = gxm_batch_finish_aborted_worker("frame-fail", draw_rc);
-            gxm_batch_discard_current();
+            /* The aborted worker owns the current entry's rollback: release
+             * after a proven completion, quarantine otherwise. */
             if (batch_rc < 0 && draw_rc >= 0) draw_rc = batch_rc;
             frame_release_fs(frame_fs, frame_fs_owned);
             return draw_rc;
@@ -10833,7 +11400,8 @@ static int frame_draw_internal(VPGxmDrawRequest *req) {
          * the preparation path. Roll back only this draw's reserved staging;
          * earlier pending draws stay in the scene and are committed later. */
         if (gxm_batch_current_entry != NULL) {
-            gxm_batch_discard_current();
+            gxm_batch_discard_current_decision(
+                gxm_batch_current_entry->direct_consumed, 0);
             req->batch_fallback = 1u;
             static_stats.batch_sync_fallbacks++;
         }

@@ -390,6 +390,19 @@ int vp_gxm_batch_flush(const char *reason);
  * changed, so an earlier scene keeps its immutable copies until completion. */
 void vp_gxm_texture_owned_retire(const void *source);
 
+/* Deep texture-pipeline support. Reusable uncached regions back the pool;
+ * decoded regions are mapped for GPU read on the GXM worker. Reclaim
+ * flushes the open scene and waits for every deferred notification so all
+ * direct-texture leases are provably released before the pool is reused,
+ * torn down or retried. */
+void *vp_gxm_texture_region_create(void *user, size_t bytes, int gpu_read);
+int vp_gxm_texture_region_release(void *user, void *base);
+int vp_gxm_texture_regions_reset(void);
+int vp_gxm_texture_copy_cache_reset(void);
+int vp_gxm_texture_pipeline_reclaim(void);
+/* Invalidates CPU descriptors that may name a torn-down pool address. */
+void vp_gxm_texture_descriptor_cache_reset(void);
+
 /* Experiment switch for the texture-identity question. When
  * ux0:data/mhgu-vita-port/texture-identity-skip-bytes.enable exists, cache
  * lookups trust the full layout key + byte size and skip the exact byte

@@ -5,6 +5,7 @@
  * the GXM/upload/log stubs and fixtures; it does not reimplement either
  * algorithm. */
 #include "gxm_runtime.h"
+#include "texture_pipeline.h"
 
 #include <assert.h>
 #include <stdint.h>
@@ -74,11 +75,32 @@ static struct {
 } gxm_uploads[VP_UPLOAD_CACHE_SLOTS];
 
 static uint64_t gxm_notify_wait_calls, gxm_notify_wait_us;
+static uint64_t gxm_notify_poll_hits, gxm_notify_real_waits;
 static uint64_t gxm_pending_complete_calls, gxm_pending_wait_us;
 static uint64_t gxm_pipeline_waits, gxm_pipeline_age_us, gxm_pipeline_age_max;
 static struct {
     uint64_t notify_us, total_us, total_max;
 } gxm_scene_classes[VP_SCENE_CLASS_COUNT];
+
+/* Direct-lease release stub used by the extracted pending/direct sections. */
+static unsigned test_direct_releases;
+static VPTexturePoolToken test_last_released;
+static void vp_texture_direct_release_gpu(VPTexturePoolToken token) {
+    test_direct_releases++;
+    test_last_released = token;
+}
+static int test_deep_active = 1;
+static int vp_texture_direct_active(void) { return test_deep_active; }
+static int vp_texture_direct_compatible(const void *rgba, size_t bytes) {
+    (void)rgba; (void)bytes; return 0;
+}
+static int vp_texture_direct_retain_gpu(const void *rgba,
+                                        VPTexturePoolToken *token) {
+    (void)rgba;
+    (void)token;
+    return 0;
+}
+static unsigned vp_texture_direct_live_refs(void) { return 0u; }
 
 typedef struct {
     volatile unsigned *address;
@@ -352,6 +374,8 @@ static void pending_reset(void) {
     memset(gxm_scene_classes, 0, sizeof(gxm_scene_classes));
     gxm_notify_wait_calls = 0u;
     gxm_notify_wait_us = 0u;
+    gxm_notify_poll_hits = 0u;
+    gxm_notify_real_waits = 0u;
     gxm_pending_complete_calls = 0u;
     gxm_pending_wait_us = 0u;
     gxm_pipeline_waits = 0u;
@@ -363,6 +387,9 @@ static void pending_reset(void) {
     test_wait_value = 0u;
     test_wait_rc = 0;
     test_poison_calls = 0u;
+    test_direct_releases = 0u;
+    memset(&test_last_released, 0, sizeof(test_last_released));
+    memset(test_notification_region, 0, sizeof(test_notification_region));
 }
 
 static void pending_add(unsigned arena, uint32_t value, unsigned cls,
@@ -494,6 +521,136 @@ static void test_retire_upto_partial(void) {
     assert(gxm_pending_scene_count == 0u);
     assert(gxm_uploads[0].pending == 0u);
     puts("PASS retirement releases exactly one pin per retired scene");
+}
+
+static void test_completion_poll_skips_duplicate_wait(void) {
+    pending_reset();
+    pending_add(1u, 20u, 0u, 0x1u);
+    gxm_pending_scenes[1].direct[0] = (VPTexturePoolToken){ 3u, 7u };
+    gxm_pending_scenes[1].direct[1] = (VPTexturePoolToken){ 4u, 9u };
+    gxm_pending_scenes[1].direct_count = 2u;
+    /* Address is region + 1 + arena. The acquire observation already equals
+     * the pending value, so NotificationWait must not be called again. */
+    test_notification_region[1u + 1u] = 20u;
+    assert(gxm_pending_scene_complete("poll-hit") == 0);
+    assert(test_wait_calls == 0u);
+    assert(gxm_notify_poll_hits == 1u);
+    assert(gxm_notify_real_waits == 0u);
+    assert(gxm_pending_scene_count == 0u);
+    assert(test_direct_releases == 2u);
+    assert(test_last_released.slot == 4u && test_last_released.generation == 9u);
+    puts("PASS completion polls the acquire value and skips an equal wait");
+}
+
+static void test_completion_baseline_still_waits(void) {
+    pending_reset();
+    pending_add(1u, 20u, 0u, 0u);
+    test_notification_region[2u] = 20u;
+    test_deep_active = 0;
+    assert(gxm_pending_scene_complete("baseline") == 0);
+    assert(test_wait_calls == 1u);
+    assert(gxm_notify_poll_hits == 0u);
+    test_deep_active = 1;
+}
+
+static void test_completion_failure_keeps_direct_refs(void) {
+    pending_reset();
+    pending_add(0u, 10u, 0u, 0x1u);
+    gxm_pending_scenes[0].direct[0] = (VPTexturePoolToken){ 5u, 2u };
+    gxm_pending_scenes[0].direct_count = 1u;
+    test_wait_rc = -7;
+    assert(gxm_pending_scene_complete("fail") == -7);
+    assert(test_wait_calls == 1u);
+    assert(gxm_notify_real_waits == 1u);
+    assert(test_direct_releases == 0u);
+    assert(gxm_pending_scenes[0].direct_count == 1u);
+
+    /* A later observation that already equals the pending value proves
+     * completion without the SVC; only then is the lease released. */
+    test_wait_rc = 0;
+    test_notification_region[1u + 0u] = 10u;
+    assert(gxm_pending_scene_complete("retry-poll") == 0);
+    assert(test_wait_calls == 1u);
+    assert(gxm_notify_poll_hits == 1u);
+    assert(test_direct_releases == 1u);
+    assert(gxm_pending_scene_count == 0u);
+    puts("PASS a failed wait retains direct leases until a proven completion");
+}
+
+static void test_direct_refs_limit_release_quarantine(void) {
+    VPGxmDirectRefs refs;
+    memset(&refs, 0, sizeof(refs));
+    gxm_direct_quarantined = 0u;
+    gxm_direct_quarantine_count = 0u;
+    test_direct_releases = 0u;
+    for (unsigned i = 0u; i < VP_GXM_DIRECT_TEXTURE_MAX; ++i)
+        assert(gxm_direct_refs_add(&refs,
+            (VPTexturePoolToken){ i, i + 1u }) == 0);
+    assert(gxm_direct_refs_add(&refs,
+        (VPTexturePoolToken){ 9u, 9u }) < 0);
+    assert(gxm_direct_refs_release(&refs) == VP_GXM_DIRECT_TEXTURE_MAX);
+    assert(refs.count == 0u);
+    assert(test_direct_releases == VP_GXM_DIRECT_TEXTURE_MAX);
+
+    assert(gxm_direct_refs_add(&refs,
+        (VPTexturePoolToken){ 1u, 1u }) == 0);
+    assert(gxm_direct_refs_add(&refs,
+        (VPTexturePoolToken){ 2u, 2u }) == 0);
+    assert(gxm_direct_refs_quarantine(&refs) == 2u);
+    assert(refs.count == 0u);
+    assert(gxm_direct_quarantined == 2u);
+    assert(test_direct_releases == VP_GXM_DIRECT_TEXTURE_MAX);
+    puts("PASS direct token limit, release and unknown-state quarantine");
+}
+
+static void test_three_arena_direct_release(void) {
+    pending_reset();
+    pending_add(0u, 10u, 0u, 0u);
+    pending_add(1u, 20u, 0u, 0u);
+    pending_add(2u, 30u, 0u, 0u);
+    gxm_pending_scenes[0].direct[0] = (VPTexturePoolToken){ 0u, 1u };
+    gxm_pending_scenes[0].direct_count = 1u;
+    gxm_pending_scenes[1].direct[0] = (VPTexturePoolToken){ 1u, 1u };
+    gxm_pending_scenes[1].direct_count = 1u;
+    gxm_pending_scenes[2].direct[0] = (VPTexturePoolToken){ 2u, 1u };
+    gxm_pending_scenes[2].direct_count = 1u;
+    test_notification_region[1u + 2u] = 30u;
+    assert(gxm_pending_scene_complete("three-arena") == 0);
+    assert(test_wait_calls == 0u);
+    assert(gxm_notify_poll_hits == 1u);
+    assert(gxm_pending_scene_count == 0u);
+    assert(test_direct_releases == 3u);
+    puts("PASS one completion retires direct leases from all three arenas");
+}
+
+static void test_direct_rollback_policy(void) {
+    VPGxmDirectRefs refs;
+    memset(&refs, 0, sizeof(refs));
+    test_direct_releases = 0u;
+    gxm_direct_quarantined = 0u;
+    gxm_direct_quarantine_count = 0u;
+    assert(gxm_direct_rollback_decision(0, 0) ==
+           VP_GXM_DIRECT_ROLLBACK_RELEASE);
+    assert(gxm_direct_rollback_decision(0, 1) ==
+           VP_GXM_DIRECT_ROLLBACK_RELEASE);
+    assert(gxm_direct_rollback_decision(1, 1) ==
+           VP_GXM_DIRECT_ROLLBACK_RELEASE);
+    assert(gxm_direct_rollback_decision(1, 0) ==
+           VP_GXM_DIRECT_ROLLBACK_QUARANTINE);
+    assert(gxm_direct_refs_add(&refs,
+        (VPTexturePoolToken){ 7u, 3u }) == 0);
+    gxm_direct_rollback_refs(&refs,
+        gxm_direct_rollback_decision(1, 0));
+    assert(refs.count == 0u);
+    assert(test_direct_releases == 0u);
+    assert(gxm_direct_quarantined == 1u);
+    assert(gxm_direct_refs_add(&refs,
+        (VPTexturePoolToken){ 8u, 4u }) == 0);
+    gxm_direct_rollback_refs(&refs,
+        gxm_direct_rollback_decision(1, 1));
+    assert(test_direct_releases == 1u);
+    assert(gxm_direct_quarantined == 1u);
+    puts("PASS draw rollback releases only proven or never-issued leases");
 }
 
 static void test_notify_order_helpers(void) {
@@ -651,6 +808,12 @@ int main(void) {
     test_completion_wrap_releases_old_scene();
     test_completion_arena_wait();
     test_retire_upto_partial();
+    test_completion_baseline_still_waits();
+    test_completion_poll_skips_duplicate_wait();
+    test_completion_failure_keeps_direct_refs();
+    test_direct_refs_limit_release_quarantine();
+    test_three_arena_direct_release();
+    test_direct_rollback_policy();
     test_notify_order_helpers();
     puts("gxm_render_pipeline: all checks passed");
     return 0;

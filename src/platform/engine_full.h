@@ -12,6 +12,11 @@ extern volatile uint32_t vp_engine_full_fast_enabled;
  * timestamp. Nonzero only while mode 3 ("shared") is selected; downstream
  * draw preparation reads this atomic flag and never touches the control file. */
 extern volatile uint32_t vp_engine_shared_prepare_enabled;
+/* Independent decoder-owned texture pipeline switch. In A/B mode it follows
+ * engine-full-mode.txt (only mode 4 "deep" enables it); outside A/B it follows
+ * texture-pipeline.disable (enabled unless present). It is published
+ * on the host thread but applied only at a GXM worker boundary. */
+extern volatile uint32_t vp_engine_texture_pipeline_enabled;
 
 int vp_engine_full_init(uint32_t main_base);
 int vp_engine_full_run(uint32_t context);

@@ -6,6 +6,8 @@
 #include "engine_layout.h"
 #include "engine_full.h"
 #include "gpu_texture.h"
+#include "texture_pool.h"
+#include "texture_pipeline.h"
 #include "texture_snapshot.h"
 #include "gpu_indices.h"
 #include "vertex_window.h"
@@ -1661,6 +1663,7 @@ static uint8_t *texture_cached_decode(VPGuestSvc *svc,const VPGpuTextureInfo *t,
                  "size=%ux%u detail=base-level-native-blocks\n",
                  (unsigned long long)t->va,t->format,mips,t->width,t->height);
     }
+retry_texture_storage:
     if (!reuse) for (;;) {
         slot=NULL;
         for (unsigned i=0;i<VP_TEXTURE_CACHE_SLOTS;i++) {
@@ -1713,6 +1716,33 @@ static uint8_t *texture_cached_decode(VPGuestSvc *svc,const VPGpuTextureInfo *t,
                     (unsigned)raw_uid,(unsigned)rgba_uid,(unsigned)t->storage,(unsigned)rgba_bytes,(unsigned)texture_cache_bytes);
             if (raw_uid>=0) sceKernelFreeMemBlock(raw_uid);
             if (rgba_uid>=0) sceKernelFreeMemBlock(rgba_uid);
+            /* Kernel pressure can precede the logical cache budget. Retire
+             * one idle allocation before retrying instead of losing a real
+             * texture on a mode switch. Each retry removes one occupied slot
+             * or reuses a fitting pair, so the retry count is bounded. */
+            VPTextureCache *old = NULL, *fit = NULL;
+            for (unsigned i = 0; i < VP_TEXTURE_CACHE_SLOTS; ++i) {
+                VPTextureCache *c = &texture_cache[i];
+                if (!c->raw || c->pins) continue;
+                if (!old || c->stamp < old->stamp) old = c;
+                if (c->bytes == t->storage && c->rgba_bytes == rgba_bytes &&
+                    (!fit || c->stamp < fit->stamp)) fit = c;
+            }
+            if (fit) {
+                reuse = fit;
+                texture_evictions++;
+                texture_size_reuses++;
+                goto retry_texture_storage;
+            }
+            if (old) {
+                texture_cache_bytes -= old->bytes + old->rgba_bytes;
+                vp_gxm_texture_owned_retire(old->rgba);
+                sceKernelFreeMemBlock(old->raw_uid);
+                sceKernelFreeMemBlock(old->rgba_uid);
+                memset(old, 0, sizeof(*old));
+                texture_evictions++;
+                goto retry_texture_storage;
+            }
             return NULL;
         }
         texture_allocations++;
@@ -1776,6 +1806,504 @@ static uint8_t *texture_cached_decode(VPGuestSvc *svc,const VPGpuTextureInfo *t,
     texture_cache_hint[texture_cache_hint_index(t,mips,upload)]=(uint8_t)((unsigned)(slot-texture_cache)+1u);
     if (!reuse) texture_cache_bytes+=t->storage+rgba_bytes;
     return rgba;
+}
+
+/* ---- Deep decoder-owned texture pipeline ---------------------------------
+ *
+ * One bounded 64 MiB region pool replaces the legacy 48 MiB decoder cache plus
+ * its 16 MiB upload cache. The legacy memblock cache
+ * above stays untouched for mode 0 and for non-cache payloads. A pool switch
+ * happens only at a guest submission boundary, after the GXM worker drained
+ * every deferred scene and every direct lease was retired.
+ *
+ * Content identity is still the complete key plus every raw source byte. The
+ * decoded RGBA pointer becomes a GXM backing only through
+ * vp_texture_pool_retain_gpu, which resolves a live slot and returns its
+ * generation; no address range is interpreted as a texture identity. */
+typedef enum {
+    VP_TEX_DECODE_OK = 0,
+    /* The old cache contract does not cover this payload; the legacy malloc
+     * decode (primary slot only) may still try it. */
+    VP_TEX_DECODE_UNSUPPORTED = 1,
+    /* The contract was accepted but decode or pool memory failed. Callers must
+     * not hide this with a second allocation attempt. */
+    VP_TEX_DECODE_FAILED = 2
+} VPTextureDecodeOutcome;
+
+static VPTexturePool deep_texture_pool;
+/* 0 = not created, 1 = ready, 2 = creation failed and stays failed. */
+static int deep_pool_state;
+static int deep_pipeline_applied;
+static unsigned deep_pipeline_transitions;
+static int deep_decode_error;
+static uint64_t deep_transition_us_total, deep_transition_us_max;
+static uint64_t deep_requests, deep_hits, deep_misses, deep_updates;
+static uint64_t deep_pressure_waits, deep_pressure_failures;
+static uint64_t deep_decode_us_family[5];
+static uint64_t deep_decode_bytes_family[5];
+static uint64_t deep_direct_retains, deep_direct_releases;
+static uint64_t deep_direct_stale_releases;
+static uint64_t deep_retire_calls;
+
+void vp_texture_direct_fail_submission(void) {
+    deep_decode_error = 1;
+}
+
+static int texture_pipeline_desired(void) {
+    return __atomic_load_n(&vp_engine_texture_pipeline_enabled,
+                           __ATOMIC_ACQUIRE) != 0u;
+}
+
+int vp_texture_direct_active(void) {
+    return deep_pipeline_applied && deep_pool_state == 1;
+}
+
+int vp_texture_direct_compatible(const void *rgba, size_t bytes) {
+    return vp_texture_direct_active() &&
+           vp_texture_pool_owns(&deep_texture_pool, rgba, bytes);
+}
+
+int vp_texture_direct_retain_gpu(const void *rgba, VPTexturePoolToken *token) {
+    if (!vp_texture_direct_active() || rgba == NULL || token == NULL)
+        return 0;
+    if (!vp_texture_pool_retain_gpu(&deep_texture_pool, rgba, token))
+        return 0;
+    deep_direct_retains++;
+    return 1;
+}
+
+void vp_texture_direct_release_gpu(VPTexturePoolToken token) {
+    if (!deep_pipeline_applied) return;
+    if (vp_texture_pool_release_gpu(&deep_texture_pool, token) == 0)
+        deep_direct_releases++;
+    else
+        deep_direct_stale_releases++;
+}
+
+unsigned vp_texture_direct_live_refs(void) {
+    return vp_texture_pool_gpu_refs(&deep_texture_pool);
+}
+
+static void texture_pool_retire(void *user, const void *rgba) {
+    (void)user;
+    deep_retire_calls++;
+    /* The decoder update event must precede any reuse of this allocation. */
+    vp_gxm_texture_owned_retire(rgba);
+}
+
+/* Deep cache counters all live at the existing statistics cadence; no per-draw
+ * log or timer is added. Decode timing is only sampled when play-perf asks for
+ * timers, matching the legacy cache. */
+static void texture_pool_log_stats(VPGuestSvc *svc, const char *why) {
+    VPTexturePoolStats stats;
+    memset(&stats, 0, sizeof(stats));
+    if (deep_pool_state == 1)
+        vp_texture_pool_stats(&deep_texture_pool, &stats);
+    slog(svc, "VP_TEX_POOL_STATS why=%s applied=%d state=%d transitions=%u "
+         "transition_us=%llu transition_max_us=%llu requests=%llu hits=%llu "
+         "misses=%llu updates=%llu pressure_waits=%llu pressure_fail=%llu "
+         "decode_us_rgba8=%llu decode_us_fp16=%llu decode_us_blocks=%llu decode_us_cube=%llu decode_us_other=%llu "
+         "decode_bytes_rgba8=%llu decode_bytes_fp16=%llu decode_bytes_blocks=%llu decode_bytes_cube=%llu decode_bytes_other=%llu "
+         "pool_alloc_map=%llu pool_free_map=%llu evictions=%llu "
+         "size_reuses=%llu live=%u peak=%u used_bytes=%u peak_bytes=%u "
+         "free_runs=%u largest_free=%u gpu_refs=%u cpu_pins=%u "
+         "retire_calls=%llu pressure_events=%llu nomem_events=%llu "
+         "direct_retains=%llu direct_releases=%llu direct_stale=%llu "
+         "refs_live=%u raw_reclaims=%llu raw_reclaimed_bytes=%llu\n",
+         why, deep_pipeline_applied, deep_pool_state, deep_pipeline_transitions,
+         (unsigned long long)deep_transition_us_total,
+         (unsigned long long)deep_transition_us_max,
+         (unsigned long long)deep_requests, (unsigned long long)deep_hits,
+         (unsigned long long)deep_misses, (unsigned long long)deep_updates,
+         (unsigned long long)deep_pressure_waits,
+         (unsigned long long)deep_pressure_failures,
+         (unsigned long long)deep_decode_us_family[0],
+         (unsigned long long)deep_decode_us_family[1],
+         (unsigned long long)deep_decode_us_family[2],
+         (unsigned long long)deep_decode_us_family[3],
+         (unsigned long long)deep_decode_us_family[4],
+         (unsigned long long)deep_decode_bytes_family[0],
+         (unsigned long long)deep_decode_bytes_family[1],
+         (unsigned long long)deep_decode_bytes_family[2],
+         (unsigned long long)deep_decode_bytes_family[3],
+         (unsigned long long)deep_decode_bytes_family[4],
+         (unsigned long long)stats.alloc_map_calls,
+         (unsigned long long)stats.free_map_calls,
+         (unsigned long long)stats.evictions,
+         (unsigned long long)stats.size_reuses, stats.live_slots,
+         stats.peak_live_slots, (unsigned)stats.used_bytes,
+         (unsigned)stats.peak_used_bytes, stats.free_runs,
+         (unsigned)stats.largest_free_run_bytes, stats.gpu_refs,
+         stats.cpu_pins, (unsigned long long)stats.retire_calls,
+         (unsigned long long)stats.pressure_events,
+         (unsigned long long)stats.nomem_events,
+         (unsigned long long)deep_direct_retains,
+         (unsigned long long)deep_direct_releases,
+         (unsigned long long)deep_direct_stale_releases,
+         vp_texture_pool_gpu_refs(&deep_texture_pool),
+         (unsigned long long)stats.raw_reclaims,
+         (unsigned long long)stats.raw_reclaimed_bytes);
+}
+
+/* Free the legacy cache and drop its GXM associations. Safe at a submission
+ * boundary after the worker drained every scene. */
+static void texture_cache_release_all(VPGuestSvc *svc) {
+    unsigned released = 0u;
+    for (unsigned i = 0; i < VP_TEXTURE_CACHE_SLOTS; ++i) {
+        VPTextureCache *c = &texture_cache[i];
+        if (!c->raw && !c->rgba) continue;
+        if (c->rgba != NULL) vp_gxm_texture_owned_retire(c->rgba);
+        if (c->raw_uid >= 0) sceKernelFreeMemBlock(c->raw_uid);
+        if (c->rgba_uid >= 0) sceKernelFreeMemBlock(c->rgba_uid);
+        memset(c, 0, sizeof(*c));
+        released++;
+    }
+    memset(texture_cache_hint, 0, sizeof(texture_cache_hint));
+    texture_cache_bytes = 0u;
+    if (released != 0u)
+        slog(svc, "VP_TEX_CACHE_RELEASE slots=%u detail=mode-switch\n",
+             released);
+}
+
+static void texture_pipeline_switch_cb(void *opaque);
+
+typedef struct {
+    VPGuestSvc *svc;
+    int rc;
+} VPTexturePipelineSwitch;
+
+/* Must run on the GXM worker. The caller is a submission boundary: all scenes
+ * are drained, no draw is being prepared and no direct lease is consumed. */
+static int texture_pipeline_switch_worker(VPGuestSvc *svc) {
+    uint64_t started = sceKernelGetProcessTimeWide();
+    unsigned long long transition_us;
+    int target = texture_pipeline_desired();
+    int rc;
+
+    /* Capture the outgoing phase's pool counters before teardown; init on the
+     * next deep activation resets the pool-local peak/live values. */
+    if (deep_pipeline_applied) texture_pool_log_stats(svc, "mode-switch-before");
+    rc = vp_gxm_texture_pipeline_reclaim();
+    if (rc < 0) {
+        slog(svc, "VP_TEX_POOL_MODE_FAIL target=%s rc=%d action=keep-current\n",
+             target ? "deep" : "normal", rc);
+        return rc;
+    }
+    for (unsigned i = 0; i < VP_TEXTURE_CACHE_SLOTS; ++i)
+        texture_cache[i].pins = 0u;
+    vp_texture_pool_begin_request(&deep_texture_pool);
+    if (deep_pipeline_applied) {
+        if (deep_pool_state == 1) {
+            if (vp_texture_pool_gpu_refs(&deep_texture_pool) != 0u) {
+                slog(svc, "VP_TEX_POOL_MODE_FAIL target=%s refs=%u "
+                     "action=keep-current\n", target ? "deep" : "normal",
+                     vp_texture_pool_gpu_refs(&deep_texture_pool));
+                return -1;
+            }
+            if (vp_texture_pool_reset(&deep_texture_pool) < 0) {
+                slog(svc, "VP_TEX_POOL_MODE_FAIL target=%s reason=reset\n",
+                     target ? "deep" : "normal");
+                return -1;
+            }
+            if (vp_gxm_texture_regions_reset() < 0) return -1;
+        }
+        deep_pool_state = 0;
+    } else {
+        texture_cache_release_all(svc);
+    }
+    if (target && vp_gxm_texture_copy_cache_reset() < 0) return -1;
+    vp_gxm_texture_descriptor_cache_reset();
+    {
+        SceKernelFreeMemorySizeInfo memory;
+        memset(&memory, 0, sizeof(memory));
+        memory.size = sizeof(memory);
+        int memory_rc = sceKernelGetFreeMemorySize(&memory);
+        slog(svc, "VP_TEX_POOL_MEMORY target=%s phase=after-cleanup rc=%d "
+             "user_free=%u cdram_free=%u\n", target ? "deep" : "normal",
+             memory_rc, (unsigned)memory.size_user, (unsigned)memory.size_cdram);
+    }
+    if (target) {
+        int alloc_rc = vp_texture_pool_init_regions(&deep_texture_pool,
+            VP_TEXTURE_POOL_MAX_BYTES, NULL, vp_gxm_texture_region_create,
+            vp_gxm_texture_region_release);
+        if (alloc_rc < 0) return alloc_rc;
+        vp_texture_pool_set_retire(&deep_texture_pool, texture_pool_retire, NULL);
+        deep_pool_state = 1;
+    }
+
+    deep_pipeline_applied = target;
+    deep_pipeline_transitions++;
+    transition_us = (unsigned long long)(sceKernelGetProcessTimeWide() - started);
+    deep_transition_us_total += transition_us;
+    if (transition_us > deep_transition_us_max)
+        deep_transition_us_max = transition_us;
+    slog(svc, "VP_TEX_POOL_MODE mode=%s transition=%u transition_us=%llu "
+         "pool_state=%d bytes=%u refs=%u detail=worker-boundary\n",
+         target ? "deep" : "normal", deep_pipeline_transitions, transition_us,
+         deep_pool_state, target ? VP_TEXTURE_POOL_MAX_BYTES : 0u,
+         vp_texture_pool_gpu_refs(&deep_texture_pool));
+    texture_pool_log_stats(svc, "mode-transition");
+    return 0;
+}
+
+static void texture_pipeline_switch_cb(void *opaque) {
+    VPTexturePipelineSwitch *work = (VPTexturePipelineSwitch *)opaque;
+    work->rc = texture_pipeline_switch_worker(work->svc);
+}
+
+/* Called once per decoded GPU submission, before any draw of that submission
+ * is prepared. The host-side root poll only publishes the desired atomic; the
+ * actual cache teardown and pool creation happen here on the GXM worker. */
+static int texture_pipeline_apply_pending(VPGuestSvc *svc) {
+    int desired = texture_pipeline_desired();
+    int rc;
+    if (desired == deep_pipeline_applied) return 0;
+    if (vp_gxm_worker_is_current())
+        return texture_pipeline_switch_worker(svc);
+    {
+        VPTexturePipelineSwitch work = { svc, 0 };
+        rc = vp_gxm_worker_execute(texture_pipeline_switch_cb, &work);
+        if (rc < 0) return rc;
+        return work.rc;
+    }
+}
+
+static uint8_t *texture_pool_decode(VPGuestSvc *svc, const VPGpuTextureInfo *t,
+                                    const uint8_t *source,
+                                    unsigned decode_kind,
+                                    VPTextureDecodeOutcome *outcome) {
+    VPTexturePoolKey key;
+    VPTexturePoolToken token = {0u, 0u};
+    uint8_t *raw = NULL, *rgba = NULL;
+    size_t rgba_bytes;
+    unsigned mips, upload, family = 4u;
+    int cube, native_bc, reused = 0, rc, decode_rc = -1;
+    uint64_t started = 0u;
+    uint64_t lookup_started = svc_play_perf_enabled() ? sceKernelGetProcessTimeWide() : 0u;
+
+    *outcome = VP_TEX_DECODE_UNSUPPORTED;
+    if (deep_pool_state != 1) {
+        static unsigned pool_fail_logs;
+        if (pool_fail_logs++ < 8u)
+            slog(svc, "VP_TEX_POOL_UNAVAILABLE state=%d "
+                 "action=decode-fail-no-fallback\n", deep_pool_state);
+        *outcome = VP_TEX_DECODE_FAILED;
+        return NULL;
+    }
+    cube = t->texture_type == 3u;
+    mips = t->max_mip_level + 1u;
+    upload = cube ? 0u : vp_texture_upload_format(t->format, t->swizzle);
+    native_bc = t->format == 0x27u || t->format == 0x28u;
+    if (!cube && decode_kind == VP_TEXTURE_DECODE_VERTEX) {
+        const char *vertex_reason = NULL;
+        unsigned vertex_upload =
+            texture_vertex_upload_format(t, &vertex_reason);
+        if (vertex_reason != NULL) {
+            static unsigned vertex_format_logs;
+            if (vertex_format_logs++ < 32u)
+                slog(svc, "VP_TEX_VERTEX_RG32F_REJECT va=0x%llx fmt=%u "
+                     "word0=%08x size=%ux%u header=%u type=%u depth=%u "
+                     "block_d=%u mips=%u pitch=%u storage=%u tsc=%08x,%08x "
+                     "reason=%s\n", (unsigned long long)t->va, t->format,
+                     t->swizzle, t->width, t->height, t->header,
+                     t->texture_type, t->depth, t->block_depth,
+                     t->max_mip_level, t->pitch, (unsigned)t->storage,
+                     t->sampler[0], t->sampler[1], vertex_reason);
+            return NULL;
+        }
+        upload = vertex_upload;
+    }
+    if (native_bc && !upload) {
+        static unsigned format_refusal_logs;
+        if (format_refusal_logs++ < 32u)
+            slog(svc, "VP_TEX_FORMAT_UNSUPPORTED va=0x%llx fmt=%u word0=%08x "
+                 "size=%ux%u type=%u depth=%u block_d=%u "
+                 "detail=bc-swizzle-or-type\n", (unsigned long long)t->va,
+                 t->format, t->swizzle, t->width, t->height, t->texture_type,
+                 t->depth, t->block_depth);
+        return NULL;
+    }
+    rgba_bytes = cube ? vp_texture_cube_upload_bytes_mips(t->width, t->height,
+                                                         mips)
+                      : vp_texture_upload_bytes(t->width, t->height, upload);
+    if (!t->storage || rgba_bytes == 0u ||
+        t->storage > VP_TEXTURE_POOL_MAX_BYTES ||
+        rgba_bytes > VP_TEXTURE_POOL_MAX_BYTES - t->storage) {
+        slog(svc, "VP_TEX_POOL_MEMORY_FAIL va=0x%llx raw=%u rgba=%u cap=%u "
+             "detail=request-exceeds-pool\n", (unsigned long long)t->va,
+             (unsigned)t->storage, (unsigned)rgba_bytes,
+             VP_TEXTURE_POOL_MAX_BYTES);
+        *outcome = VP_TEX_DECODE_FAILED;
+        return NULL;
+    }
+    memset(&key, 0, sizeof(key));
+    key.va = t->va;
+    key.width = t->width;
+    key.height = t->height;
+    key.format = t->format;
+    key.header = t->header;
+    key.pitch = t->pitch;
+    key.block_height = t->block_height;
+    key.swizzle = t->swizzle;
+    key.texture_type = t->texture_type;
+    key.mip_count = mips;
+    key.upload = upload;
+    deep_requests++;
+    texture_requests++;
+    if ((deep_requests & 511u) == 0u)
+        texture_pool_log_stats(svc, "periodic");
+    if (vp_texture_pool_lookup(&deep_texture_pool, &key, source, t->storage,
+                               &token, &rgba)) {
+        deep_hits++;
+        texture_hits++;
+        if (lookup_started) texture_lookup_us += sceKernelGetProcessTimeWide() - lookup_started;
+        *outcome = VP_TEX_DECODE_OK;
+        return rgba;
+    }
+    deep_misses++;
+    texture_misses++;
+    if (lookup_started) texture_lookup_us += sceKernelGetProcessTimeWide() - lookup_started;
+    rc = vp_texture_pool_begin_store(&deep_texture_pool, &key, t->storage,
+                                     rgba_bytes, &token, &raw, &rgba, &reused);
+    if (rc == VP_TEXTURE_POOL_STORE_PRESSURE) {
+        /* Pressure is only reported when a GPU lease could become evictable.
+         * Flush the open scene in this worker and wait for real completion;
+         * retry exactly once. */
+        deep_pressure_waits++;
+        if (vp_gxm_texture_pipeline_reclaim() < 0) {
+            deep_pressure_failures++;
+            slog(svc, "VP_TEX_POOL_MEMORY_FAIL va=0x%llx raw=%u rgba=%u "
+                 "detail=pressure-drain-failed\n", (unsigned long long)t->va,
+                 (unsigned)t->storage, (unsigned)rgba_bytes);
+            *outcome = VP_TEX_DECODE_FAILED;
+            return NULL;
+        }
+        rc = vp_texture_pool_begin_store(&deep_texture_pool, &key, t->storage,
+                                         rgba_bytes, &token, &raw, &rgba,
+                                         &reused);
+    }
+    if (rc != VP_TEXTURE_POOL_STORE_OK) {
+        deep_pressure_failures++;
+        slog(svc, "VP_TEX_POOL_MEMORY_FAIL va=0x%llx raw=%u rgba=%u rc=%d "
+             "detail=no-safe-slot\n", (unsigned long long)t->va,
+             (unsigned)t->storage, (unsigned)rgba_bytes, rc);
+        *outcome = VP_TEX_DECODE_FAILED;
+        return NULL;
+    }
+    if (cube) family = 3u;
+    else if (upload == VP_TEXTURE_UPLOAD_RGBA16F) family = 1u;
+    else if (upload == VP_TEXTURE_UPLOAD_RGBA32F_RG32F) family = 4u;
+    else if (upload) family = 2u;
+    else if (t->format == 8u) family = 0u;
+    if (svc_play_perf_enabled()) started = sceKernelGetProcessTimeWide();
+    if (cube) {
+        decode_rc = vp_texture_cube_rgba(source, t->storage, rgba, rgba_bytes,
+                                         t->width, t->height, t->format,
+                                         t->block_height, mips, t->swizzle);
+    } else if (upload == VP_TEXTURE_UPLOAD_RGBA32F_RG32F) {
+        decode_rc = vp_texture_rgba32f_pitch_to_rg32f(
+            source, t->storage, rgba, rgba_bytes, t->width, t->height,
+            t->pitch, t->swizzle);
+    } else if (upload == VP_TEXTURE_UPLOAD_RGBA16F) {
+        if (t->header == 2u && t->format == 0x01u)
+            decode_rc = vp_texture_rgba32f_pitch_to_rgba16f(
+                source, t->storage, rgba, t->width, t->height, t->pitch,
+                t->swizzle);
+    } else if (upload) {
+        decode_rc = vp_texture_blocks_linear(source, t->storage, rgba,
+                                             t->width, t->height, t->format,
+                                             t->block_height);
+    } else if (t->header == 2u && t->format == 8u) {
+        decode_rc = vp_texture_rgba8_linear_swizzle(
+            source, t->storage, rgba, t->width, t->height, t->pitch,
+            t->swizzle);
+    } else if (t->format == 8u) {
+        decode_rc = vp_texture_rgba8_untile_swizzle(
+            source, t->storage, rgba, t->width, t->height, t->block_height,
+            t->swizzle);
+    } else {
+        /* Other CPU layouts (U8/R16) keep the reviewed decoder and its
+         * separate selector pass byte-for-byte. */
+        decode_rc = vp_texture_rgba(source, t->storage, rgba, t->width,
+                                    t->height, t->format, t->block_height);
+        if (decode_rc == 0)
+            vp_texture_swizzle(rgba, (size_t)t->width * t->height,
+                               t->swizzle);
+    }
+    if (started != 0u) {
+        uint64_t elapsed = sceKernelGetProcessTimeWide() - started;
+        deep_decode_us_family[family] += elapsed;
+        texture_decoded_us += elapsed;
+        if (family == 0u) texture_decode_us_rgba8 += elapsed;
+        else if (family == 1u) texture_decode_us_fp16 += elapsed;
+        else if (family == 2u) texture_decode_us_blocks += elapsed;
+        else if (family == 3u) texture_decode_us_cube += elapsed;
+        else texture_decode_us_other += elapsed;
+    }
+    if (decode_rc != 0) {
+        vp_texture_pool_abort_store(&deep_texture_pool, token);
+        {
+            static unsigned decode_fail_logs;
+            if (decode_fail_logs++ < 16u)
+                slog(svc, "VP_TEX_POOL_DECODE_FAIL va=0x%llx fmt=%u "
+                     "header=%u size=%ux%u storage=%u upload=%u rc=%d\n",
+                     (unsigned long long)t->va, t->format, t->header,
+                     t->width, t->height, (unsigned)t->storage, upload,
+                     decode_rc);
+        }
+        *outcome = VP_TEX_DECODE_FAILED;
+        return NULL;
+    }
+    uint64_t tail_started = svc_play_perf_enabled() ? sceKernelGetProcessTimeWide() : 0u;
+    if (vp_texture_pool_commit_store(&deep_texture_pool, token, &key, source,
+                                     t->storage) != 0) {
+        vp_texture_pool_abort_store(&deep_texture_pool, token);
+        slog(svc, "VP_TEX_POOL_MEMORY_FAIL va=0x%llx detail=commit-failed\n",
+             (unsigned long long)t->va);
+        *outcome = VP_TEX_DECODE_FAILED;
+        return NULL;
+    }
+    if (tail_started) texture_update_tail_us += sceKernelGetProcessTimeWide() - tail_started;
+    deep_updates++;
+    texture_updates++;
+    deep_decode_bytes_family[family] += rgba_bytes;
+    texture_asset_dump_maybe(svc, t, source);
+    *outcome = VP_TEX_DECODE_OK;
+    return rgba;
+}
+
+/* Single dispatch point for the three texture consumers. Legacy mode keeps
+ * the exact old function and its fallback semantics; deep mode never falls
+ * back to a second backing allocation on pool/decode failure. */
+static int frame_record_mode_active(void);
+static uint8_t *texture_decode_any(VPGuestSvc *svc, const VPGpuTextureInfo *t,
+                                   const uint8_t *source, unsigned decode_kind,
+                                   VPTextureDecodeOutcome *outcome) {
+    if (deep_pipeline_applied) {
+        /* The one-frame inventory diagnostic executes recorded draws after
+         * the submission completed, so a cached payload could be evicted
+         * between recording and replay. It never used the legacy cache for
+         * primary/extra payloads either; refuse the unguarded vertex borrow
+         * here instead of handing it a payload the pool may already reuse. */
+        if (frame_record_mode_active()) {
+            static unsigned record_bypass_logs;
+            if (record_bypass_logs++ < 8u)
+                slog(svc, "VP_TEX_POOL_RECORD_BYPASS stage=%s "
+                     "action=no-borrow\n",
+                     decode_kind == VP_TEXTURE_DECODE_VERTEX ? "vertex" :
+                                                               "fragment");
+            *outcome = VP_TEX_DECODE_UNSUPPORTED;
+            return NULL;
+        }
+        uint8_t *result = texture_pool_decode(svc, t, source, decode_kind, outcome);
+        if (*outcome == VP_TEX_DECODE_FAILED) deep_decode_error = 1;
+        return result;
+    }
+    {
+        uint8_t *rgba = texture_cached_decode(svc, t, source, decode_kind);
+        *outcome = rgba != NULL ? VP_TEX_DECODE_OK : VP_TEX_DECODE_UNSUPPORTED;
+        return rgba;
+    }
 }
 
 void vp_guest_frame_perf(VPGuestFramePerf *out) {
@@ -2007,6 +2535,9 @@ static int frame_at_mode;
 static int frame_at_selected;
 static uint32_t frame_at_ms;
 static int frame_done;
+static int frame_record_mode_active(void) {
+    return frame_auto && !frame_done;
+}
 static uint32_t frame_submission_seen[8];
 static unsigned frame_submission_draws[8];
 
@@ -2787,6 +3318,7 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
     int vertex_declared = 0;
     int use_fs_plan = 0;
     for (unsigned c=0;c<VP_TEXTURE_CACHE_SLOTS;c++) texture_cache[c].pins=0;
+    vp_texture_pool_begin_request(&deep_texture_pool);
     {
         int primary_declared;
         int resources_active;
@@ -2922,14 +3454,28 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
         if (req.texture_source != VP_GXM_EXTRA_SOURCE_DEPTH &&
             !frame_target_seen(tex.va) && tex.storage != 0u) {
             uint32_t source = 0;
+            VPTextureDecodeOutcome decode_outcome = VP_TEX_DECODE_UNSUPPORTED;
             if (bridge_quiet && gpu_va_to_cpu(ctx->session,tex.va,tex.storage,&source)) {
-                linear=texture_cached_decode(ctx->svc,&tex,(const uint8_t *)(uintptr_t)source,
-                                             VP_TEXTURE_DECODE_FRAGMENT);
+                linear=texture_decode_any(ctx->svc,&tex,
+                    (const uint8_t *)(uintptr_t)source,
+                    VP_TEXTURE_DECODE_FRAGMENT,&decode_outcome);
                 linear_borrowed=linear!=NULL;
                 if (linear_borrowed) {
                     req.tex_format=vp_texture_upload_format(tex.format,tex.swizzle);
                     req.texels_owned=1u;
                 }
+            }
+            if (!linear && decode_outcome == VP_TEX_DECODE_FAILED) {
+                /* The deep contract accepted this texture but its bounded pool
+                 * could not provide a safe slot. Do not hide that behind a
+                 * second malloc/memblock allocation. */
+                static unsigned primary_pool_fail_logs;
+                if (primary_pool_fail_logs++ < 16u)
+                    slog(ctx->svc,"VP_TEX_POOL_MEMORY_FAIL fd=%u submission=%u "
+                         "idx=%u va=0x%llx detail=primary-draw-fail n=%u\n",
+                         ctx->fd,ctx->submission,draw->index,
+                         (unsigned long long)tex.va,primary_pool_fail_logs);
+                return -1;
             }
             if (!linear) linear = malloc((size_t)tex.width * tex.height * 4u);
             int decoded=-1;
@@ -3155,9 +3701,19 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
                          plane.format,plane.header,(unsigned)plane.storage,map_rc);
                 continue;
             }
-            extra->texels=texture_cached_decode(ctx->svc,&plane,
-                (const uint8_t *)(uintptr_t)ptr,VP_TEXTURE_DECODE_FRAGMENT);
-            extra->texels_owned=extra->texels!=NULL;
+            {
+                VPTextureDecodeOutcome decode_outcome = VP_TEX_DECODE_UNSUPPORTED;
+                extra->texels=texture_decode_any(ctx->svc,&plane,
+                    (const uint8_t *)(uintptr_t)ptr,
+                    VP_TEXTURE_DECODE_FRAGMENT,&decode_outcome);
+                extra->texels_owned=extra->texels!=NULL;
+                if (!extra->texels && decode_outcome == VP_TEX_DECODE_FAILED) {
+                    if (extra_error_logs++<32u)
+                        slog(ctx->svc,"VP_TEX_POOL_MEMORY_FAIL slot=%u "
+                             "va=0x%llx detail=extra-no-fallback\n",e+1u,
+                             (unsigned long long)plane.va);
+                }
+            }
             if (!extra->texels) {
                 if (extra_error_logs++<32u)
                     slog(ctx->svc,"VP_GXM_EXTRA_TEX_MISSING slot=%u source=cpu "
@@ -3286,9 +3842,21 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
                              vertex_tex.header);
                 } else if (vertex_reason == NULL && vertex_tex.storage &&
                     gpu_va_to_cpu(ctx->session,vertex_tex.va,vertex_tex.storage,&source)) {
-                    extra->texels=texture_cached_decode(ctx->svc,&vertex_tex,
-                        (const uint8_t *)(uintptr_t)source,VP_TEXTURE_DECODE_VERTEX);
+                    VPTextureDecodeOutcome decode_outcome =
+                        VP_TEX_DECODE_UNSUPPORTED;
+                    extra->texels=texture_decode_any(ctx->svc,&vertex_tex,
+                        (const uint8_t *)(uintptr_t)source,
+                        VP_TEXTURE_DECODE_VERTEX,&decode_outcome);
                     extra->texels_owned=extra->texels!=NULL;
+                    if (!extra->texels &&
+                        decode_outcome == VP_TEX_DECODE_FAILED) {
+                        static unsigned vertex_pool_fail_logs;
+                        if (vertex_pool_fail_logs++ < 16u)
+                            slog(ctx->svc,"VP_TEX_POOL_MEMORY_FAIL "
+                                 "stage=vertex va=0x%llx "
+                                 "detail=vertex-no-fallback\n",
+                                 (unsigned long long)vertex_tex.va);
+                    }
                 }
             }
         }
@@ -3317,7 +3885,9 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
             VPFrameEvent *event = &frame_events[frame_event_count++];
             event->kind = 2;
             event->draw = req;
-            event->texels = linear;
+            /* Only a malloc fallback is owned by the event list. A decoder
+             * borrow stays owned by its cache/pool and must not reach free(). */
+            event->texels = linear_borrowed ? NULL : linear;
             linear = NULL;
             rc = 0;
         } else {
@@ -3329,7 +3899,7 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
             VPFrameEvent *event = &frame_events[frame_event_count++];
             event->kind = 2;
             event->draw = req;
-            event->texels = linear;
+            event->texels = linear_borrowed ? NULL : linear;
             linear = NULL;
         }
     }
@@ -4382,7 +4952,7 @@ static void vp_hid_fill_state(VPGuestSvc *svc) {
     }
 }
 
-static void vp_guest_gpu_decode_entry_locked(VPGuestSvc *svc, VPGuestSession *state,
+static int vp_guest_gpu_decode_entry_locked(VPGuestSvc *svc, VPGuestSession *state,
         VPGuestGpuChannel *channel, uint32_t fd, uint32_t submission,
         uint32_t cpu, uint32_t words, int log) {
     VPGpuDecode *decode = channel->gpu_decode;
@@ -4402,7 +4972,7 @@ static void vp_guest_gpu_decode_entry_locked(VPGuestSvc *svc, VPGuestSession *st
             if (perf)
                 gpu_cpu_perf.entry_setup_us +=
                     sceKernelGetProcessTimeWide() - phase;
-            return;
+            return -1;
         }
         vp_macro_table_init(&decode->macros);
         vp_macro_upload_state_init(&decode->upload);
@@ -4423,7 +4993,7 @@ static void vp_guest_gpu_decode_entry_locked(VPGuestSvc *svc, VPGuestSession *st
     if (bad) {
         ++svc->ipc_unsupported;
         slog(svc,"VP_GPU_ENTRY_REJECT fd=%u submission=%u words=%u reason=allocation-or-size\n",fd,submission,words);
-        return;
+        return -1;
     }
     /* Snapshot the whole entry before decode/dispatch. The guest command RAM
      * stays the producer's; decoder state never borrows a mutable pointer. */
@@ -4449,7 +5019,7 @@ static void vp_guest_gpu_decode_entry_locked(VPGuestSvc *svc, VPGuestSession *st
         ++svc->ipc_unsupported;
         slog(svc,"VP_GPU_ENTRY_REJECT fd=%u submission=%u words=%u reason=decode writes=%u\n",
              fd,submission,words,(unsigned)stats.writes);
-        return;
+        return -1;
     }
     write_count = stats.writes;
     if (perf) {
@@ -4458,6 +5028,21 @@ static void vp_guest_gpu_decode_entry_locked(VPGuestSvc *svc, VPGuestSession *st
         gpu_cpu_perf.decoded_writes += write_count;
         phase = phase_end;
     }
+    /* The mode switch runs at the submission boundary before any draw of this
+     * entry is prepared. The desired flag is published by the host root poll;
+     * the actual flush, cache teardown and pool creation stay on the GXM
+     * worker and never on the host polling thread. */
+    {
+        int switch_rc = texture_pipeline_apply_pending(svc);
+        if (switch_rc < 0) {
+            static unsigned switch_fail_logs;
+            if (switch_fail_logs++ < 8u)
+                slog(svc, "VP_TEX_POOL_MODE_DEFER fd=%u submission=%u rc=%d "
+                     "action=submission-failed\n", fd, submission, switch_rc);
+            return switch_rc;
+        }
+    }
+    deep_decode_error = 0;
     VPGpuSendContext direct = {0};
     direct.decode = decode;
     direct.svc = svc;
@@ -4473,7 +5058,7 @@ static void vp_guest_gpu_decode_entry_locked(VPGuestSvc *svc, VPGuestSession *st
                 ++svc->ipc_unsupported;
                 slog(svc,"VP_ENGINE_LAYOUT_REJECT token=%08x sub=%u fd=%u submission=%u\n",
                     write.value,write.sub,fd,submission);
-                return;
+                return -1;
             }
             layout_consumed++;
             k++;
@@ -4484,6 +5069,7 @@ static void vp_guest_gpu_decode_entry_locked(VPGuestSvc *svc, VPGuestSession *st
                                   write.method, write.value);
             direct.sub = write.sub;
             gpu_state_send(&direct, write.method, write.value);
+            if (deep_decode_error) return -1;
             if (write.sub < VP_GPU_SUBCHANNELS) {
                 if (write.method == 0x35eu) decode->indexed[write.sub] = 0;
                 if (write.method == 0x5f8u) decode->indexed[write.sub] = 1;
@@ -4532,6 +5118,7 @@ static void vp_guest_gpu_decode_entry_locked(VPGuestSvc *svc, VPGuestSession *st
             vp_mme_execute(&decode->macros, decode->macros.positions[index],
                            decode->commands.params, param_count, &decode->shared,
                            gpu_state_send, &ctx, &result);
+            if (deep_decode_error) return -1;
             direct.upload_size = 0u;
         }
     }
@@ -4545,7 +5132,9 @@ static void vp_guest_gpu_decode_entry_locked(VPGuestSvc *svc, VPGuestSession *st
     if (perf)
         gpu_cpu_perf.submission_finish_us +=
             sceKernelGetProcessTimeWide() - phase;
+    return deep_decode_error ? -1 : 0;
 }
+
 typedef struct {
     VPGuestSvc *svc;
     VPGuestSession *state;
@@ -4556,6 +5145,7 @@ typedef struct {
      * only after vp_gxm_worker_execute signals completion. */
     uint64_t queued_us, callback_end_us;
     int log;
+    int rc;
 } VPGpuDecodeWork;
 
 static void gpu_decode_on_worker(void *opaque) {
@@ -4573,7 +5163,7 @@ static void gpu_decode_on_worker(void *opaque) {
     uint64_t started = perf ? sceKernelGetProcessTimeWide() : 0u;
     if (acquire_started)
         gpu_cpu_perf.segment_acquire_us += started - acquire_started;
-    vp_guest_gpu_decode_entry_locked(work->svc, work->state, work->channel,
+    work->rc = vp_guest_gpu_decode_entry_locked(work->svc, work->state, work->channel,
         work->fd, work->submission, work->cpu, work->words, work->log);
     if (started) {
         gpu_cpu_perf.entries++;
@@ -4637,19 +5227,20 @@ static int vp_guest_gpu_decode_entry(VPGuestSvc *svc, VPGuestSession *state,
     }
     display_bridge_init(svc);
     if (!display_bridge_enabled && frame_mode_state != 1) {
-        vp_guest_gpu_decode_entry_locked(svc, state, channel, fd, submission, cpu, words, log);
+        int decode_rc = vp_guest_gpu_decode_entry_locked(svc, state, channel, fd, submission, cpu, words, log);
         sceKernelUnlockMutex(gpu_execution_gate, 1);
-        return 0;
+        return decode_rc;
     }
     int perf = svc_play_perf_enabled();
     VPGpuDecodeWork work = {svc, state, channel, fd, submission, cpu, words,
-                            {0, 0}, 0u, 0u, log};
+                            {0, 0}, 0u, 0u, log, 0};
     /* The caller keeps the GPU gate until the worker returns. Release service
      * state while waiting; the worker acquires it once for the whole decode,
      * including the inline GXM requests, and releases it when the entry ends. */
     device_wait_begin(svc, work.token);
     work.queued_us = perf ? sceKernelGetProcessTimeWide() : 0u;
     int rc = vp_gxm_worker_execute(gpu_decode_on_worker, &work);
+    if (rc == 0) rc = work.rc;
     if (perf) {
         uint64_t returned = sceKernelGetProcessTimeWide();
         if (work.callback_end_us && returned >= work.callback_end_us)

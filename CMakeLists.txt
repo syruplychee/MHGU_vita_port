@@ -77,6 +77,7 @@ add_executable(vita_port_native_loader
     src/platform/sdk_exception_index.c
     src/platform/sdk_tls_slots.c
     src/platform/static_shader_index.c
+    src/platform/texture_pool.c
     src/platform/thread_local_allocator.c
     src/platform/vertex_format.c
     src/platform/vertex_window.c)

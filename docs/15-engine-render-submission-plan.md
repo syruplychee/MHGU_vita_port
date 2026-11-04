@@ -184,6 +184,39 @@ program 命令包／底层资源描述对照，找到原接口检查漏查的 re
 框架成本下降，整帧仍未证明稳定净收益。测量将大头定位到命令分派内部的资源／GXM
 绘制准备，不能把其包含时间误当纯解析耗时。数据和下一处边界见 ADR 0022。
 
+## 深纹理管线（2026-11-04，当前分支默认启用）
+
+新增与 root／shared 解耦的 mode 4（`deep`）。`engine-full-mode.txt` 写 `4` 时仍执行
+与 `0`／`3` 相同的原游戏 root trampoline，但只发布独立纹理管线原子开关；`3` 的
+shared 开关保持关闭。普通非 A/B 运行默认启用，`texture-pipeline.disable` 是单一退出
+开关。控制文件与阶段名均接受 `deep`，分析器不把数字 `4` 当阶段名。
+
+实际替换路径：
+
+- decoder 使用总额 64 MiB 的 `USER_RW_UNCACHE` chunk（通常每块 4 MiB），GPU READ
+  映射后从块内分配 4 KiB 页。128 槽完整 key 加逐字节 raw 比较保留，不 hash、不按帧跳过。
+  同 key 空闲块直接更新，其他槽按 LRU 淘汰，释放小页供不同尺寸复用，避免持续系统申请/
+  释放；GPU 引用退休前不改写。合并原来 48 MiB decoder 与 16 MiB uploader 的总预算，
+  新路径释放并停用旧上传缓存。
+- GXM batch 对真实 decoder-owned 且格式/布局符合的源预留 0 纹理字节，直接 retain
+  `(slot, generation)` 并返回原 RGBA 作为 `SceGxmTexture` backing；upload cache、
+  snapshot staging 与 memcpy 均不执行。所有格式/布局/sampler 检查和 GXM setter 保留。
+- direct token 按每个 draw 最多 6 个绑定到 `VPGxmBatchEntry`：同步 scene 在
+  notification + Finish 成功后释放，deferred scene 在 notification 成功退休后释放；
+  EndScene/NotificationWait 失败时 quarantine 并 poison，不释放未知 GPU 持有。
+- 同步边界改为当前 scene 先 EndScene 登记、再等待最新 notification 一次；空 scene
+  仍 drain。notification 已等于 pending value 时跳过重复 SVC，仍 pending 时调用真实
+  `sceGxmNotificationWait`。`sceGxmFinish` 与 CPU 可见性等待全部保留。
+- capture 只有实际 surface/pass 输入 dump 期间强制同步；只拍 present 的
+  `capture-live inputs=0` 不再永久关闭流水线，输入 capture 完成后恢复。
+
+证据包含 L0/L1/L2 和有限村庄 L3：宿主 42 项 CTest 与 Vita 构建通过，已实际运行对照。
+最终同进程四段整帧 mean 为原路径 144.966 / deep 137.858 ms，约减少 4.9%；两对窗口
+都改善，P95 同时降低。GPU 直接绑定后，稳态实际中间复制为 0；准备净时间约减半，
+解码与等待的上升抵消了一部分收益。普通默认启动与 GPU 读回另做验证，不混入性能汇总。
+完整帧时间、失败迭代、覆盖范围与未验证项见
+[ADR 0024](decisions/0024-deep-texture-pipeline.md)。
+
 ## 下游共享准备实验（2026-11-04，默认关闭）
 
 按 ADR 0022 的边界，新增与 root 接管解耦的 mode 3（`shared`）。`engine-full-mode.txt`

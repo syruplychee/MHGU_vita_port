@@ -49,6 +49,18 @@ size_t vp_texture_storage(unsigned width, unsigned height, unsigned format, unsi
 int vp_texture_rgba(const uint8_t *src, size_t bytes, uint8_t *dst,
                     unsigned width, unsigned height, unsigned format, unsigned block_h);
 void vp_texture_swizzle(uint8_t *rgba, size_t pixels, uint32_t tic_word0);
+/* Fused Maxwell block-linear RGBA8 tiled decode and TIC selector permutation.
+ * The result is byte-identical to vp_texture_rgba(..., 8, block_h) followed by
+ * vp_texture_swizzle(..., tic_word0): all selectors, GOB tails and the
+ * non-multiple-of-16 row path keep their original semantics, but the decoded
+ * bytes are written once instead of being permuted in a second pass. */
+int vp_texture_rgba8_untile_swizzle(const uint8_t *src, size_t bytes,
+    uint8_t *dst, unsigned width, unsigned height, unsigned block_h,
+    uint32_t tic_word0);
+/* Same fusion for the pitch-linear RGBA8 form (TIC header 2). */
+int vp_texture_rgba8_linear_swizzle(const uint8_t *src, size_t bytes,
+    uint8_t *dst, unsigned width, unsigned height, size_t pitch,
+    uint32_t tic_word0);
 unsigned vp_texture_upload_format(unsigned format, uint32_t tic_word0);
 size_t vp_texture_upload_bytes(unsigned w,unsigned h,unsigned format);
 int vp_texture_blocks_linear(const uint8_t *src,size_t bytes,uint8_t *dst,

@@ -178,6 +178,7 @@ int vp_texture_rgba32f_pitch_to_rg32f(const uint8_t *src,size_t src_bytes,
     uint8_t *dst,size_t dst_bytes,unsigned width,unsigned height,size_t pitch,
     uint32_t word) {
     size_t required,produced;
+    int identity;
     if (!src || !dst || !width || !height ||
         width>VP_TEXTURE_RG32F_LOGICAL_MAX_WIDTH ||
         height>VP_TEXTURE_RG32F_MAX_HEIGHT ||
@@ -186,6 +187,21 @@ int vp_texture_rgba32f_pitch_to_rg32f(const uint8_t *src,size_t src_bytes,
     if (src_bytes<required || (size_t)width>SIZE_MAX/(height*16u)) return -1;
     produced=(size_t)width*height*16u;
     if (dst_bytes<produced) return -1;
+    /* Identity selectors leave every 32-bit channel pattern in place (NaN,
+     * -0 and subnormals included), so whole rows are copied without any float
+     * interpretation. */
+    identity = ((word>>19)&7u)==2u && ((word>>22)&7u)==3u &&
+               ((word>>25)&7u)==4u && ((word>>28)&7u)==5u;
+    if (identity) {
+        if (pitch==(size_t)width*16u) {
+            memcpy(dst,src,produced);
+        } else {
+            for (unsigned y=0;y<height;y++)
+                memcpy(dst+(size_t)y*width*16u,src+(size_t)y*pitch,
+                       (size_t)width*16u);
+        }
+        return 0;
+    }
     for (unsigned y=0;y<height;y++) for (unsigned x=0;x<width;x++) {
         uint32_t input[4],output[4];
         const uint8_t *pixel=src+(size_t)y*pitch+(size_t)x*16u;
@@ -450,6 +466,140 @@ static void rgb565(unsigned c, uint8_t out[4]) {
     out[1] = (uint8_t)((g << 2) | (g >> 4));
     out[2] = (uint8_t)((b << 3) | (b >> 2));
     out[3] = 255u;
+}
+
+/* Apply the four Maxwell TIC selector fields while copying. Selector 1 has no
+ * established channel meaning here and stays zero, exactly as the reviewed
+ * vp_texture_swizzle mapping; selectors 6 and 7 both produce 255. */
+static void rgba8_selector_map(const uint8_t in[4], uint8_t out[4],
+                               const unsigned sel[4]) {
+    for (unsigned i = 0; i < 4u; ++i) {
+        unsigned s = sel[i];
+        out[i] = s >= 2u && s <= 5u ? in[s - 2u] : s >= 6u ? 255u : 0u;
+    }
+}
+
+static int rgba8_identity_selectors(uint32_t word) {
+    return ((word >> 19) & 7u) == 2u && ((word >> 22) & 7u) == 3u &&
+           ((word >> 25) & 7u) == 4u && ((word >> 28) & 7u) == 5u;
+}
+
+static void rgba8_copy_pixels(uint8_t *dst, const uint8_t *src,
+                              unsigned pixels, int identity,
+                              const unsigned sel[4]) {
+    if (identity) {
+        memcpy(dst, src, (size_t)pixels * 4u);
+        return;
+    }
+    for (unsigned p = 0; p < pixels; ++p)
+        rgba8_selector_map(src + p * 4u, dst + p * 4u, sel);
+}
+
+int vp_texture_rgba8_untile_swizzle(const uint8_t *src, size_t bytes,
+    uint8_t *dst, unsigned w, unsigned h, unsigned bh, uint32_t word) {
+    static const size_t row_offsets[8] = {0u,16u,64u,80u,
+                                          128u,144u,192u,208u};
+    unsigned sel[4];
+    size_t gob_stride;
+    int identity;
+
+    if (!src || !dst || !w || !h || w > 4096u || h > 4096u || bh > 5u)
+        return -1;
+    if (bytes < vp_texture_storage(w, h, 8u, bh)) return -1;
+    gob_stride = (size_t)512u << bh;
+    for (unsigned i = 0; i < 4u; ++i) sel[i] = (word >> (19u + 3u * i)) & 7u;
+    identity = rgba8_identity_selectors(word);
+
+    if ((w & 15u) == 0u) {
+        /* Same GOB row-group traversal as the reviewed decoder: complete four
+         * GOBs (64 pixels) for all rows first, then one GOB at a time. */
+        for (unsigned gob_y = 0; gob_y < h; gob_y += 8u) {
+            const unsigned rows = h - gob_y < 8u ? h - gob_y : 8u;
+            const size_t base = tiled_offset(0, gob_y, w, 4u, bh);
+            unsigned gob_x = 0;
+            for (; gob_x + 64u <= w; gob_x += 64u) {
+                for (unsigned row = 0; row < rows; ++row) {
+                    uint8_t *out = dst +
+                        ((size_t)(gob_y + row) * w + gob_x) * 4u;
+                    const uint8_t *in = src + base +
+                        (size_t)(gob_x / 16u) * gob_stride +
+                        row_offsets[row];
+                    for (unsigned gob = 0; gob < 4u; ++gob) {
+                        const uint8_t *row_in = in + (size_t)gob * gob_stride;
+                        uint8_t *gob_out = out + (size_t)gob * 64u;
+                        rgba8_copy_pixels(gob_out, row_in, 4u, identity, sel);
+                        rgba8_copy_pixels(gob_out + 16u, row_in + 32u, 4u,
+                                          identity, sel);
+                        rgba8_copy_pixels(gob_out + 32u, row_in + 256u, 4u,
+                                          identity, sel);
+                        rgba8_copy_pixels(gob_out + 48u, row_in + 288u, 4u,
+                                          identity, sel);
+                    }
+                }
+            }
+            for (; gob_x < w; gob_x += 16u) {
+                const uint8_t *in = src + base +
+                    (size_t)(gob_x / 16u) * gob_stride;
+                for (unsigned row = 0; row < rows; ++row) {
+                    uint8_t *out = dst +
+                        ((size_t)(gob_y + row) * w + gob_x) * 4u;
+                    const uint8_t *row_in = in + row_offsets[row];
+                    rgba8_copy_pixels(out, row_in, 4u, identity, sel);
+                    rgba8_copy_pixels(out + 16u, row_in + 32u, 4u,
+                                      identity, sel);
+                    rgba8_copy_pixels(out + 32u, row_in + 256u, 4u,
+                                      identity, sel);
+                    rgba8_copy_pixels(out + 48u, row_in + 288u, 4u,
+                                      identity, sel);
+                }
+            }
+        }
+        return 0;
+    }
+
+    /* Narrow/unaligned widths keep the original per-row order. */
+    for (unsigned y = 0; y < h; ++y) {
+        const size_t row_base = tiled_offset(0, y, w, 4u, bh);
+        uint8_t *out = dst + (size_t)y * w * 4u;
+        unsigned x = 0;
+        for (; x + 16u <= w; x += 16u) {
+            const uint8_t *in = src + row_base +
+                (size_t)(x / 16u) * gob_stride;
+            rgba8_copy_pixels(out + (size_t)x * 4u, in, 4u, identity, sel);
+            rgba8_copy_pixels(out + (size_t)x * 4u + 16u, in + 32u, 4u,
+                              identity, sel);
+            rgba8_copy_pixels(out + (size_t)x * 4u + 32u, in + 256u, 4u,
+                              identity, sel);
+            rgba8_copy_pixels(out + (size_t)x * 4u + 48u, in + 288u, 4u,
+                              identity, sel);
+        }
+        for (; x + 4u <= w; x += 4u)
+            rgba8_copy_pixels(out + (size_t)x * 4u,
+                              src + tiled_offset(x, y, w, 4u, bh), 4u,
+                              identity, sel);
+        if (x < w)
+            rgba8_copy_pixels(out + (size_t)x * 4u,
+                              src + tiled_offset(x, y, w, 4u, bh), w - x,
+                              identity, sel);
+    }
+    return 0;
+}
+
+int vp_texture_rgba8_linear_swizzle(const uint8_t *src, size_t bytes,
+    uint8_t *dst, unsigned w, unsigned h, size_t pitch, uint32_t word) {
+    unsigned sel[4];
+    int identity;
+
+    if (!src || !dst || !w || !h || w > 4096u || h > 4096u ||
+        pitch < (size_t)w * 4u || (size_t)h > SIZE_MAX / pitch)
+        return -1;
+    if (bytes < pitch * h) return -1;
+    for (unsigned i = 0; i < 4u; ++i) sel[i] = (word >> (19u + 3u * i)) & 7u;
+    identity = rgba8_identity_selectors(word);
+    for (unsigned y = 0; y < h; ++y)
+        rgba8_copy_pixels(dst + (size_t)y * w * 4u,
+                          src + (size_t)y * pitch, w, identity, sel);
+    return 0;
 }
 
 int vp_texture_rgba(const uint8_t *src, size_t bytes, uint8_t *dst,

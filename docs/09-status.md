@@ -39,6 +39,20 @@ Vita VPK 构建通过（L1／L2）。Vita3K 同进程四段对照（L3）中，�
 新增黑块，**仍不认定稳定提速，默认关闭**。真机、全部动画帧及流式场景未验证。见
 [ADR 0023](decisions/0023-shared-downstream-prepare.md)。
 
+2026-11-04 另增独立候选 mode 4（`deep`）：在同一个原游戏 root trampoline 下，用有界
+64 MiB 小页池合并原来 48 MiB decoder 与 16 MiB uploader 的预算，并把符合契约的
+decoder-owned RGBA 直接作为 GXM 纹理 backing；不启用 mode 3 的 shared 元数据优化。
+旧普通 cache 与 deep pool 互斥且切换前先 drain，raw 仍逐字节比较，GPU 引用与 CPU pin
+分开，失败路径显式 poison/quarantine 而不释放未知持有。当前分支普通运行默认启用，
+`texture-pipeline.disable` 可退出；旧稳定安装未替换。宿主 42 项 CTest 与 Vita VPK 构建
+通过，已做 L3 村庄双向切换和图像检查；真机及全部场景未验证。迭代失败、整帧数据及范围见
+[ADR 0024](decisions/0024-deep-texture-pipeline.md)。
+
+最终四段窗口原路径 864 帧平均 144.966 ms，新路径 832 帧平均 137.858 ms，减少约
+4.9%；两对窗口均改善，P95 从 161–162 降至 153–154 ms。GXM 准备净时间约
+46.637 → 21.714 ms/帧，但解码总时间和 GPU 阻塞有所增加，不能按准备降幅宣传整帧收益。
+普通启动（不带 A/B/root marker）与显式 GPU 读回也通过，有限样本未见新增黑块。
+
 | 能力 | 证据级别 | 说明 |
 |---|---|---|
 | 四模块 NSO 解码、重定位、导入绑定 | L3 | Vita3K OpenGL 下加载并执行 |
