@@ -23,6 +23,7 @@
 #include "vertex_window.h"
 #include "gpu_indices.h"
 #include "gpu_wait_profile.h"
+#include "frame_cost_profile.h"
 
 #include <psp2/display.h>
 #include <psp2/gxm.h>
@@ -415,15 +416,20 @@ static int gxm_log_ensure(void) {
  * later lines are counted as suppressed by the helper. Write/flush failures
  * fail closed and are also reported once. */
 static void glog(const char *format, ...) {
+    uint64_t fc = vp_gxm_frame_cost_log_begin();
     va_list args;
     int state = gxm_log_ensure();
     int rc;
-    if (state == -2) return; /* half-initialized; do not read its fields */
+    if (state == -2) {
+        vp_gxm_frame_cost_category_end(VP_FRAME_COST_LOG, fc);
+        return; /* half-initialized; do not read its fields */
+    }
     va_start(args, format);
     rc = vp_log_sink_vprintf(&gxm_log_sink, format, args);
     va_end(args);
     if (rc < 0 && rc != VP_LOG_SINK_NOT_READY)
         gxm_log_report_failure(rc, 1u);
+    vp_gxm_frame_cost_category_end(VP_FRAME_COST_LOG, fc);
 }
 
 int vp_gxm_log_get_stats(VPLogSinkStats *out) {
@@ -1126,6 +1132,303 @@ static uint32_t gxm_perf_frame_intervals[512];
 static uint64_t gxm_perf_global_ok, gxm_perf_global_fail, gxm_perf_global_skip;
 static unsigned gxm_last_draw_class = 2u; /* 0 colour, 1 depth-only, 2 noop */
 
+/* ---- Bounded frame-cost decomposition -----------------------------------
+ *
+ * Only the single GXM worker records spans. The play-perf marker is not used:
+ * frame-cost.enable is an independent gate, and frame-cost-mode.txt is polled
+ * at decoder-entry boundaries at most every 500 ms. Mode 0 keeps the exact
+ * same boundary clock and file polling cadence but performs no span clocks, so
+ * the two modes can be compared descriptively. A missing/illegal control file
+ * is a recorded control error, never a silent fallback. No span is opened on a
+ * non-worker thread or while the profile is disabled. */
+#define VP_FRAME_COST_MARKER_PATH "ux0:data/mhgu-vita-port/frame-cost.enable"
+#define VP_FRAME_COST_MODE_PATH "ux0:data/mhgu-vita-port/frame-cost-mode.txt"
+#define VP_FRAME_COST_POLL_US 500000ull
+
+static VPFrameCostProfile gxm_frame_cost_profile;
+static int gxm_frame_cost_marker = -1;   /* -1 unknown, 0 absent, 1 present */
+static int gxm_frame_cost_mode;          /* applied control mode */
+static int gxm_frame_cost_enabled;       /* spans active (mode 1) */
+static int gxm_frame_cost_failed;        /* sticky control error */
+static unsigned gxm_frame_cost_epoch;
+static unsigned gxm_frame_cost_seq;
+static int gxm_frame_cost_reported_mode = -1;
+static int gxm_frame_cost_reported_failed = -1;
+static uint64_t gxm_frame_cost_last_poll_us;
+static uint64_t gxm_frame_cost_poll_clocks;
+static uint64_t gxm_frame_cost_boundaries;
+static int gxm_frame_resource_audit;
+static uint64_t gxm_frame_resource_start_frame;
+static void gxm_frame_cost_details(uint64_t now, uint64_t frames, unsigned seq);
+
+int vp_gxm_frame_cost_active(void) {
+    return gxm_frame_cost_enabled;
+}
+
+int vp_gxm_frame_cost_resource_audit(uint64_t *frame) {
+    if (frame) *frame = gxm_perf_present_frames;
+    return gxm_frame_cost_enabled && gxm_frame_resource_audit &&
+        gxm_perf_present_frames - gxm_frame_resource_start_frame < 16u;
+}
+
+uint64_t vp_gxm_frame_cost_log_begin(void) {
+    /* Reporting an empty stack must not create a new root which reports
+     * itself. Ordinary logging inside work remains a nested measured cost. */
+    if (!gxm_frame_cost_enabled || !gxm_frame_cost_profile.depth) return 0u;
+    return vp_gxm_frame_cost_category_begin(VP_FRAME_COST_LOG);
+}
+
+uint64_t vp_gxm_frame_cost_now(void) {
+    if (!gxm_frame_cost_enabled) return 0u;
+    gxm_frame_cost_profile.clock_calls++;
+    return sceKernelGetProcessTimeWide();
+}
+
+uint64_t vp_gxm_frame_cost_category_begin(unsigned category) {
+    if (!gxm_frame_cost_enabled || !vp_gxm_worker_is_current()) return 0u;
+    uint64_t now = vp_gxm_frame_cost_now();
+    if (now != 0u &&
+        !vp_frame_cost_span_begin(&gxm_frame_cost_profile, category, now))
+        return 0u;
+    return now;
+}
+
+void vp_gxm_frame_cost_category_end(unsigned category, uint64_t started_us) {
+    if (started_us == 0u) return;
+    uint64_t now = vp_gxm_frame_cost_now();
+    int root = gxm_frame_cost_profile.depth == 1u;
+    int rc = vp_frame_cost_span_end(&gxm_frame_cost_profile, category, now);
+    if (!rc && root)
+        glog("VP_FRAME_COST_ROOT schema=%u epoch=%u cat=%s entry_us=%llu "
+             "t_us=%llu frames=%llu\n", VP_FRAME_COST_SCHEMA,
+             gxm_frame_cost_epoch, vp_frame_cost_category_names[category],
+             (unsigned long long)started_us, (unsigned long long)now,
+             (unsigned long long)gxm_perf_present_frames);
+}
+
+static uint64_t gxm_frame_cost_errors(void) {
+    return vp_frame_cost_error_count(&gxm_frame_cost_profile) +
+           (gxm_frame_cost_failed ? 1u : 0u);
+}
+
+static void gxm_frame_cost_log_point(uint64_t now, uint64_t frames,
+                                     const char *reason) {
+    glog("VP_FRAME_COST_POINT schema=%u epoch=%u mode=%d t_us=%llu "
+         "frames=%llu clocks=%llu poll_clocks=%llu boundaries=%llu "
+         "control_error=%d reason=%s\n",
+         VP_FRAME_COST_SCHEMA, gxm_frame_cost_epoch, gxm_frame_cost_mode,
+         (unsigned long long)now, (unsigned long long)frames,
+         (unsigned long long)gxm_frame_cost_profile.clock_calls,
+         (unsigned long long)gxm_frame_cost_poll_clocks,
+         (unsigned long long)gxm_frame_cost_boundaries,
+         gxm_frame_cost_failed ? 1 : 0, reason);
+}
+
+/* Emit one complete snapshot: BEGIN, every fixed category row, END. All lines
+ * carry the same schema/seq/epoch/mode/t_us/frames identity. A snapshot with an
+ * open span is refused and recorded as incomplete instead of being presented
+ * as a closed interval. */
+static void gxm_frame_cost_log_snapshot(uint64_t now, uint64_t frames,
+                                        const char *reason) {
+    VPFrameCostProfile copy;
+    unsigned seq, row;
+    uint64_t errors;
+
+    if (!gxm_frame_cost_enabled) return;
+    if (gxm_frame_cost_profile.depth != 0u) {
+        gxm_frame_cost_profile.incomplete_snapshot++;
+        glog("VP_FRAME_COST_SNAPSHOT_SKIP schema=%u epoch=%u t_us=%llu "
+             "frames=%llu depth=%u reason=span-active\n",
+             VP_FRAME_COST_SCHEMA, gxm_frame_cost_epoch,
+             (unsigned long long)now, (unsigned long long)frames,
+             gxm_frame_cost_profile.depth);
+        return;
+    }
+    copy = gxm_frame_cost_profile;
+    seq = ++gxm_frame_cost_seq;
+    errors = gxm_frame_cost_errors();
+    glog("VP_FRAME_COST_SNAPSHOT_BEGIN schema=%u seq=%u epoch=%u mode=1 "
+         "t_us=%llu frames=%llu rows=%u depth=%u errors=%llu mismatch=%llu "
+         "overflow=%llu underflow=%llu clock_regress=%llu missing_time=%llu "
+         "incomplete=%llu control_error=%d clocks=%llu poll_clocks=%llu "
+         "boundaries=%llu reason=%s\n",
+         VP_FRAME_COST_SCHEMA, seq, gxm_frame_cost_epoch,
+         (unsigned long long)now, (unsigned long long)frames,
+         VP_FRAME_COST_CATEGORY_COUNT, copy.depth,
+         (unsigned long long)errors, (unsigned long long)copy.mismatch,
+         (unsigned long long)copy.overflow, (unsigned long long)copy.underflow,
+         (unsigned long long)copy.clock_regression,
+         (unsigned long long)copy.missing_time,
+         (unsigned long long)copy.incomplete_snapshot,
+         gxm_frame_cost_failed ? 1 : 0,
+         (unsigned long long)copy.clock_calls,
+         (unsigned long long)gxm_frame_cost_poll_clocks,
+         (unsigned long long)gxm_frame_cost_boundaries, reason);
+    for (row = 0u; row < VP_FRAME_COST_CATEGORY_COUNT; ++row) {
+        const VPFrameCostCategory *c = &copy.categories[row];
+        glog("VP_FRAME_COST_SNAPSHOT_ROW schema=%u seq=%u epoch=%u mode=1 "
+             "t_us=%llu frames=%llu row=%u cat=%s calls=%llu incl_us=%llu "
+             "self_us=%llu max_us=%llu root_calls=%llu root_incl_us=%llu\n",
+             VP_FRAME_COST_SCHEMA, seq, gxm_frame_cost_epoch,
+             (unsigned long long)now, (unsigned long long)frames, row,
+             vp_frame_cost_category_names[row],
+             (unsigned long long)c->calls,
+             (unsigned long long)c->inclusive_us,
+             (unsigned long long)c->self_us,
+             (unsigned long long)c->max_us,
+             (unsigned long long)c->root_calls,
+             (unsigned long long)c->root_inclusive_us);
+    }
+    gxm_frame_cost_details(now, frames, seq);
+    glog("VP_FRAME_COST_SNAPSHOT_END schema=%u seq=%u epoch=%u mode=1 "
+         "t_us=%llu frames=%llu rows=%u errors=%llu\n",
+         VP_FRAME_COST_SCHEMA, seq, gxm_frame_cost_epoch,
+         (unsigned long long)now, (unsigned long long)frames,
+         VP_FRAME_COST_CATEGORY_COUNT, (unsigned long long)errors);
+}
+
+static void gxm_frame_cost_start_epoch(uint64_t now, uint64_t frames,
+                                       const char *source) {
+    gxm_frame_cost_epoch++;
+    gxm_frame_cost_seq = 0u;
+    gxm_frame_cost_poll_clocks = 0u;
+    gxm_frame_cost_boundaries = 0u;
+    vp_frame_cost_profile_reset(&gxm_frame_cost_profile);
+    gxm_frame_cost_enabled = 1;
+    gxm_frame_resource_start_frame = frames;
+    glog("VP_FRAME_COST_EPOCH action=start schema=%u epoch=%u mode=1 "
+         "t_us=%llu frames=%llu source=%s\n",
+         VP_FRAME_COST_SCHEMA, gxm_frame_cost_epoch,
+         (unsigned long long)now, (unsigned long long)frames, source);
+}
+
+static void gxm_frame_cost_stop_epoch(uint64_t now, uint64_t frames,
+                                      const char *reason) {
+    if (!gxm_frame_cost_enabled) return;
+    /* Record the final closed interval before disabling span clocks. */
+    gxm_frame_cost_log_snapshot(now, frames, reason);
+    gxm_frame_cost_enabled = 0;
+    glog("VP_FRAME_COST_EPOCH action=stop schema=%u epoch=%u mode=0 "
+         "t_us=%llu frames=%llu reason=%s\n",
+         VP_FRAME_COST_SCHEMA, gxm_frame_cost_epoch,
+         (unsigned long long)now, (unsigned long long)frames, reason);
+}
+
+/* -1 = missing/unreadable, -2 = parse error, 0 = valid mode. */
+static int gxm_frame_cost_read_mode(unsigned *mode) {
+    char text[64];
+    size_t count;
+    int extra;
+    FILE *file = fopen(VP_FRAME_COST_MODE_PATH, "rb");
+    if (file == NULL) return -1;
+    count = fread(text, 1u, sizeof(text), file);
+    extra = fgetc(file);
+    fclose(file);
+    if (extra != EOF) return -2;
+    return vp_frame_cost_parse_mode(text, count, mode) == 0 ? 0 : -2;
+}
+
+static void gxm_frame_cost_apply(unsigned requested_mode, int control_error,
+                                 uint64_t now, uint64_t frames,
+                                 const char *source) {
+    if (control_error) {
+        gxm_frame_cost_mode = 0;
+        if (!gxm_frame_cost_failed) {
+            gxm_frame_cost_failed = 1;
+            glog("VP_FRAME_COST_CONTROL source=%s error=%s action=disable-data "
+                 "epoch=%u t_us=%llu frames=%llu\n", source,
+                 control_error == -1 ? "mode-file-missing" : "mode-invalid",
+                 gxm_frame_cost_epoch, (unsigned long long)now,
+                 (unsigned long long)frames);
+            gxm_frame_cost_stop_epoch(now, frames, "control-error");
+            gxm_frame_cost_log_point(now, frames, "control-error");
+        }
+        return;
+    }
+    /* A control error invalidates this process's closure data. Keep polling
+     * (so the condition stays observable) but never resume spans. */
+    if (gxm_frame_cost_failed) {
+        if (gxm_frame_cost_reported_failed != 1) {
+            gxm_frame_cost_reported_failed = 1;
+            gxm_frame_cost_log_point(now, frames, "control-error-sticky");
+        }
+        return;
+    }
+    if (requested_mode == (unsigned)gxm_frame_cost_mode) {
+        if (gxm_frame_cost_reported_mode != (int)requested_mode) {
+            gxm_frame_cost_reported_mode = (int)requested_mode;
+            gxm_frame_cost_log_point(now, frames,
+                                     requested_mode == 1 ? "mode-1" : "mode-0");
+        }
+        return;
+    }
+    if (gxm_frame_cost_mode == 1)
+        gxm_frame_cost_stop_epoch(now, frames, "mode-change");
+    gxm_frame_cost_mode = (int)requested_mode;
+    if (requested_mode == 1) {
+        gxm_frame_cost_start_epoch(now, frames, source);
+    } else {
+        gxm_frame_cost_log_point(now, frames, "mode-0");
+    }
+    gxm_frame_cost_reported_mode = (int)requested_mode;
+}
+
+/* Called once at the start of every complete decoder-entry boundary, while the
+ * span stack is empty. This is the only place that reads frame-cost control
+ * files or takes the boundary clock. */
+void vp_gxm_frame_cost_worker_boundary(void) {
+    FILE *marker;
+    uint64_t now;
+    unsigned requested = 0u;
+    int read_rc;
+
+    if (gxm_frame_cost_marker == 0) return;
+    if (gxm_frame_cost_profile.depth != 0u) {
+        /* Mode switches only happen with a closed span stack. This cannot be
+         * a normal decoder-entry boundary; refuse instead of splitting a
+         * cumulative epoch in the middle of a span. */
+        glog("VP_FRAME_COST_CONTROL action=defer-boundary depth=%u\n",
+             gxm_frame_cost_profile.depth);
+        return;
+    }
+    if (gxm_frame_cost_marker < 0) {
+        marker = fopen(VP_FRAME_COST_MARKER_PATH, "rb");
+        gxm_frame_cost_marker = marker != NULL;
+        if (marker != NULL) fclose(marker);
+        glog("VP_FRAME_COST_MARKER enabled=%d path=%s\n",
+             gxm_frame_cost_marker, VP_FRAME_COST_MARKER_PATH);
+        if (!gxm_frame_cost_marker) return; /* no polling, no clock */
+        FILE *resource = fopen("ux0:data/mhgu-vita-port/frame-resource-audit.enable", "rb");
+        gxm_frame_resource_audit = resource != NULL;
+        if (resource) fclose(resource);
+    }
+
+    /* The marker is present. Take the boundary clock even in mode 0 so both
+     * modes pay the same polling structure; file reads stay bounded to the
+     * 500 ms boundary cadence. */
+    now = sceKernelGetProcessTimeWide();
+    gxm_frame_cost_poll_clocks++;
+    gxm_frame_cost_boundaries++;
+    if (gxm_frame_cost_last_poll_us != 0u &&
+        now - gxm_frame_cost_last_poll_us < VP_FRAME_COST_POLL_US)
+        return;
+    gxm_frame_cost_last_poll_us = now;
+    marker = fopen(VP_FRAME_COST_MARKER_PATH, "rb");
+    if (marker == NULL) {
+        gxm_frame_cost_marker = 0;
+        gxm_frame_cost_stop_epoch(now, gxm_perf_present_frames, "marker-removed");
+        gxm_frame_cost_mode = 0;
+        gxm_frame_cost_log_point(now, gxm_perf_present_frames, "marker-removed");
+        return;
+    }
+    fclose(marker);
+    read_rc = gxm_frame_cost_read_mode(&requested);
+    gxm_frame_cost_apply(read_rc == 0 ? requested : 0u, read_rc,
+                         now, gxm_perf_present_frames,
+                         VP_FRAME_COST_MODE_PATH);
+}
+
+
 /* Draw refusal census. Every frame_draw_internal_body failure records the last
  * stage marker it passed, so a run identifies which section refused the draw
  * without a per-draw hash chain. Bounded logging only; counters are exact. */
@@ -1462,6 +1765,49 @@ static struct {
     uint64_t prj_us, reserve_us, uniform_us, policy_us;
 } gxm_batch_encode_perf[2];
 
+/* Capture these existing successful-batch counters at exactly the same
+ * endpoints as the nested profile. They are a second, nested view, never
+ * additional frame costs. Failed/legacy draws remain in gxm-draw instead. */
+static void gxm_frame_cost_details(uint64_t now, uint64_t frames, unsigned seq) {
+    for (unsigned kind = 0; kind < 2u; ++kind) {
+#define FC_VALUE(field) (unsigned long long)gxm_batch_encode_perf[kind].field
+        glog("VP_FRAME_COST_GXM schema=%u seq=%u epoch=%u mode=1 t_us=%llu frames=%llu "
+             "kind=%u draws=%llu prep_us=%llu begin_us=%llu encode_us=%llu draw_us=%llu "
+             "setup_us=%llu vertex_us=%llu index_us=%llu texture_us=%llu "
+             "nested_flush_us=%llu nested_pending_us=%llu nested_notify_us=%llu "
+             "nested_finish_us=%llu validate_us=%llu pair_us=%llu feedback_us=%llu "
+             "admit_us=%llu resolve_us=%llu pair_flush_us=%llu admit_flush_us=%llu "
+             "prj_us=%llu reserve_us=%llu uniform_us=%llu policy_us=%llu\n",
+             VP_FRAME_COST_SCHEMA, seq, gxm_frame_cost_epoch, (unsigned long long)now, (unsigned long long)frames,
+             kind, FC_VALUE(draws), FC_VALUE(prep_us), FC_VALUE(begin_us), FC_VALUE(encode_us),
+             FC_VALUE(draw_us), FC_VALUE(setup_us), FC_VALUE(vertex_us), FC_VALUE(index_us),
+             FC_VALUE(texture_us), FC_VALUE(nested_flush_us), FC_VALUE(nested_pending_us),
+             FC_VALUE(nested_notify_us), FC_VALUE(nested_finish_us), FC_VALUE(validate_us),
+             FC_VALUE(pair_us), FC_VALUE(feedback_us), FC_VALUE(admit_us), FC_VALUE(resolve_us),
+             FC_VALUE(pair_flush_us), FC_VALUE(admit_flush_us), FC_VALUE(prj_us),
+             FC_VALUE(reserve_us), FC_VALUE(uniform_us), FC_VALUE(policy_us));
+#undef FC_VALUE
+    }
+    VPGuestFramePerf guest;
+    vp_guest_frame_perf(&guest);
+    glog("VP_FRAME_COST_TEXTURE schema=%u seq=%u epoch=%u mode=1 t_us=%llu frames=%llu "
+         "requests=%llu hits=%llu misses=%llu rgba8_us=%llu fp16_us=%llu blocks_us=%llu "
+         "cube_us=%llu other_us=%llu rgba8_bytes=%llu fp16_bytes=%llu blocks_bytes=%llu "
+         "cube_bytes=%llu other_bytes=%llu miss_changed=%llu miss_absent=%llu "
+         "miss_gpu_only=%llu compare_bytes=%llu compare_calls=%llu\n", VP_FRAME_COST_SCHEMA, seq, gxm_frame_cost_epoch,
+         (unsigned long long)now, (unsigned long long)frames,
+         (unsigned long long)guest.tex_requests, (unsigned long long)guest.tex_hits,
+         (unsigned long long)guest.tex_misses,
+         (unsigned long long)guest.tex_family_us[0], (unsigned long long)guest.tex_family_us[1],
+         (unsigned long long)guest.tex_family_us[2], (unsigned long long)guest.tex_family_us[3],
+         (unsigned long long)guest.tex_family_us[4], (unsigned long long)guest.tex_family_bytes[0],
+         (unsigned long long)guest.tex_family_bytes[1], (unsigned long long)guest.tex_family_bytes[2],
+         (unsigned long long)guest.tex_family_bytes[3], (unsigned long long)guest.tex_family_bytes[4],
+         (unsigned long long)guest.tex_miss_changed, (unsigned long long)guest.tex_miss_absent,
+         (unsigned long long)guest.tex_miss_gpu_only, (unsigned long long)guest.tex_compare_bytes,
+         (unsigned long long)guest.tex_compare_calls);
+}
+
 /* Scene-class completion census (B86 exploration). A scene is one EndScene;
  * the class decides which attachment family paid for its GPU completion. The
  * synchronous path measures start/notification/Finish exactly; the deferred
@@ -1752,6 +2098,9 @@ static void gxm_perf_present(uint64_t fn_us, uint64_t now) {
              (unsigned long long)gxm_perf_global_skip);
     if ((gxm_perf_present_frames % 32u) == 0u) {
         gxm_wait_profile_log(now, gxm_perf_present_frames);
+        /* Frame-cost snapshots use this exact existing reporting point. The
+         * profile must be closed here; otherwise the snapshot is refused. */
+        gxm_frame_cost_log_snapshot(now, gxm_perf_present_frames, "periodic");
         glog("VP_GXM_FRAME_INTERVALS t_us=%llu count=%llu sum_us=%llu width_us=1000\n",
             (unsigned long long)now,(unsigned long long)gxm_perf_present_interval_count,
             (unsigned long long)gxm_perf_present_interval_sum);
@@ -3068,7 +3417,12 @@ static int frame_end_scene_timed(SceGxmContext *context, const char *why,
     if (out_end != NULL) *out_end = finished;
     if (rc < 0) return rc;
     started = gxm_prof_now();
-    rc = sceGxmNotificationWait(&notification);
+    {
+        uint64_t fc = vp_gxm_frame_cost_category_begin(
+            VP_FRAME_COST_WAIT_NOTIFY);
+        rc = sceGxmNotificationWait(&notification);
+        vp_gxm_frame_cost_category_end(VP_FRAME_COST_WAIT_NOTIFY, fc);
+    }
     finished = gxm_prof_now();
     vp_gpu_wait_record(&gxm_wait_profile, why, started, finished, 1, rc,
                        gxm_pending_scene_count, 0u, 1);
@@ -3081,7 +3435,12 @@ static int frame_end_scene_timed(SceGxmContext *context, const char *why,
     /* sceGxmFinish returns void on this SDK; the timestamp still measures the
      * complete synchronous wait before any staging buffer may be reused. */
     started = gxm_prof_now();
-    sceGxmFinish(context);
+    {
+        uint64_t fc = vp_gxm_frame_cost_category_begin(
+            VP_FRAME_COST_WAIT_FINISH);
+        sceGxmFinish(context);
+        vp_gxm_frame_cost_category_end(VP_FRAME_COST_WAIT_FINISH, fc);
+    }
     finished = gxm_prof_now();
     if (started != 0u) {
         gxm_finish_calls++;
@@ -7965,8 +8324,11 @@ static int gxm_pending_scene_wait(VPGxmPendingScene *pending, const char *why) {
         rc = 0;
         real_wait = 0;
     } else {
+        uint64_t fc = vp_gxm_frame_cost_category_begin(
+            VP_FRAME_COST_WAIT_NOTIFY);
         gxm_notify_real_waits++;
         rc = sceGxmNotificationWait(&notification);
+        vp_gxm_frame_cost_category_end(VP_FRAME_COST_WAIT_NOTIFY, fc);
         real_wait = 1;
     }
     finished = gxm_prof_now();
@@ -8123,8 +8485,9 @@ static int gxm_batch_move_direct_to_pending(unsigned arena, unsigned draws,
 }
 
 /* Complete a scene whose draws were all encoded successfully. Called on
- * submission end and on every API/resource boundary. */
-static int gxm_batch_flush_worker(unsigned reason) {
+ * submission end and on every API/resource boundary. The outer wrapper is the
+ * single span owner; every early return in the implementation is balanced. */
+static int gxm_batch_flush_worker_impl(unsigned reason) {
     uint64_t t_start, t_end = 0u, t_notify = 0u, t_finished = 0u;
     unsigned pending, committed, i;
     int rc;
@@ -8342,6 +8705,13 @@ static int gxm_batch_flush_worker(unsigned reason) {
         if (rc < 0) return rc;
     }
     return 0;
+}
+
+static int gxm_batch_flush_worker(unsigned reason) {
+    uint64_t fc = vp_gxm_frame_cost_category_begin(VP_FRAME_COST_GXM_FLUSH);
+    int rc = gxm_batch_flush_worker_impl(reason);
+    vp_gxm_frame_cost_category_end(VP_FRAME_COST_GXM_FLUSH, fc);
+    return rc;
 }
 
 /* ---- Deep texture-pool GPU backing and drain --------------------------- */
@@ -11508,6 +11878,7 @@ frame_fail:
 
 static int frame_draw_internal(VPGxmDrawRequest *req) {
     int rc;
+    uint64_t fc = vp_gxm_frame_cost_category_begin(VP_FRAME_COST_GXM_DRAW);
     /* Owned-source associations persist across draws; the decoder retires them
      * at the actual rewrite/free event (vp_gxm_texture_owned_retire). */
     gxm_draw_trace(req);
@@ -11540,6 +11911,7 @@ static int frame_draw_internal(VPGxmDrawRequest *req) {
             (void)gxm_batch_flush_worker(GXM_BATCH_REASON_FAILURE);
         }
     }
+    vp_gxm_frame_cost_category_end(VP_FRAME_COST_GXM_DRAW, fc);
     return rc;
 }
 
@@ -11812,7 +12184,10 @@ static int frame_clear_internal_impl(VPGxmClearRequest *req, int allow_defer) {
  * the mode-6 asynchronous record; only the worker dispatch below passes
  * allow_defer. */
 static int frame_clear_internal(VPGxmClearRequest *req) {
-    return frame_clear_internal_impl(req, 0);
+    uint64_t fc = vp_gxm_frame_cost_category_begin(VP_FRAME_COST_GXM_CLEAR);
+    int rc = frame_clear_internal_impl(req, 0);
+    vp_gxm_frame_cost_category_end(VP_FRAME_COST_GXM_CLEAR, fc);
+    return rc;
 }
 
 static int frame_finish_internal(void) {
@@ -12519,7 +12894,12 @@ static unsigned gxm_worker_process(void) {
         /* All clear requests (external worker dispatch and the worker-local
          * route) share one admission decision. A refused request keeps the
          * original synchronous clear boundary inside frame_clear_internal. */
-        clear->rc = frame_clear_internal_impl(clear, 1);
+        {
+            uint64_t fc = vp_gxm_frame_cost_category_begin(
+                VP_FRAME_COST_GXM_CLEAR);
+            clear->rc = frame_clear_internal_impl(clear, 1);
+            vp_gxm_frame_cost_category_end(VP_FRAME_COST_GXM_CLEAR, fc);
+        }
         gxm_pending_clear = NULL;
     } else if (gxm_pending_finish) {
         int flush_rc = 0;
@@ -12561,6 +12941,7 @@ static unsigned gxm_worker_process(void) {
             uint64_t draw_finished, draw_elapsed;
             unsigned perf_kind;
             req->rc = frame_draw_internal(req);
+            uint64_t tail_fc = vp_gxm_frame_cost_category_begin(VP_FRAME_COST_WORKER_TAIL);
             draw_finished = gxm_prof_now();
             draw_elapsed = draw_finished - draw_started;
             if (req->batch_encoded) {
@@ -12608,6 +12989,7 @@ static unsigned gxm_worker_process(void) {
                     static_log_stats();
             }
             }
+            vp_gxm_frame_cost_category_end(VP_FRAME_COST_WORKER_TAIL, tail_fc);
             gxm_pending = NULL;
         } else {
             int flush_rc = 0;

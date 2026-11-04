@@ -60,6 +60,7 @@ add_executable(vita_port_native_loader
     src/platform/engine_state.c
     src/platform/engine_queue_native.c
     src/platform/engine_full.c
+    src/platform/frame_cost_profile.c
     src/platform/gxm_depth.c
     src/platform/gxm_depth_clear_native.c
     src/platform/gxm_depth_view.c

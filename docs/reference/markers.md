@@ -46,6 +46,13 @@ Marker 是 `ux0:data/mhgu-vita-port/` 下的空文件或短文本文件。运行
 | Marker | 作用 |
 |---|---|
 | `play-perf.enable` | 启用逐帧/服务计时；关闭时计时字段为 0 |
+| `frame-cost.enable` | 启用独立的 GXM worker 帧成本分解计时。不存在时不做持续轮询/取时钟；存在时才在完整 decoder-entry 边界读取控制文件。默认关闭，见 ADR 0027 |
+| `frame-cost-mode.txt` | `frame-cost.enable` 存在时的控制文件（不是 marker）：内容必须恰好是 `0` 或 `1`，允许尾部空白。`0` 保持同样的边界轮询频率但不建 span；`1` 启用 span。缺失或非法时显式记录 control error 并禁用本进程数据。切换只在 span 栈为空时发生，记录 epoch/mode/time |
+| `VP_FRAME_COST_SNAPSHOT_BEGIN/ROW/END` | 仅 mode 1：每 32 个 present 输出同一身份的完整累计快照；最终 schema 3 为 22 类，另有同端点 GXM/纹理细分。关闭时补最后闭合快照。缺行、错误、倒退、self/root 不对账均拒绝；见 ADR 0027 |
+| `VP_FRAME_COST_POINT` / `VP_FRAME_COST_EPOCH` / `VP_FRAME_COST_CONTROL` | mode 0/1 切换、epoch 端点、marker 删除和控制错误的显式记录；不包括成本 span |
+| `VP_FRAME_COST_ROOT` | 闭合 worker 根调用的起止 journal；区间和必须等于同端点 root 累计差。用于和原游戏区间求并集，不能跨线程相加 |
+| `frame-resource-audit.enable` | 默认关；与 frame-cost 一起启用，每个 mode-1 epoch 的前 16 个 present 范围记录纹理完整 key/长度/真实查询结果，不写像素。不纳入正式性能窗口；首尾不完整帧由分析器排除 |
+| `game-cost.enable` | 默认关；安装四个原游戏 A32 函数观测钩子，保留原函数，记录嵌套与平台桥墙钟。入口、原字节、范围和 ABI 见 `config/patch-plans/game-cost.json`、ADR 0028 |
 | `VP_GPU_WAIT` / `VP_GPU_WAIT_TOTAL` | play-perf 下每 32 个 present 输出完整 28 原因累计快照；记录真实通知等待、poll 命中、失败、阻塞时间及粗直方图，与原全局通知计时对账。mode 6 的 clear-materialize 等待单列一行。用 `analyze_gpu_wait.py` 做完整快照端点差分；不是 GPU 硬件执行时间 |
 | `draw-trace.enable` | draw 跟踪 |
 | `vtx-dump.enable` | 顶点 dump |

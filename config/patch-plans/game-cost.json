@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "module": "main",
+  "source_sha256": "b3935415499549adaf4c0e89822831daa175cfd456a7990791c79be3997645ef",
+  "build_id": "fb08f1d20fd1204fe7070672777f869b00000000000000000000000000000000",
+  "marker": "ux0:data/mhgu-vita-port/game-cost.enable",
+  "default_enabled": false,
+  "purpose": "Measure original A32 render functions without replacing their bodies",
+  "sites": [
+    {"id": 0, "offset": "0x3da8fc", "guard_bytes": 1672, "original_word": "e92d4ff0", "sha256": "8b5f4df7baf5038cbce56497b87b71c8de40779fdea3c64179ee573ec8fdd749"},
+    {"id": 1, "offset": "0xbbe154", "guard_bytes": 1284, "original_word": "e92d4ff0", "sha256": "36d52f82c0048a26998537d64597b65c91d9a01dbfad47afb391c1c0ea1f01fd"},
+    {"id": 2, "offset": "0xbbe66c", "guard_bytes": 388, "original_word": "e92d4ff0", "sha256": "73113068eaf1b2c985cb7a4d8f8c97ad1e5cda4c1c8b482ba7fbbe41b2e5ca86"},
+    {"id": 3, "offset": "0xbc0874", "guard_bytes": 876, "original_word": "e92d41f0", "sha256": "a94873db81179626ef67cc814069fb4831934d590558c9f952952e01a213cac6"}
+  ],
+  "patch_bytes_per_site": 4,
+  "island_bytes_per_site": 20,
+  "veneer": ["e51ff004", "wrapper-address"],
+  "trampoline": ["original-push", "e51ff004", "main-base+site+4"],
+  "abi": "A32 object argument in r0; audited sites do not consume stack arguments. Wrapper saves r4/LR with 8-byte alignment. Host bridge preserves GPR/VFP/FPSCR. r12 selects the site/trampoline and is AAPCS caller-scratch.",
+  "guards": "Loader verifies module identity; patch validates every immutable range and first word before writing any site, then checks alignment, capacity and A32 branch reach. Shared/out-of-line tails are not claimed to be covered by a contiguous guard range.",
+  "limitations": "Wall time includes blocking, platform bridge and scheduling. Per-thread parent/child and worker overlap must be subtracted, not added. Exceptions through probe wrappers and hardware are unverified."
+}

@@ -15,6 +15,10 @@ add_test(NAME engine_prepare_ab_metrics
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_engine_prepare_ab.py")
 add_test(NAME gpu_wait_metrics
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_gpu_wait_metrics.py")
+add_test(NAME frame_cost_metrics
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_frame_cost_metrics.py")
+add_test(NAME game_cost_metrics
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_game_cost_metrics.py")
 
 set(VP_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../src")
 set(VP_INCLUDES
@@ -119,6 +123,7 @@ target_include_directories(clear_defer PRIVATE
 vp_host_test(clear_fusion "${VP_SRC}/platform/gxm_depth.c")
 vp_host_test(engine_mode)
 vp_host_test(float_bits_numeric)
+vp_host_test(frame_cost_profile "${VP_SRC}/platform/frame_cost_profile.c")
 vp_host_test(gpu_command_buffer "${VP_SRC}/platform/gpu_stream.c")
 vp_host_test(gpu_effective_rt "${VP_SRC}/platform/gpu_stream.c")
 vp_host_test(gpu_indices)

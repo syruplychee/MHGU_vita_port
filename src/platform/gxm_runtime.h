@@ -151,8 +151,24 @@ typedef struct {
      * after tex_decode_us and not folded into it; both are nested in
      * draw_prepare_us. */
     uint64_t tex_update_tail_us;
+    uint64_t tex_family_us[5], tex_family_bytes[5];
+    uint64_t tex_miss_changed, tex_miss_absent, tex_miss_gpu_only;
+    uint64_t tex_compare_bytes, tex_compare_calls;
 } VPGuestFramePerf;
 void vp_guest_frame_perf(VPGuestFramePerf *out);
+
+/* Bounded nested frame-cost profile. All entry points must run on the GXM
+ * worker; other threads do not record spans and must not read the control
+ * file. The boundary poll applies a mode change only while no span is open.
+ * begin/end return the timestamp they captured (0 when profiling is off), so
+ * an inactive run performs no clock call. */
+void vp_gxm_frame_cost_worker_boundary(void);
+int vp_gxm_frame_cost_active(void);
+uint64_t vp_gxm_frame_cost_now(void);
+uint64_t vp_gxm_frame_cost_category_begin(unsigned category);
+void vp_gxm_frame_cost_category_end(unsigned category, uint64_t started_us);
+uint64_t vp_gxm_frame_cost_log_begin(void);
+int vp_gxm_frame_cost_resource_audit(uint64_t *frame);
 
 /* Register every GXP listed in <dir>/index.txt. Returns 0 when all registered. */
 int vp_gxm_shader_register_all(const char *dir, unsigned *files,

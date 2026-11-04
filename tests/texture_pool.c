@@ -630,7 +630,43 @@ static void test_working_set_replaces_cold_large_textures(void) {
     puts("PASS cold large textures yield to a complete mixed-size working set");
 }
 
+static void test_lookup_trace_preserves_versions(void) {
+    Fixture fixture;
+    uint8_t source[100];
+    uint8_t *rgba = NULL;
+    VPTexturePoolKey key = key_for(0x1000u);
+    VPTexturePoolLookupTrace trace;
+    VPTexturePoolToken token, lease;
+    memset(source, 0x23, sizeof(source));
+    fixture_init(&fixture, PAGE * 8u);
+    token = store(&fixture, key.va, source, sizeof(source), 200u, NULL);
+    vp_texture_pool_begin_request(&fixture.pool);
+    assert(vp_texture_pool_lookup_trace(&fixture.pool, &key, source, sizeof(source),
+        &token, &rgba, &trace) == 1);
+    assert(trace.live_keys == 1u && trace.comparisons == 1u);
+    assert(trace.compare_bytes == sizeof(source) && trace.changed == 0u);
+    assert(vp_texture_pool_retain_gpu(&fixture.pool, rgba, &lease) == 1);
+    vp_texture_pool_begin_request(&fixture.pool);
+    source[17] ^= 1u;
+    assert(vp_texture_pool_lookup_trace(&fixture.pool, &key, source, sizeof(source),
+        &token, &rgba, &trace) == 0);
+    assert(trace.changed == 1u && trace.comparisons == 1u);
+    assert(fixture.pool.slots[lease.slot].raw == NULL);
+    assert(vp_texture_pool_gpu_refs(&fixture.pool) == 1u);
+    assert(vp_texture_pool_lookup_trace(&fixture.pool, &key, source, sizeof(source),
+        &token, &rgba, &trace) == 0);
+    assert(trace.gpu_only_keys == 1u && trace.comparisons == 0u && trace.changed == 0u);
+    key.va++;
+    assert(vp_texture_pool_lookup_trace(&fixture.pool, &key, source, sizeof(source),
+        &token, &rgba, &trace) == 0);
+    assert(trace.gpu_only_keys == 0u && trace.live_keys == 0u);
+    assert(vp_texture_pool_release_gpu(&fixture.pool, lease) == 0);
+    fixture_done(&fixture);
+    puts("PASS lookup diagnostics retain exact comparison and GPU version lifetime");
+}
+
 int main(void) {
+    test_lookup_trace_preserves_versions();
     test_reusable_regions();
     test_region_updates_and_kernel_pressure();
     test_pressure_preserves_wrong_size_regions();

@@ -218,14 +218,33 @@ void vp_texture_pool_begin_request(VPTexturePool *pool) {
 int vp_texture_pool_lookup(VPTexturePool *pool, const VPTexturePoolKey *key,
                            const uint8_t *source, size_t raw_bytes,
                            VPTexturePoolToken *token, uint8_t **rgba) {
+    return vp_texture_pool_lookup_trace(pool, key, source, raw_bytes, token, rgba, NULL);
+}
+
+int vp_texture_pool_lookup_trace(VPTexturePool *pool, const VPTexturePoolKey *key,
+                           const uint8_t *source, size_t raw_bytes,
+                           VPTexturePoolToken *token, uint8_t **rgba,
+                           VPTexturePoolLookupTrace *trace) {
+    if (trace) memset(trace, 0, sizeof(*trace));
     if (pool == NULL || key == NULL || source == NULL || raw_bytes == 0u)
         return 0;
     for (unsigned i = 0u; i < VP_TEXTURE_POOL_SLOTS; ++i) {
         VPTexturePoolSlot *slot = &pool->slots[i];
-        if (!slot->used || !slot->live || !slot->raw) continue;
+        if (!slot->used || !slot->live) continue;
+        if (!slot->raw) {
+            if (trace && slot->raw_bytes == raw_bytes && pool_key_equal(&slot->key, key))
+                trace->gpu_only_keys++;
+            continue;
+        }
         if (slot->raw_bytes != raw_bytes || !pool_key_equal(&slot->key, key))
             continue;
+        if (trace) {
+            trace->live_keys++;
+            trace->comparisons++;
+            trace->compare_bytes += raw_bytes;
+        }
         if (!vp_texture_bytes_equal(slot->raw, source, raw_bytes)) {
+            if (trace) trace->changed++;
             /* Only the decoded payload is read by the GPU. Once this exact
              * key has changed, an older GPU-only version needs no raw identity
              * snapshot. Keep its immutable pixels and token until completion,

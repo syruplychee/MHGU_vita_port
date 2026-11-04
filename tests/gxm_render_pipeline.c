@@ -7,6 +7,7 @@
 #include "gxm_runtime.h"
 #include "texture_pipeline.h"
 #include "gpu_wait_profile.h"
+#include "frame_cost_profile.h"
 
 #include <assert.h>
 #include <stdint.h>
@@ -118,6 +119,19 @@ static unsigned test_poison_calls;
 
 static uint64_t gxm_prof_now(void) {
     return ++test_time_now;
+}
+
+/* The extracted pending-scene wait now contains a frame-cost span. This host
+ * fixture exercises completion/lease semantics, not the profiler, so the span
+ * hooks stay inert. */
+uint64_t vp_gxm_frame_cost_category_begin(unsigned category) {
+    (void)category;
+    return 0u;
+}
+
+void vp_gxm_frame_cost_category_end(unsigned category, uint64_t started_us) {
+    (void)category;
+    (void)started_us;
 }
 
 static volatile unsigned *sceGxmGetNotificationRegion(void) {

@@ -77,6 +77,31 @@ VP_HOST_BRIDGE_FUNCTION vp_engine_full_failed, 0x252
  * caller's callee-saved registers. */
 VP_HOST_BRIDGE_FUNCTION vp_engine_full_ab_enter, 0x253
 VP_HOST_BRIDGE_FUNCTION vp_engine_full_ab_leave, 0x254
+VP_HOST_BRIDGE_FUNCTION vp_game_cost_enter, 0x255
+VP_HOST_BRIDGE_FUNCTION vp_game_cost_leave, 0x256
+
+/* Audited A32 functions take their object in r0 and have no stack arguments.
+ * Keep the caller LR/r4 and replay the displaced PUSH through a trampoline.
+ * The bridge preserves GPR/VFP/FPSCR and the original return registers. */
+.macro VP_GAME_COST_ENTRY name, id
+    .balign 4
+    .global \name
+    .type \name,%function
+\name:
+    push {r4,lr}
+    movw ip, #\id
+    bl vp_game_cost_enter
+    blx ip
+    movw ip, #\id
+    bl vp_game_cost_leave
+    pop {r4,lr}
+    bx lr
+    .size \name,.-\name
+.endm
+VP_GAME_COST_ENTRY vp_game_cost_frame, 0
+VP_GAME_COST_ENTRY vp_game_cost_submit, 1
+VP_GAME_COST_ENTRY vp_game_cost_queue, 2
+VP_GAME_COST_ENTRY vp_game_cost_end_frame, 3
 
 /* Full queue replacement: C owns its local state; original caller ABI stays
  * on the guest stack. Failures enter the normal host bridge and stop. The

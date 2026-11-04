@@ -30,6 +30,7 @@
 13. [渲染性能安全迁移：结论、反例与测量教训](13-render-performance-lessons.md)
 14. [村庄黑块：原始代码、GXM 与模拟器的证据边界](14-render-black-block-investigation.md)
 15. [游戏内部渲染提交：公共入口、字段与已实施切片](15-engine-render-submission-plan.md)
+16. [整帧主要成本审计与深层接管依据](16-frame-cost-audit.md)
 
 ## 参考
 
@@ -71,3 +72,5 @@
 - [0024 深纹理解码池与 decoder-owned 直接绑定实验](decisions/0024-deep-texture-pipeline.md)
 - [0025 GPU 通知等待按触发原因计时](decisions/0025-gpu-wait-attribution.md)
 - [0026 延迟 clear 的提交与同步契约](decisions/0026-deferred-clear-sync.md)
+- [0027 GXM worker 有界嵌套帧成本分解计时](decisions/0027-frame-cost-profile.md)
+- [0028 原游戏渲染函数计时与深层接管调查](decisions/0028-original-game-cost-probe.md)

@@ -17,6 +17,7 @@
 #include "engine_submit_probe.h"
 #include "engine_layout.h"
 #include "engine_full.h"
+#include "gxm_runtime.h"
 #include <stddef.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/kernel/cpu.h>
@@ -102,6 +103,20 @@ static int engine_full_ab_enabled;
 static uint32_t engine_full_ab_trampoline;
 static uint32_t engine_submit_replay;
 static uint32_t engine_submit_leave_replay;
+#define VP_GAME_COST_SITES 4u
+#define VP_GAME_COST_DEPTH 16u
+extern void vp_game_cost_frame(void), vp_game_cost_submit(void);
+extern void vp_game_cost_queue(void), vp_game_cost_end_frame(void);
+static int game_cost_enabled;
+static uint32_t game_cost_trampolines[VP_GAME_COST_SITES];
+typedef struct {
+    uint64_t started, child_us, bridge_us, bridge_calls;
+    uint32_t site, context, caller, presents;
+} VPGameCostSpan;
+typedef struct {
+    VPGameCostSpan stack[VP_GAME_COST_DEPTH];
+    unsigned depth;
+} VPGameCostThread;
 /* Same-process A/B accounting. entry_us/t_us use the process clock on the host
  * side; command is the root context's command buffer and before/after are its
  * write offsets. mode is the mode selected when this call entered, so a control
@@ -132,6 +147,7 @@ typedef struct {
     unsigned movie_color_samples;
     VPEngineSubmitTiming engine_submit[64];
     VPEnginePrepareTiming engine_prepare[64];
+    VPGameCostThread game_cost[64];
     uint64_t engine_ab_poll_us;
     uint32_t engine_ab_mode;
     unsigned engine_ab_mode_valid;
@@ -702,12 +718,76 @@ static int engine_full_patch(FILE *log,VPNativeModule *m) {
     return rc;
 }
 
+static int game_cost_patch(FILE *log, VPNativeModule *m) {
+    static const struct {
+        uint32_t offset, bytes, first;
+        const char *sha;
+        void (*entry)(void);
+    } sites[VP_GAME_COST_SITES] = {
+        {0x3da8fcu, 0x688u, 0xe92d4ff0u,
+         "8b5f4df7baf5038cbce56497b87b71c8de40779fdea3c64179ee573ec8fdd749", vp_game_cost_frame},
+        {0xbbe154u, 0x504u, 0xe92d4ff0u,
+         "36d52f82c0048a26998537d64597b65c91d9a01dbfad47afb391c1c0ea1f01fd", vp_game_cost_submit},
+        {0xbbe66cu, 0x184u, 0xe92d4ff0u,
+         "73113068eaf1b2c985cb7a4d8f8c97ad1e5cda4c1c8b482ba7fbbe41b2e5ca86", vp_game_cost_queue},
+        {0xbc0874u, 0x36cu, 0xe92d41f0u,
+         "a94873db81179626ef67cc814069fb4831934d590558c9f952952e01a213cac6", vp_game_cost_end_frame}
+    };
+    FILE *marker = fopen("ux0:data/mhgu-vita-port/game-cost.enable", "rb");
+    game_cost_enabled = marker != NULL;
+    if (marker) fclose(marker);
+    fprintf(log, "GAME_COST_MODE enabled=%d sites=%u\n", game_cost_enabled, VP_GAME_COST_SITES);
+    if (!game_cost_enabled) return 0;
+    /* Validate every immutable range before writing any site. The module
+     * identity has already passed the loader's locked input checks. */
+    const char *digits = "0123456789abcdef";
+    for (unsigned i = 0; i < VP_GAME_COST_SITES; ++i) {
+        unsigned char sha[32];
+        if (sites[i].offset > m->nso.span ||
+            sites[i].bytes > m->nso.span - sites[i].offset) return VP_PATCH_RANGE;
+        if (word(m->image + sites[i].offset) != sites[i].first) return VP_PATCH_BINDING;
+        vp_sha256(m->image + sites[i].offset, sites[i].bytes, sha);
+        for (unsigned j = 0; j < 32u; ++j)
+            if (digits[sha[j] >> 4] != sites[i].sha[j * 2u] ||
+                digits[sha[j] & 15u] != sites[i].sha[j * 2u + 1u]) return VP_PATCH_BINDING;
+    }
+    if (m->island_offset > m->capacity ||
+        m->island_bytes > m->capacity - m->island_offset) return VP_PATCH_RANGE;
+    uint32_t off = m->island_offset + m->island_bytes;
+    if ((off & 3u) || 20u * VP_GAME_COST_SITES > m->capacity - off) return VP_PATCH_RANGE;
+    for (unsigned i = 0; i < VP_GAME_COST_SITES; ++i) {
+        int64_t delta = (int64_t)(off + 20u * i) - sites[i].offset - 8;
+        if (delta < -(int64_t)VP_PATCH_BRANCH_REACH || delta >= VP_PATCH_BRANCH_REACH)
+            return VP_PATCH_REACH;
+    }
+    VPPatchTarget target;
+    int rc = vp_patch_open(&target, m->image, m->nso.span, m->base);
+    if (rc) return rc;
+    for (unsigned i = 0; i < VP_GAME_COST_SITES; ++i) {
+        uint32_t at = off + 20u * i;
+        uint32_t code[5] = {0xe51ff004u, (uint32_t)(uintptr_t)sites[i].entry,
+            sites[i].first, 0xe51ff004u, m->base + sites[i].offset + 4u};
+        memcpy(m->image + at, code, sizeof(code));
+        game_cost_trampolines[i] = m->base + at + 8u;
+        rc = vp_patch_site(&target, sites[i].offset, sites[i].first, m->base + at);
+        fprintf(log, "GAME_COST_PATCH id=%u site=0x%x bytes=4 original=%08x "
+            "island=[0x%x,0x%x) trampoline=0x%x return=0x%x branch_delta=%lld status=%d\n",
+            i, sites[i].offset, sites[i].first, m->base + at, m->base + at + 20u,
+            game_cost_trampolines[i], code[4], (long long)at - sites[i].offset - 8, rc);
+        if (rc) return rc;
+    }
+    m->island_bytes += 20u * VP_GAME_COST_SITES;
+    return 0;
+}
+
 int vp_sdk_dso_patch(FILE *log,VPNativeModule modules[4]) {
     int engine_rc=engine_submit_probe_patch(log,&modules[1]);
     if (engine_rc) return engine_rc;
     engine_rc=engine_layout_patch(log,modules);
     if (engine_rc) return engine_rc;
     engine_rc=engine_full_patch(log,&modules[1]);
+    if (engine_rc) return engine_rc;
+    engine_rc=game_cost_patch(log,&modules[1]);
     if (engine_rc) return engine_rc;
     int color_rc=movie_color_probe_patch(log,&modules[2]);
     if (color_rc) {
@@ -1313,8 +1393,96 @@ static int engine_prepare_ab_service(Session *s,VPExecutor *e,VPBridgeFrame *f) 
     return 0;
 }
 
-static int dispatch_locked(VPExecutor *e,VPBridgeFrame *f) {
+static int game_cost_service(Session *s, VPExecutor *e, VPBridgeFrame *f) {
+    if (!game_cost_enabled) return VP_BRIDGE_UNSUPPORTED;
+    unsigned site = f->regs[12];
+    if (site >= VP_GAME_COST_SITES) return VP_BRIDGE_ARGUMENT;
+    VPGuestThread *thread = thread_for_executor(e);
+    unsigned slot;
+    if (e == s->main_executor) slot = 0u;
+    else if (thread && thread->handle && thread >= thread_pool.threads &&
+        (unsigned)(thread - thread_pool.threads) < VP_GUEST_THREAD_LIMIT)
+        slot = 1u + (unsigned)(thread - thread_pool.threads);
+    else return VP_BRIDGE_ARGUMENT;
+    VPGameCostThread *cost = &s->game_cost[slot];
+    uint64_t now = sceKernelGetProcessTimeWide();
+    if (f->service == 0x255u) {
+        if (cost->depth == VP_GAME_COST_DEPTH ||
+            !vp_guest_svc_readable(&s->svc, f->sp, 8u)) {
+            fprintf(s->log, "GAME_COST_ERROR reason=entry slot=%u site=%u depth=%u\n",
+                slot, site, cost->depth);
+            return VP_BRIDGE_ARGUMENT;
+        }
+        VPGameCostSpan *span = &cost->stack[cost->depth++];
+        span->started = now;
+        span->child_us = 0u;
+        span->bridge_us = span->bridge_calls = 0u;
+        span->site = site;
+        span->context = f->regs[0];
+        span->caller = word((void *)(uintptr_t)(f->sp + 4u));
+        span->presents = engine_prepare_presents(s);
+        f->regs[12] = game_cost_trampolines[site];
+        if (!f->regs[12]) return VP_BRIDGE_ARGUMENT;
+        return 0;
+    }
+    if (!cost->depth || cost->stack[cost->depth - 1u].site != site) {
+        fprintf(s->log, "GAME_COST_ERROR reason=leave slot=%u site=%u depth=%u\n",
+            slot, site, cost->depth);
+        return VP_BRIDGE_ARGUMENT;
+    }
+    VPGameCostSpan span = cost->stack[--cost->depth];
+    if (now < span.started || now - span.started < span.child_us + span.bridge_us) {
+        fprintf(s->log, "GAME_COST_ERROR reason=clock slot=%u site=%u\n", slot, site);
+        return VP_BRIDGE_ARGUMENT;
+    }
+    uint64_t elapsed = now - span.started;
+    if (cost->depth) cost->stack[cost->depth - 1u].child_us += elapsed;
+    fprintf(s->log, "GAME_COST_TIME site=%u slot=%u thread=0x%x depth=%u "
+        "context=0x%x caller=0x%x entry_us=%llu t_us=%llu incl_us=%llu self_us=%llu "
+        "bridge_us=%llu bridge_calls=%llu presents_before=%u presents_after=%u\n", site, slot, s->svc.current_thread_handle,
+        cost->depth, span.context, span.caller, (unsigned long long)span.started,
+        (unsigned long long)now, (unsigned long long)elapsed,
+        (unsigned long long)(elapsed - span.child_us),
+        (unsigned long long)span.bridge_us, (unsigned long long)span.bridge_calls,
+        span.presents, engine_prepare_presents(s));
+    return 0;
+}
+
+static int dispatch_locked_body(VPExecutor *e,VPBridgeFrame *f);
+
+/* Original-function self wall includes calls into the platform bridge. Account
+ * these separately on the active innermost original span. This is wall time,
+ * including blocking/worker handoff; subtraction is not a CPU-cycle claim. */
+static int dispatch_locked(VPExecutor *e, VPBridgeFrame *f) {
+    Session *s = e->user;
+    VPGameCostThread *cost = NULL;
+    if (game_cost_enabled && f->service != 0x255u && f->service != 0x256u) {
+        if (e == s->main_executor) cost = &s->game_cost[0];
+        else {
+            VPGuestThread *thread = thread_for_executor(e);
+            if (thread && thread->handle && thread >= thread_pool.threads &&
+                (unsigned)(thread - thread_pool.threads) < VP_GUEST_THREAD_LIMIT)
+                cost = &s->game_cost[1u + (unsigned)(thread - thread_pool.threads)];
+        }
+    }
+    unsigned depth = cost ? cost->depth : 0u;
+    uint64_t started = depth ? sceKernelGetProcessTimeWide() : 0u;
+    int rc = dispatch_locked_body(e, f);
+    if (started) {
+        uint64_t ended = sceKernelGetProcessTimeWide();
+        if (cost->depth != depth || ended < started) {
+            fprintf(s->log, "GAME_COST_ERROR reason=bridge-depth-or-clock depth=%u\n", depth);
+            return VP_BRIDGE_ARGUMENT;
+        }
+        cost->stack[depth - 1u].bridge_us += ended - started;
+        cost->stack[depth - 1u].bridge_calls++;
+    }
+    return rc;
+}
+
+static int dispatch_locked_body(VPExecutor *e,VPBridgeFrame *f) {
     Session *s=e->user;
+    if (f->service==0x255u || f->service==0x256u) return game_cost_service(s,e,f);
     if (f->service==0x252u) {
         fprintf(s->log,"ENGINE_FULL_FATAL rc=%d\n",(int32_t)f->regs[0]);
         vp_engine_full_report(s->log);

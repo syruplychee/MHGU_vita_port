@@ -41,6 +41,12 @@ typedef struct {
     uint32_t generation;
 } VPTexturePoolToken;
 
+/* Optional read-only lookup observations. compare_bytes is the requested
+ * comparison length, not the number of bytes read before an early mismatch. */
+typedef struct {
+    uint64_t live_keys, gpu_only_keys, comparisons, compare_bytes, changed;
+} VPTexturePoolLookupTrace;
+
 enum {
     VP_TEXTURE_POOL_STORE_OK = 1,
     /* No evictable slot exists, but at least one GPU-referenced slot could
@@ -132,6 +138,10 @@ void vp_texture_pool_begin_request(VPTexturePool *pool);
 int vp_texture_pool_lookup(VPTexturePool *pool, const VPTexturePoolKey *key,
                            const uint8_t *source, size_t raw_bytes,
                            VPTexturePoolToken *token, uint8_t **rgba);
+int vp_texture_pool_lookup_trace(VPTexturePool *pool, const VPTexturePoolKey *key,
+                           const uint8_t *source, size_t raw_bytes,
+                           VPTexturePoolToken *token, uint8_t **rgba,
+                           VPTexturePoolLookupTrace *trace);
 
 /* Reserve payload ranges and a slot for new content. The slot is not visible
  * to lookups until commit. On VP_TEXTURE_POOL_STORE_PRESSURE the caller may
