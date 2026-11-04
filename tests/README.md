@@ -12,7 +12,8 @@ cmake --build build/host-tests -j
 ctest --test-dir build/host-tests --output-on-failure
 ```
 
-- Windows：28 项（27 项跨平台测试 + `session_gate`）。
+- Windows：40 项 CTest（38 项跨平台，含 3 项 Python 工具回归；另加
+  `session_gate`、`runtime_main_window` 两项 Windows 专用）。
 - Linux/WSL：额外 4 项 POSIX 测试（`audio_auto_catchup`、`audio_wave_progress`、
   `guest_storage`、`log_sink`）。
 - Python 工具回归：`test_movie_timing.py`、`test_movie_color_timing.py`（unittest）。

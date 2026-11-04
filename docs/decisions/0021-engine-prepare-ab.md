@@ -91,9 +91,10 @@ caller LR 后 `bx lr`，保持原 caller ABI。
 
 控制文件：`ux0:data/mhgu-vita-port/engine-full-mode.txt`。
 
-- 内容必须恰好是一个 `0`、`1` 或 `2`，允许尾部空白（空格、制表符、换行、CR、VT、FF）；
+- 内容必须恰好是一个 `0`、`1`、`2` 或 `3`，允许尾部空白（空格、制表符、换行、CR、VT、FF）；
   其他内容非法。
-- `0` = 原 root，`1` = 基础 C，`2` = 优化 C（ADR 0022）。
+- `0` = 原 root，`1` = 基础 C，`2` = 优化 C（ADR 0022），`3` = shared
+  （ADR 0023：与 `0` 相同的原 root trampoline，只启用下游共享准备）。
 - A/B 启用时缺失或非法会显式失败，不回退到任一模式。普通非 A/B 运行不读取该文件。
   补丁写入前先校验一次，运行时每次轮询再校验；两处都遵循同一格式。
 - 轮询在 host 侧、Session 锁下执行，最多每 500000 µs 一次；文件 I/O 在
@@ -120,7 +121,9 @@ ENGINE_PREPARE_TIME mode=original|native thread=... context=... entry_us=...
   t_us=... elapsed_us=... encoded_bytes=... growth=0|1 presents=...
 ```
 
-时间均为游戏进程时钟 `sceKernelGetProcessTimeWide` 微秒。框架产生 `original`／`native`／`fast`，每段固定选择一条完整 root 路径。
+时间均为游戏进程时钟 `sceKernelGetProcessTimeWide` 微秒。框架产生
+`original`／`native`／`fast`／`shared`，每段固定选择一条完整 root 路径；`shared`
+与 `original` 使用同一原 root，只额外启用下游共享准备（ADR 0023）。
 
 ### 6. 分析器与判定边界
 

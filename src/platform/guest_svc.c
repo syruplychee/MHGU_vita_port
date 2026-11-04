@@ -37,6 +37,14 @@ static int svc_play_perf_enabled(void) {
     return enabled;
 }
 
+/* Published by the host-side A/B control poll before the root timestamp.
+ * Draw preparation reads only this atomic flag; it never opens the control
+ * file. */
+static int shared_prepare_enabled(void) {
+    return __atomic_load_n(&vp_engine_shared_prepare_enabled,
+                           __ATOMIC_ACQUIRE) != 0u;
+}
+
 /* Only request headers are sampled. Result/error records, GPU rejects,
  * savedata, input receipts and periodic performance summaries remain intact.
  * Keep the first eight and every 256th header of each kind for correlation. */
@@ -2771,19 +2779,51 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
                  s->value[0x4d5u], s->value[0x4d6u]);
         }
     }
+    int shared_prepare = shared_prepare_enabled();
+    VPGxmShaderResourcePlan fs_plan;
+    VPGxmShaderResourcePlan vs_plan;
+    int fs_plan_rc = 1;
+    int vs_plan_rc = 1;
+    int vertex_declared = 0;
+    int use_fs_plan = 0;
     for (unsigned c=0;c<VP_TEXTURE_CACHE_SLOTS;c++) texture_cache[c].pins=0;
     {
-        int primary_declared =
-            vp_gxm_shader_has_fragment_sampler(req.fs_token,
-                                               req.viewport_transform,0u);
-        int resources_active =
-            primary_declared ? vp_gxm_static_resources_active() : 0;
+        int primary_declared;
+        int resources_active;
         VPResourceTexture primary_layout;
         int primary_layout_rc = 0;
         unsigned handle_offset = 32u;
+        if (shared_prepare) {
+            fs_plan_rc = vp_gxm_shader_resource_plan(
+                req.fs_token,4u,req.viewport_transform,&fs_plan);
+            if (fs_plan_rc == 0) {
+                use_fs_plan = 1;
+            } else {
+                static unsigned shared_plan_fallback_logs;
+                if (shared_plan_fallback_logs++ < 8u)
+                    slog(ctx->svc,"VP_GXM_SHARED_PLAN_FALLBACK stage=fragment "
+                         "token=0x%x rc=%d action=legacy-per-slot\n",
+                         req.fs_token,fs_plan_rc);
+            }
+        }
+        if (use_fs_plan) {
+            primary_declared = (fs_plan.declared_mask & 1u) != 0u;
+            resources_active = primary_declared ? fs_plan.resources_active : 0;
+        } else {
+            primary_declared = vp_gxm_shader_has_fragment_sampler(
+                req.fs_token,req.viewport_transform,0u);
+            resources_active = primary_declared
+                                   ? vp_gxm_static_resources_active() : 0;
+        }
         if (primary_declared && resources_active != 0) {
-            primary_layout_rc = vp_gxm_shader_resource(
-                req.fs_token,4u,req.viewport_transform,0u,&primary_layout);
+            if (use_fs_plan) {
+                primary_layout_rc = fs_plan.slots[0].layout_rc;
+                if (primary_layout_rc == 0)
+                    primary_layout = fs_plan.slots[0].layout;
+            } else {
+                primary_layout_rc = vp_gxm_shader_resource(
+                    req.fs_token,4u,req.viewport_transform,0u,&primary_layout);
+            }
             if (primary_layout_rc == 0)
                 handle_offset = primary_layout.offset;
         }
@@ -2967,13 +3007,26 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
             int layout_rc=0;
             VPResourceTexture layout;
             VPGxmExtraTexture *extra=&req.extra_textures[e];
-            if (!vp_gxm_shader_has_fragment_sampler(req.fs_token,req.viewport_transform,e+1u))
-                continue;
-            resources_active=vp_gxm_static_resources_active();
-            if (resources_active != 0) {
-                layout_rc=vp_gxm_shader_resource(req.fs_token,4u,
-                    req.viewport_transform,e+1u,&layout);
-                if (layout_rc == 0) handle_offset=layout.offset;
+            if (use_fs_plan) {
+                if ((fs_plan.declared_mask & (1u << (e + 1u))) == 0u)
+                    continue;
+                resources_active=fs_plan.resources_active;
+                if (resources_active != 0) {
+                    layout_rc=fs_plan.slots[e+1u].layout_rc;
+                    if (layout_rc == 0) layout=fs_plan.slots[e+1u].layout;
+                    if (layout_rc == 0) handle_offset=layout.offset;
+                }
+            } else {
+                if (!vp_gxm_shader_has_fragment_sampler(req.fs_token,
+                                                        req.viewport_transform,
+                                                        e+1u))
+                    continue;
+                resources_active=vp_gxm_static_resources_active();
+                if (resources_active != 0) {
+                    layout_rc=vp_gxm_shader_resource(req.fs_token,4u,
+                        req.viewport_transform,e+1u,&layout);
+                    if (layout_rc == 0) handle_offset=layout.offset;
+                }
             }
             if (resources_active < 0 ||
                 (resources_active > 0 && layout_rc != 0)) {
@@ -3122,21 +3175,44 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
                      (unsigned)plane.storage);
         }
     }
-    if (vp_gxm_shader_has_vertex_sampler(req.vs_token,req.viewport_transform,0u)) {
+    if (shared_prepare) {
+        vs_plan_rc = vp_gxm_shader_resource_plan(
+            req.vs_token,0u,req.viewport_transform,&vs_plan);
+        if (vs_plan_rc == 0) {
+            vertex_declared = (vs_plan.declared_mask & 1u) != 0u;
+        } else {
+            static unsigned shared_vertex_plan_logs;
+            if (shared_vertex_plan_logs++ < 8u)
+                slog(ctx->svc,"VP_GXM_SHARED_PLAN_FALLBACK stage=vertex "
+                     "token=0x%x rc=%d action=legacy-per-slot\n",
+                     req.vs_token,vs_plan_rc);
+        }
+    }
+    if (vs_plan_rc != 0)
+        vertex_declared = vp_gxm_shader_has_vertex_sampler(
+            req.vs_token,req.viewport_transform,0u);
+    if (vertex_declared) {
         VPGpuTextureInfo vertex_tex;
         uint32_t source=0;
         VPGxmExtraTexture *extra=&req.vertex_texture;
         int resolve_rc=-1;
         const char *vertex_reason=NULL;
         unsigned vertex_upload=0u;
-        int resources_active=vp_gxm_static_resources_active();
+        int use_vs_plan = vs_plan_rc == 0;
+        int resources_active = use_vs_plan ? vs_plan.resources_active
+                                           : vp_gxm_static_resources_active();
         int layout_rc=0;
         VPResourceTexture layout;
         unsigned handle_offset=32u;
         memset(&vertex_tex,0,sizeof(vertex_tex));
         if (resources_active != 0) {
-            layout_rc=vp_gxm_shader_resource(req.vs_token,0u,
-                req.viewport_transform,0u,&layout);
+            if (use_vs_plan) {
+                layout_rc=vs_plan.slots[0].layout_rc;
+                if (layout_rc == 0) layout=vs_plan.slots[0].layout;
+            } else {
+                layout_rc=vp_gxm_shader_resource(req.vs_token,0u,
+                    req.viewport_transform,0u,&layout);
+            }
             if (layout_rc == 0) handle_offset=layout.offset;
         }
         if (resources_active < 0 ||

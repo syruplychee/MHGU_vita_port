@@ -13,6 +13,7 @@
 #include "log_sink.h"
 #include "gxm_sampler_slots.h"
 #include "gxm_resource_layout.h"
+#include "gxm_shader_plan.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -170,6 +171,14 @@ int vp_gxm_static_resources_active(void);
 int vp_gxm_shader_resource(unsigned token, unsigned gpu_stage,
                            unsigned viewport_transform, unsigned slot,
                            VPResourceTexture *out);
+/* One bounded plan for a whole stage: all tex0..tex4 declarations, the current
+ * resources-active state and each declared slot's original shader_resource
+ * return. Returns 0 on success; -1 for bad arguments; -3 when no static index
+ * is active (the caller must use the legacy per-slot path). The plan contains
+ * value copies only and is invalidated by resident/index generation changes. */
+int vp_gxm_shader_resource_plan(unsigned token, unsigned gpu_stage,
+                                unsigned viewport_transform,
+                                VPGxmShaderResourcePlan *out);
 
 typedef struct {
     const void *vertices;

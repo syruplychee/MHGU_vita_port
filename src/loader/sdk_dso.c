@@ -550,15 +550,15 @@ static int engine_layout_patch(FILE *log,VPNativeModule modules[4]) {
     return rc;
 }
 
-/* The A/B control file is host state, never guest memory. Exactly one '0', '1'
- * or '2' is required; trailing whitespace is accepted and any other byte is
- * invalid. Missing and malformed files are distinct so the caller can report
- * the actual failure instead of falling back to a path. */
+/* The A/B control file is host state, never guest memory. Exactly one '0',
+ * '1', '2' or '3' is required; trailing whitespace is accepted and any other
+ * byte is invalid. Missing and malformed files are distinct so the caller can
+ * report the actual failure instead of falling back to a path. */
 static int engine_ab_read_control(uint32_t *mode) {
     FILE *f=fopen(VP_ENGINE_AB_CONTROL_PATH,"rb");
     if (!f) return 1;
     int first=fgetc(f),rc=0;
-    if (first!='0' && first!='1' && first!='2') rc=2;
+    if (first!='0' && first!='1' && first!='2' && first!='3') rc=2;
     if (!rc) {
         int c;
         while ((c=fgetc(f))!=EOF) {
@@ -573,7 +573,7 @@ static int engine_ab_read_control(uint32_t *mode) {
     return rc;
 }
 static const char *engine_ab_mode_name(uint32_t mode) {
-    return mode==2u?"fast":mode==1u?"native":"original";
+    return mode==3u?"shared":mode==2u?"fast":mode==1u?"native":"original";
 }
 
 static int engine_full_patch(FILE *log,VPNativeModule *m) {
@@ -588,6 +588,8 @@ static int engine_full_patch(FILE *log,VPNativeModule *m) {
     if (fast_marker) fclose(fast_marker);
     int enabled=full||ab||fast;
     vp_engine_full_fast_enabled=fast?1u:0u;
+    /* No downstream shared preparation unless mode 3 is selected below. */
+    __atomic_store_n(&vp_engine_shared_prepare_enabled,0u,__ATOMIC_RELEASE);
     fprintf(log,"ENGINE_FULL_MODE enabled=%d ab=%d\n",enabled,ab);
     if (!enabled) {
         engine_full_ab_enabled=0;
@@ -637,6 +639,8 @@ static int engine_full_patch(FILE *log,VPNativeModule *m) {
         }
         fprintf(log,"ENGINE_FULL_AB_MODE control=%s initial=%s\n",
             VP_ENGINE_AB_CONTROL_PATH,engine_ab_mode_name(initial));
+        __atomic_store_n(&vp_engine_shared_prepare_enabled,
+            initial==3u?1u:0u,__ATOMIC_RELEASE);
     }
     if (m->island_offset>m->capacity || m->island_bytes>m->capacity-m->island_offset)
         return VP_PATCH_RANGE;
@@ -1159,12 +1163,17 @@ static int engine_prepare_ab_poll(Session *s,uint64_t now) {
     uint32_t mode=0;
     int rc=engine_ab_read_control(&mode);
     if (rc) {
+        __atomic_store_n(&vp_engine_shared_prepare_enabled,0u,__ATOMIC_RELEASE);
         fprintf(s->log,"ENGINE_PREPARE_CONTROL_ERROR path=%s reason=%s status=%d thread=0x%x\n",
             VP_ENGINE_AB_CONTROL_PATH,rc==1?"missing":"invalid",rc,
             s->svc.current_thread_handle);
         fflush(s->log);
         return VP_BRIDGE_ARGUMENT;
     }
+    /* Publish before the root timestamp so this call's downstream draws and
+     * the elapsed_us interval see the same mode decision. */
+    __atomic_store_n(&vp_engine_shared_prepare_enabled,
+        mode==3u?1u:0u,__ATOMIC_RELEASE);
     if (!s->engine_ab_mode_valid || mode!=s->engine_ab_mode) {
         fprintf(s->log,"ENGINE_PREPARE_PHASE mode=%s t_us=%llu previous=%s thread=0x%x\n",
             engine_ab_mode_name(mode),(unsigned long long)now,
@@ -1216,9 +1225,11 @@ static int engine_prepare_ab_service(Session *s,VPExecutor *e,VPBridgeFrame *f) 
             return VP_BRIDGE_ARGUMENT;
         }
         uint32_t mode=s->engine_ab_mode;
+        /* Modes 0 and 3 both execute the original root trampoline; only 3
+         * turns on the downstream shared preparation published above. */
         uint32_t target=mode==2u?(uint32_t)(uintptr_t)vp_engine_full_run_fast:
             mode==1u?(uint32_t)(uintptr_t)vp_engine_full_run:engine_full_ab_trampoline;
-        if (!s->engine_ab_mode_valid || mode>2u || !target) {
+        if (!s->engine_ab_mode_valid || mode>3u || !target) {
             fprintf(s->log,"ENGINE_PREPARE_ENTER_ERROR slot=%u thread=0x%x reason=target mode=%u target=0x%08x\n",
                 slot,s->svc.current_thread_handle,mode,target);
             fflush(s->log);
@@ -1243,9 +1254,10 @@ static int engine_prepare_ab_service(Session *s,VPExecutor *e,VPBridgeFrame *f) 
         fflush(s->log);
         return VP_BRIDGE_ARGUMENT;
     }
-    /* Only the native C body has a declared result. The original root may
-     * return any r0 and its callers do not consume it. */
-    if (t->mode && f->regs[0]) {
+    /* Only the native C bodies (modes 1 and 2) declare a result. The original
+     * root trampoline is used by modes 0 and 3; its callers do not consume r0,
+     * so any value is valid there. */
+    if ((t->mode==1u || t->mode==2u) && f->regs[0]) {
         fprintf(s->log,"ENGINE_FULL_FATAL rc=%d\n",(int32_t)f->regs[0]);
         vp_engine_full_report(s->log);
         fflush(s->log);

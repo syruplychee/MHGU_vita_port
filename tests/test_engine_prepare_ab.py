@@ -19,8 +19,9 @@ ELAPSED = {
     "original": [100, 110, 120, 130, 140, 150, 160, 170, 180, 190],
     "native": [50, 60, 70, 80, 90, 100, 110, 120, 130, 140],
     "fast": [75, 85, 95, 105, 115, 125, 135, 145, 155, 165],
+    "shared": [95, 105, 115, 125, 135, 145, 155, 165, 175, 185],
 }
-ENCODED = {"original": 100, "native": 200, "fast": 150}
+ENCODED = {"original": 100, "native": 200, "fast": 150, "shared": 120}
 
 
 def prepare_line(mode, entry_us, elapsed_us, encoded, growth, presents):
@@ -165,6 +166,10 @@ class PrepareAbTests(unittest.TestCase):
             validate_phases(overlap)
         with self.assertRaisesRegex(ValueError, "at least four phases"):
             validate_phases(PHASES[:3])
+        bad_phase = [dict(row) for row in PHASES]
+        bad_phase[1]["mode"] = "4"
+        with self.assertRaisesRegex(ValueError, "unknown mode"):
+            validate_phases(bad_phase)
 
     def test_future_fast_mode_name_is_accepted(self):
         phases = [
@@ -179,11 +184,29 @@ class PrepareAbTests(unittest.TestCase):
         self.assertEqual(report["delta"]["comparison_mode"], "fast")
         self.assertIn("fast", report["aggregate"])
 
+    def test_shared_mode_name_is_accepted(self):
+        phases = [
+            {"mode": "original", "start_us": 1_000_000, "end_us": 4_000_000},
+            {"mode": "shared", "start_us": 4_100_000, "end_us": 7_100_000},
+            {"mode": "original", "start_us": 7_200_000, "end_us": 10_200_000},
+            {"mode": "shared", "start_us": 10_300_000, "end_us": 13_300_000},
+        ]
+        sdk, gxm = build_case(phases)
+        report = analyze_logs(sdk, gxm, phases, warmup_seconds=1.0)
+        self.assertEqual(report["delta"]["baseline_mode"], "original")
+        self.assertEqual(report["delta"]["comparison_mode"], "shared")
+        self.assertIn("shared", report["aggregate"])
+        self.assertEqual(report["phases"][1]["samples"], 10)
+
     def test_unknown_mode_and_bad_elapsed_rejected(self):
         sdk, gxm = build_case(PHASES)
         bad_mode = sdk.replace("mode=original", "mode=other", 1)
         with self.assertRaisesRegex(ValueError, "unknown preparation mode"):
             analyze_logs(bad_mode, gxm, PHASES, warmup_seconds=1.0)
+        # The runtime accepts only 0..3; a logged mode=4 is not a phase name.
+        mode4 = sdk.replace("mode=original", "mode=4", 1)
+        with self.assertRaisesRegex(ValueError, "unknown preparation mode"):
+            analyze_logs(mode4, gxm, PHASES, warmup_seconds=1.0)
         bad_elapsed = sdk.replace("elapsed_us=100 ", "elapsed_us=101 ", 1)
         with self.assertRaisesRegex(ValueError, "elapsed_us does not match"):
             analyze_logs(bad_elapsed, gxm, PHASES, warmup_seconds=1.0)

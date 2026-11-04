@@ -8,6 +8,10 @@
  * itself is read from assembly and is not changed after the patch is built. */
 extern volatile uint32_t vp_engine_full_profile_enabled;
 extern volatile uint32_t vp_engine_full_fast_enabled;
+/* Published by the host-side A/B control poll before the root entry
+ * timestamp. Nonzero only while mode 3 ("shared") is selected; downstream
+ * draw preparation reads this atomic flag and never touches the control file. */
+extern volatile uint32_t vp_engine_shared_prepare_enabled;
 
 int vp_engine_full_init(uint32_t main_base);
 int vp_engine_full_run(uint32_t context);

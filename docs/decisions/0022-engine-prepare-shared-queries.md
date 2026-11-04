@@ -6,7 +6,8 @@
 
 沿用原队列、材质、骨骼、网格、纹理、shader 和绘制顺序。新的
 `engine-full-fast.enable` 可单独启用优化的完整接管；A/B 控制 0=原函数、1=基础 C、
-2=优化 C。没有启用 marker 的正常路径不变，不替换本机无黑块稳定包。
+2=优化 C（后续 3=shared 走原 root 并启用下游共享准备，见
+[ADR 0023](0023-shared-downstream-prepare.md)，本 ADR 的 C 路径在 mode 3 下关闭）。没有启用 marker 的正常路径不变，不替换本机无黑块稳定包。
 优化／A/B 与 `VITA_PORT_ENGINE_CAPTURE` 编译组合显式拒绝；本轮优化检查使用保留了
 全部真实查询返回的旧完整采集作为 oracle，不声称支持只记录省略查询后事件的新采集。
 

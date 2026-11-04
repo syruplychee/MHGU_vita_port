@@ -29,6 +29,16 @@
 两组相邻窗口方向不一致，**仍不认定稳定净提速，默认关闭**。详见
 [ADR 0021](decisions/0021-engine-prepare-ab.md) 与 [ADR 0022](decisions/0022-engine-prepare-shared-queries.md)。
 
+2026-11-04 另增下游 shared 准备实验：已有 A/B 控制文件新增 mode 3（`shared`），仍走
+原游戏 trampoline，只在 `engine-full-ab.enable` 下启用。它用批量 shader 资源计划、
+pair 保存的 blend／uniform 结果和有界 sampler 计划替换重复逐槽准备；旧 API 与 legacy
+路径保留，generation 覆盖 resident 注册／卸载和索引重载。默认关闭，TIC／TSC 读取、
+纹理解码、深度／生产者／阴影检查、所有 setter 与 draw 未替换。宿主 40 项 CTest 与
+Vita VPK 构建通过（L1／L2）。Vita3K 同进程四段对照（L3）中，原路径 352 帧均值
+192.663 ms，共享路径 544 帧均值 191.301 ms，约改善 0.71%；村庄 GPU 采样未发现
+新增黑块，**仍不认定稳定提速，默认关闭**。真机、全部动画帧及流式场景未验证。见
+[ADR 0023](decisions/0023-shared-downstream-prepare.md)。
+
 | 能力 | 证据级别 | 说明 |
 |---|---|---|
 | 四模块 NSO 解码、重定位、导入绑定 | L3 | Vita3K OpenGL 下加载并执行 |

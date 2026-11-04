@@ -1,6 +1,8 @@
 #include "gxm_runtime.h"
 #include "batch_policy.h"
 #include "clear_fusion.h"
+#include "engine_full.h"
+#include "gxm_sampler_plan.h"
 #include "texture_snapshot.h"
 #include "gpu_texture.h"
 #include "gxm_depth.h"
@@ -30,6 +32,25 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* The pure sampler planner uses portable enum values; these assertions keep
+ * them identical to the VitaSDK sampler enums actually passed to GXM. */
+_Static_assert(SCE_GXM_TEXTURE_FILTER_POINT == 0, "sampler point value");
+_Static_assert(SCE_GXM_TEXTURE_FILTER_LINEAR == 1, "sampler linear value");
+_Static_assert(SCE_GXM_TEXTURE_MIP_FILTER_DISABLED == 0, "mip disabled value");
+_Static_assert(SCE_GXM_TEXTURE_MIP_FILTER_ENABLED == 0x200, "mip enabled value");
+_Static_assert((unsigned)SCE_GXM_TEXTURE_ADDR_REPEAT ==
+               (unsigned)VP_GXM_SAMPLER_ADDR_REPEAT, "addr repeat value");
+_Static_assert((unsigned)SCE_GXM_TEXTURE_ADDR_MIRROR ==
+               (unsigned)VP_GXM_SAMPLER_ADDR_MIRROR, "addr mirror value");
+_Static_assert((unsigned)SCE_GXM_TEXTURE_ADDR_CLAMP ==
+               (unsigned)VP_GXM_SAMPLER_ADDR_CLAMP, "addr clamp value");
+_Static_assert((unsigned)SCE_GXM_TEXTURE_ADDR_MIRROR_CLAMP ==
+               (unsigned)VP_GXM_SAMPLER_ADDR_MIRROR_CLAMP,
+               "addr mirror clamp value");
+_Static_assert((unsigned)SCE_GXM_TEXTURE_ADDR_CLAMP_FULL_BORDER ==
+               (unsigned)VP_GXM_SAMPLER_ADDR_CLAMP_FULL_BORDER,
+               "addr border value");
 
 #define VP_GXM_WIDTH 960
 #define VP_GXM_HEIGHT 544
@@ -164,6 +185,15 @@ typedef struct VPStaticPair {
     uint32_t packed_mask;
     uint16_t packed_stream_stride;
     uint32_t blend[6];
+    /* Immutable result of build_blend_info at pair creation. Shared mode reuses
+     * it on later hits instead of converting the same six guest enums again. */
+    SceGxmBlendInfo blend_info;
+    /* Per-stage default-uniform sizes and the face-state condition used by the
+     * batch uniform budget. Pair-held residents cannot be evicted, so these
+     * values stay valid for the pair lifetime. */
+    uint32_t vs_default_uniform_bytes;
+    uint32_t fs_default_uniform_bytes;
+    uint32_t fs_face_state;
     SceGxmVertexProgram *vs;
     SceGxmFragmentProgram *fs;
     const SceGxmProgram *vs_program;
@@ -266,6 +296,26 @@ static void static_pair_hint_set(VPStaticPair *pair, uint32_t vs_token,
 /* VP_HOST_TEST_EXTRACT:pair_hint_end */
 static VPStaticPair *static_current_pair;
 static VPStaticStats static_stats;
+/* Resident/index identity changes bump this generation; every shader-plan
+ * cache entry from an older generation is rejected and rebuilt. */
+static uint32_t static_plan_generation;
+static VPGxmShaderPlanCacheEntry static_plan_cache[VP_GXM_SHADER_PLAN_CACHE_ENTRIES];
+static VPGxmShaderPlanCounts static_plan_counts;
+static unsigned static_plan_stage_calls[2];
+static unsigned static_plan_slot_calls[2][VP_GXM_FRAGMENT_SAMPLER_LIMIT];
+static VPGxmSamplerPlanCacheEntry
+    gxm_sampler_plan_cache[VP_GXM_SAMPLER_PLAN_CACHE_ENTRIES];
+static unsigned gxm_sampler_plan_hits, gxm_sampler_plan_misses;
+/* Counters for the mode-3-only substitutions; they remain zero in modes 0-2. */
+static unsigned static_shared_pair_hits, static_shared_uniform_reuses;
+static unsigned static_shared_blend_reuses;
+static int gxm_shared_prepare_active(void) {
+    return __atomic_load_n(&vp_engine_shared_prepare_enabled,
+                           __ATOMIC_ACQUIRE) != 0u;
+}
+static void static_plan_invalidate(void) {
+    static_plan_generation++;
+}
 static int static_index_load(const char *dir);
 static int static_preload_observed(void);
 static int static_register_bringup(unsigned token);
@@ -2508,8 +2558,10 @@ static int static_index_load(const char *dir) {
     FILE *probe;
     int rc;
 
-    /* A reload can change token/variant/resident identity; no hint survives. */
+    /* A reload can change token/variant/resident identity; no hint or plan
+     * survives. The generation covers entries that are not touched again. */
     static_pair_hint_reset();
+    static_plan_invalidate();
     static_mode = 0;
     static_resources_ready = 0;
     snprintf(path, sizeof(path), "%s/shader-index.bin", dir);
@@ -4271,6 +4323,7 @@ static int depth_func_to_gxm(uint32_t op, SceGxmDepthFunc *out) {
     }
 }
 
+/* VP_HOST_TEST_EXTRACT:blend_ops_begin */
 static int blend_factor_to_gxm(uint32_t factor, SceGxmBlendFactor *out) {
     switch (factor) {
     case 1u: case 0x4000u: *out = SCE_GXM_BLEND_FACTOR_ZERO; return 0;
@@ -4298,6 +4351,7 @@ static int blend_op_to_gxm(uint32_t op, SceGxmBlendFunc *out) {
     default: return -1;
     }
 }
+/* VP_HOST_TEST_EXTRACT:blend_ops_end */
 
 /* VP_HOST_TEST_EXTRACT:color_mask_begin */
 static uint8_t color_mask_to_gxm(uint32_t mask) {
@@ -4310,6 +4364,7 @@ static uint8_t color_mask_to_gxm(uint32_t mask) {
 }
 /* VP_HOST_TEST_EXTRACT:color_mask_end */
 
+/* VP_HOST_TEST_EXTRACT:blend_build_begin */
 static int build_blend_info(const VPGxmDrawRequest *req, SceGxmBlendInfo *info) {
     SceGxmBlendFunc color_func, alpha_func;
     SceGxmBlendFactor color_src, color_dst, alpha_src, alpha_dst;
@@ -4336,6 +4391,7 @@ static int build_blend_info(const VPGxmDrawRequest *req, SceGxmBlendInfo *info) 
     info->alphaDst = alpha_dst;
     return 0;
 }
+/* VP_HOST_TEST_EXTRACT:blend_build_end */
 
 /* Number of sampler parameters declared by a GXP program. NVN may leave a
  * texture bound from an earlier draw even when the current fragment program
@@ -4491,6 +4547,26 @@ static void static_log_stats(void) {
          static_resident_used,
          VP_GXM_RESIDENT_LIMIT, static_resident_bytes,
          VP_GXM_RESIDENT_BYTES, static_stats.resident_peak_bytes);
+    glog("VP_GXM_SHARED_PREP_STATS enabled=%d shader_plan_hits=%u "
+         "shader_plan_misses=%u shader_plan_builds=%u "
+         "shader_plan_invalidations=%u shader_plan_vs=%u shader_plan_fs=%u "
+         "shader_slots_vs=%u,%u,%u,%u,%u shader_slots_fs=%u,%u,%u,%u,%u "
+         "sampler_plan_hits=%u sampler_plan_misses=%u "
+         "pair_prepared_hits=%u uniform_plan_reuses=%u "
+         "blend_plan_reuses=%u generation=%u\n",
+         gxm_shared_prepare_active(), static_plan_counts.hits,
+         static_plan_counts.misses, static_plan_counts.builds,
+         static_plan_counts.invalidations, static_plan_stage_calls[0],
+         static_plan_stage_calls[1],
+         static_plan_slot_calls[0][0], static_plan_slot_calls[0][1],
+         static_plan_slot_calls[0][2], static_plan_slot_calls[0][3],
+         static_plan_slot_calls[0][4],
+         static_plan_slot_calls[1][0], static_plan_slot_calls[1][1],
+         static_plan_slot_calls[1][2], static_plan_slot_calls[1][3],
+         static_plan_slot_calls[1][4],
+         gxm_sampler_plan_hits, gxm_sampler_plan_misses,
+         static_shared_pair_hits, static_shared_uniform_reuses,
+         static_shared_blend_reuses, static_plan_generation);
     static_log_batch_hist();
     glog("VP_GXM_CLEAR_FUSION_STATS deferred=%llu combined_deferred=%llu "
          "in_scene=%llu materialized=%llu blue_first=%llu\n",
@@ -4783,6 +4859,9 @@ static int static_resident_evict_one(void) {
         free(resident->program);
         memset(resident, 0, sizeof(*resident));
         static_resident_used--;
+        /* A previously declared sampler may become unresolved even though no
+         * memory changed; plans must not keep the old declared/reflection. */
+        static_plan_invalidate();
     }
     return 0;
 }
@@ -4901,6 +4980,9 @@ static int static_resident_ensure(uint32_t stage_index, uint16_t variant_index,
         static_stats.resident_peak_bytes = static_resident_bytes;
     static_stats.gxp_loads++;
     static_stats.registrations++;
+    /* A stage that had no resident (and therefore queried as undeclared) can
+     * now declare samplers. Bump before any later draw can consult a plan. */
+    static_plan_invalidate();
     glog("VP_GXM_STATIC_RESIDENT stage=%u variant=%u bytes=%u resident=%u/%u "
          "total_bytes=%u\n", stage_index, variant_index, resident->bytes,
          static_resident_used, VP_GXM_RESIDENT_LIMIT, static_resident_bytes);
@@ -4991,6 +5073,61 @@ int vp_gxm_shader_resource(unsigned token, unsigned gpu_stage,
     if (vp_resource_layout_texture(&static_resources, resource_stage, slot,
                                    out) < 0)
         return -6;
+    return 0;
+}
+
+/* Plan callbacks deliberately call the original query functions. A plan miss
+ * therefore has exactly the legacy return/failure semantics; each later hit
+ * copies value fields and issues no resident lookup again. The query path and
+ * resident registration are serialized by gpu_execution_gate (the decoder
+ * entry holds it around inline GXM work), so the generation comparison is a
+ * stale-result check, not a lock. */
+static int static_plan_declared(void *user, uint32_t token, unsigned gpu_stage,
+                                unsigned viewport, unsigned slot) {
+    (void)user;
+    return gpu_stage == 0u
+               ? vp_gxm_shader_has_vertex_sampler(token, viewport, slot)
+               : vp_gxm_shader_has_fragment_sampler(token, viewport, slot);
+}
+
+static int static_plan_active(void *user) {
+    (void)user;
+    return vp_gxm_static_resources_active();
+}
+
+static int static_plan_resource(void *user, uint32_t token, unsigned gpu_stage,
+                                unsigned viewport, unsigned slot,
+                                VPResourceTexture *out) {
+    (void)user;
+    return vp_gxm_shader_resource(token, gpu_stage, viewport, slot, out);
+}
+
+static const VPGxmShaderPlanOps static_plan_ops = {
+    NULL, static_plan_declared, static_plan_active, static_plan_resource
+};
+
+int vp_gxm_shader_resource_plan(unsigned token, unsigned gpu_stage,
+                                unsigned viewport_transform,
+                                VPGxmShaderResourcePlan *out) {
+    unsigned stage_index;
+    unsigned slot;
+    if (out == NULL) return -1;
+    memset(out, 0, sizeof(*out));
+    if (gpu_stage != 0u && gpu_stage != 4u) return -1;
+    /* Legacy mode keeps the original per-slot calls: reporting a synthetic
+     * plan here would silently disable the legacy hash-bundle resolution. */
+    if (!static_mode) return -3;
+    if (vp_gxm_shader_plan_cached(static_plan_cache,
+                                  VP_GXM_SHADER_PLAN_CACHE_ENTRIES,
+                                  static_plan_generation, &static_plan_ops,
+                                  token, gpu_stage, viewport_transform, out,
+                                  &static_plan_counts) < 0)
+        return -1;
+    stage_index = gpu_stage == 0u ? 0u : 1u;
+    static_plan_stage_calls[stage_index]++;
+    for (slot = 0; slot < VP_GXM_FRAGMENT_SAMPLER_LIMIT; ++slot)
+        if ((out->declared_mask & (1u << slot)) != 0u)
+            static_plan_slot_calls[stage_index][slot]++;
     return 0;
 }
 
@@ -5212,6 +5349,13 @@ static int static_build_pair(VPStaticPair *pair, const VPStaticResident *vs_res,
     pair->blend[3] = req->blend_alpha_op;
     pair->blend[4] = req->blend_alpha_src;
     pair->blend[5] = req->blend_alpha_dst;
+    /* The validated GXM result and the two ring sizes are properties of this
+     * immutable pair. A later hit may reuse them; release/rebuild clears them
+     * with the rest of the slot, so no address-based identity is involved. */
+    pair->blend_info = *blend;
+    pair->vs_default_uniform_bytes = vs_res->refl.default_uniform_bytes;
+    pair->fs_default_uniform_bytes = fs_res->refl.default_uniform_bytes;
+    pair->fs_face_state = fs_res->refl.face_state != NULL ? 1u : 0u;
     pair->last_use = ++static_clock;
     pair->used = 1;
     memset(&pair->base, 0, sizeof(pair->base));
@@ -5323,8 +5467,10 @@ static int static_pair_cached(const VPGxmDrawRequest *req,
                  ? SCE_GXM_INDEX_SOURCE_INDEX_32BIT
                  : SCE_GXM_INDEX_SOURCE_INDEX_16BIT;
     if (static_pair_hint_probe(req, vs_token, fs_token, viewport, index_source,
-                               out, owner))
+                               out, owner)) {
+        if (gxm_shared_prepare_active()) static_shared_pair_hits++;
         return 0;
+    }
     vs_program = vp_static_program_for_token(&static_index, vs_token);
     fs_program = vp_static_program_for_token(&static_index, fs_token);
     if (vs_program == NULL || vs_program->vertex_stage == VP_STATIC_INDEX_STAGE_NONE ||
@@ -5347,7 +5493,12 @@ static int static_pair_cached(const VPGxmDrawRequest *req,
     fs_resident = static_resident_find(fs_program->fragment_stage,
                                        (uint16_t)(fs_variant - static_index.variants));
     if (vs_resident < 0 || fs_resident < 0) return 1;
-    if (build_blend_info(req, &blend) < 0) return 1;
+    /* A matching pair already ran this conversion when it was created; its
+     * stored blend_info is part of the immutable pair. Shared mode therefore
+     * skips the repeated build on a hit. A miss still reaches static_pair_get,
+     * which performs the original conversion and reports its exact failure. */
+    if (!gxm_shared_prepare_active() && build_blend_info(req, &blend) < 0)
+        return 1;
     for (i = 0; i < VP_GXM_STATIC_PAIR_LIMIT; ++i) {
         VPStaticPair *pair = &static_pairs[i];
         if (!pair->used) continue;
@@ -5356,6 +5507,7 @@ static int static_pair_cached(const VPGxmDrawRequest *req,
             static_pair_inputs_match(pair, req, index_source)) {
             pair->last_use = ++static_clock;
             static_stats.pair_hits++;
+            if (gxm_shared_prepare_active()) static_shared_pair_hits++;
             /* Established only after the original resolution matched. */
             static_pair_hint_set(pair, vs_token, fs_token, viewport);
             *out = &pair->base;
@@ -5450,6 +5602,7 @@ static int static_pair_get(const VPGxmDrawRequest *req, VPGxmProgramPair **out,
                                     pair->last_use) == VP_PAIR_CACHE_SCAN_HIT) {
             pair->last_use = ++static_clock;
             static_stats.pair_hits++;
+            if (gxm_shared_prepare_active()) static_shared_pair_hits++;
             static_pair_hint_set(pair, vs_token, fs_token, viewport);
             *out = &pair->base;
             *owner = pair;
@@ -5948,10 +6101,43 @@ static void gxm_note_addr_border(unsigned raw_u, unsigned raw_v,
          raw_u, raw_v, tsc[4], tsc[5], tsc[6], tsc[7]);
 }
 
+/* All frame_draw_internal calls run on the single GXM worker; the precheck and
+ * the later apply therefore share this cache without another lock. The key is
+ * the full sampler word pair plus primary-vs-mip kind. */
+static const VPGxmSamplerPlan *gxm_sampler_plan_for(
+        unsigned kind, const uint32_t sampler[2]) {
+    return vp_gxm_sampler_plan_cache_get(gxm_sampler_plan_cache,
+                                         VP_GXM_SAMPLER_PLAN_CACHE_ENTRIES,
+                                         kind, sampler[0], sampler[1],
+                                         &gxm_sampler_plan_hits,
+                                         &gxm_sampler_plan_misses);
+}
+
 static int frame_apply_extra_sampler(SceGxmTexture *texture,
                                      const VPGxmExtraTexture *extra,
                                      unsigned draw_index, unsigned slot) {
     SceGxmTextureAddrMode u_mode, v_mode;
+    if (gxm_shared_prepare_active()) {
+        const VPGxmSamplerPlan *plan =
+            gxm_sampler_plan_for(VP_GXM_SAMPLER_PLAN_MIP, extra->sampler);
+        if (plan == NULL || plan->rc < 0) {
+            glog("VP_GXM_FRAME_DRAW idx=%u unsupported tex%u sampler=%08x,%08x\n",
+                draw_index, slot, extra->sampler[0], extra->sampler[1]);
+            return -2;
+        }
+        gxm_note_addr_border(plan->raw_u, plan->raw_v, extra->tsc_words,
+                             draw_index);
+        sceGxmTextureSetMinFilter(texture, plan->min_filter
+            ? SCE_GXM_TEXTURE_FILTER_LINEAR : SCE_GXM_TEXTURE_FILTER_POINT);
+        sceGxmTextureSetMagFilter(texture, plan->mag_filter
+            ? SCE_GXM_TEXTURE_FILTER_LINEAR : SCE_GXM_TEXTURE_FILTER_POINT);
+        sceGxmTextureSetMipFilter(texture, plan->mip_filter
+            ? SCE_GXM_TEXTURE_MIP_FILTER_ENABLED
+            : SCE_GXM_TEXTURE_MIP_FILTER_DISABLED);
+        sceGxmTextureSetUAddrMode(texture, (SceGxmTextureAddrMode)plan->addr_u);
+        sceGxmTextureSetVAddrMode(texture, (SceGxmTextureAddrMode)plan->addr_v);
+        return 0;
+    }
     if ((extra->sampler[1]&3u)<1u || (extra->sampler[1]&3u)>2u ||
         ((extra->sampler[1]>>4)&3u)<1u || ((extra->sampler[1]>>4)&3u)>2u ||
         gxm_texture_addr_mode(extra->sampler[0],&u_mode)<0 ||
@@ -5980,6 +6166,26 @@ static int frame_apply_extra_sampler(SceGxmTexture *texture,
 static int gxm_apply_primary_sampler(SceGxmTexture *texture,
                                      const VPGxmDrawRequest *req) {
     SceGxmTextureAddrMode u_mode, v_mode;
+    if (gxm_shared_prepare_active()) {
+        const VPGxmSamplerPlan *plan =
+            gxm_sampler_plan_for(VP_GXM_SAMPLER_PLAN_PRIMARY, req->sampler);
+        if (plan == NULL || plan->rc < 0) {
+            glog("VP_GXM_SAMPLER unsupported primary hash=0x%x raw=%08x,%08x\n",
+                 req->hash,req->sampler[0],req->sampler[1]);
+            return -2;
+        }
+        gxm_note_addr_border(plan->raw_u, plan->raw_v, req->tex_tsc,
+                             req->draw_index);
+        /* Primary deliberately does not set a mip filter; only the extra and
+         * vertex paths apply their planned mip state. */
+        sceGxmTextureSetMagFilter(texture, plan->mag_filter
+            ? SCE_GXM_TEXTURE_FILTER_LINEAR : SCE_GXM_TEXTURE_FILTER_POINT);
+        sceGxmTextureSetMinFilter(texture, plan->min_filter
+            ? SCE_GXM_TEXTURE_FILTER_LINEAR : SCE_GXM_TEXTURE_FILTER_POINT);
+        sceGxmTextureSetUAddrMode(texture, (SceGxmTextureAddrMode)plan->addr_u);
+        sceGxmTextureSetVAddrMode(texture, (SceGxmTextureAddrMode)plan->addr_v);
+        return 0;
+    }
     if ((req->sampler[1]&3u)<1u || (req->sampler[1]&3u)>2u ||
         ((req->sampler[1]>>4)&3u)<1u || ((req->sampler[1]>>4)&3u)>2u ||
         gxm_texture_addr_mode(req->sampler[0],&u_mode)<0 ||
@@ -6582,6 +6788,7 @@ static int gxm_batch_enabled(void) {
     return enabled;
 }
 
+/* VP_HOST_TEST_EXTRACT:pair_uniform_begin */
 static size_t gxm_batch_align_size(size_t bytes) {
     if (bytes == 0u) return 0u;
     if (bytes > (size_t)-1 - 15u) return (size_t)-1;
@@ -6596,6 +6803,26 @@ static size_t gxm_batch_add_size(size_t total, size_t bytes) {
         return (size_t)-1;
     return total + aligned;
 }
+
+/* Uniform-ring bytes for one pair from the immutable sizes captured at pair
+ * creation. The extra fragment buffer depends on this draw's live cull/face
+ * state and still uses the same saturating addition as the original path. */
+static size_t static_pair_uniform_bytes(const VPStaticPair *pair,
+                                        const VPGxmDrawRequest *req) {
+    size_t total = 0u;
+    if (pair == NULL || req == NULL) return 0u;
+    if (pair->vs_program != NULL)
+        total = gxm_batch_add_size(total, pair->vs_default_uniform_bytes);
+    if (pair->fs_program != NULL) {
+        total = gxm_batch_add_size(total, pair->fs_default_uniform_bytes);
+        if (pair->fs_face_state != 0u && !req->cull_enable &&
+            (req->cull_face == 0x404u || req->cull_face == 0x405u ||
+             req->cull_face == 0x408u))
+            total = gxm_batch_add_size(total, pair->fs_default_uniform_bytes);
+    }
+    return total;
+}
+/* VP_HOST_TEST_EXTRACT:pair_uniform_end */
 
 static VPTextureSnapshotKey gxm_snapshot_key(uint64_t va, unsigned w,
     unsigned h, unsigned format, unsigned cube, unsigned mips) {
@@ -6913,6 +7140,12 @@ static size_t gxm_batch_uniform_for(const VPGxmDrawRequest *req,
                                     const VPStaticPair *pair) {
     size_t total = 0u;
     if (pair == NULL) return 0u;
+    /* Mode 3 uses the pair's immutable sizes; this skips the repeated
+     * resident reflection reads without changing the live face condition. */
+    if (gxm_shared_prepare_active()) {
+        static_shared_uniform_reuses++;
+        return static_pair_uniform_bytes(pair, req);
+    }
     if (pair->vs_program != NULL)
         total = gxm_batch_add_size(total,
             static_residents[pair->vs_resident].refl.default_uniform_bytes);
@@ -8363,7 +8596,12 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
         return gxm_extra_reject(req->draw_index, e + 1u, "feedback-alias",
                                 extra, req->target_va);
     }
-    if (build_blend_info(req, &blend) < 0) return -2;
+    if (static_mode && static_pair != NULL && gxm_shared_prepare_active()) {
+        /* Pair hits already ran and stored this conversion, and the pair's
+         * creation check covered the same six guest enums plus color mask. */
+        blend = static_pair->blend_info;
+        static_shared_blend_reuses++;
+    } else if (build_blend_info(req, &blend) < 0) return -2;
     /* Census only: Maxwell factor 1 is ZERO and 2 is ONE, so ONE/ZERO is the
      * opaque colour-blend case. */
     if (req->blend_color_src == 2u && req->blend_color_dst == 1u)
@@ -8393,14 +8631,25 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
             gxm_batch_pre_reject_why = 1u;
         }
         if (fs_refl->tex[0] != NULL) {
-            SceGxmTextureAddrMode u_mode, v_mode;
-            if ((req->sampler[1] & 3u) < 1u || (req->sampler[1] & 3u) > 2u ||
-                ((req->sampler[1] >> 4) & 3u) < 1u ||
-                ((req->sampler[1] >> 4) & 3u) > 2u ||
-                gxm_texture_addr_mode(req->sampler[0], &u_mode) < 0 ||
-                gxm_texture_addr_mode(req->sampler[0] >> 3, &v_mode) < 0) {
-                pre_reject = 1;
-                gxm_batch_pre_reject_why = 2u;
+            if (gxm_shared_prepare_active()) {
+                /* Same cached plan the apply below will use; this only decides
+                 * batch membership, it does not bind or modify any texture. */
+                const VPGxmSamplerPlan *plan = gxm_sampler_plan_for(
+                    VP_GXM_SAMPLER_PLAN_PRIMARY, req->sampler);
+                if (plan == NULL || plan->rc < 0) {
+                    pre_reject = 1;
+                    gxm_batch_pre_reject_why = 2u;
+                }
+            } else {
+                SceGxmTextureAddrMode u_mode, v_mode;
+                if ((req->sampler[1] & 3u) < 1u || (req->sampler[1] & 3u) > 2u ||
+                    ((req->sampler[1] >> 4) & 3u) < 1u ||
+                    ((req->sampler[1] >> 4) & 3u) > 2u ||
+                    gxm_texture_addr_mode(req->sampler[0], &u_mode) < 0 ||
+                    gxm_texture_addr_mode(req->sampler[0] >> 3, &v_mode) < 0) {
+                    pre_reject = 1;
+                    gxm_batch_pre_reject_why = 2u;
+                }
             }
         }
         if (pre_reject) {
@@ -9578,30 +9827,63 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
             }
             if (!vertex_desc_hit) {
                 SceGxmTextureAddrMode u_mode, v_mode;
-                if ((extra->sampler[1]&3u)<1u || (extra->sampler[1]&3u)>2u ||
-                    ((extra->sampler[1]>>4)&3u)<1u || ((extra->sampler[1]>>4)&3u)>2u ||
-                    gxm_texture_addr_mode(extra->sampler[0],&u_mode)<0 ||
-                    gxm_texture_addr_mode(extra->sampler[0]>>3,&v_mode)<0) {
-                    glog("VP_GXM_FRAME_DRAW idx=%u unsupported vertex tex0 sampler=%08x,%08x\n",
-                         req->draw_index,extra->sampler[0],extra->sampler[1]);
-                    gxm_stage9_note(VP_GXM_S9_VERTEX_TEX, req->draw_index);
-                    frame_release_fs(frame_fs, frame_fs_owned);
-                    return -2;
+                if (gxm_shared_prepare_active()) {
+                    const VPGxmSamplerPlan *plan = gxm_sampler_plan_for(
+                        VP_GXM_SAMPLER_PLAN_MIP, extra->sampler);
+                    if (plan == NULL || plan->rc < 0) {
+                        glog("VP_GXM_FRAME_DRAW idx=%u unsupported vertex tex0 "
+                             "sampler=%08x,%08x\n", req->draw_index,
+                             extra->sampler[0], extra->sampler[1]);
+                        gxm_stage9_note(VP_GXM_S9_VERTEX_TEX, req->draw_index);
+                        frame_release_fs(frame_fs, frame_fs_owned);
+                        return -2;
+                    }
+                    gxm_note_addr_border(plan->raw_u, plan->raw_v,
+                                         extra->tsc_words, req->draw_index);
+                    sceGxmTextureSetMinFilter(vtex, plan->min_filter
+                        ? SCE_GXM_TEXTURE_FILTER_LINEAR
+                        : SCE_GXM_TEXTURE_FILTER_POINT);
+                    sceGxmTextureSetMagFilter(vtex, plan->mag_filter
+                        ? SCE_GXM_TEXTURE_FILTER_LINEAR
+                        : SCE_GXM_TEXTURE_FILTER_POINT);
+                    /* The lossless RG32F vertex layout cannot carry a mip
+                     * chain; that format condition still overrides the guest
+                     * mip code exactly as in the legacy path. */
+                    sceGxmTextureSetMipFilter(vtex,
+                        extra->tex_format != VP_TEXTURE_UPLOAD_RGBA32F_RG32F &&
+                        plan->mip_filter ?
+                            SCE_GXM_TEXTURE_MIP_FILTER_ENABLED :
+                            SCE_GXM_TEXTURE_MIP_FILTER_DISABLED);
+                    sceGxmTextureSetUAddrMode(vtex,
+                        (SceGxmTextureAddrMode)plan->addr_u);
+                    sceGxmTextureSetVAddrMode(vtex,
+                        (SceGxmTextureAddrMode)plan->addr_v);
+                } else {
+                    if ((extra->sampler[1]&3u)<1u || (extra->sampler[1]&3u)>2u ||
+                        ((extra->sampler[1]>>4)&3u)<1u || ((extra->sampler[1]>>4)&3u)>2u ||
+                        gxm_texture_addr_mode(extra->sampler[0],&u_mode)<0 ||
+                        gxm_texture_addr_mode(extra->sampler[0]>>3,&v_mode)<0) {
+                        glog("VP_GXM_FRAME_DRAW idx=%u unsupported vertex tex0 sampler=%08x,%08x\n",
+                             req->draw_index,extra->sampler[0],extra->sampler[1]);
+                        gxm_stage9_note(VP_GXM_S9_VERTEX_TEX, req->draw_index);
+                        frame_release_fs(frame_fs, frame_fs_owned);
+                        return -2;
+                    }
+                    gxm_note_addr_border(extra->sampler[0]&7u, (extra->sampler[0]>>3)&7u,
+                                         extra->tsc_words, req->draw_index);
+                    sceGxmTextureSetMinFilter(vtex,
+                        ((extra->sampler[1]>>4)&3u)==2u?SCE_GXM_TEXTURE_FILTER_LINEAR:
+                                                          SCE_GXM_TEXTURE_FILTER_POINT);
+                    sceGxmTextureSetMagFilter(vtex,
+                        (extra->sampler[1]&3u)==2u?SCE_GXM_TEXTURE_FILTER_LINEAR:
+                                                    SCE_GXM_TEXTURE_FILTER_POINT);
+                    sceGxmTextureSetMipFilter(vtex,
+                        extra->tex_format!=VP_TEXTURE_UPLOAD_RGBA32F_RG32F &&
+                        ((extra->sampler[1]>>6)&3u)!=0u ? SCE_GXM_TEXTURE_MIP_FILTER_ENABLED :
+                                                           SCE_GXM_TEXTURE_MIP_FILTER_DISABLED);
+                    sceGxmTextureSetUAddrMode(vtex,u_mode);
+                    sceGxmTextureSetVAddrMode(vtex,v_mode);
                 }
-                gxm_note_addr_border(extra->sampler[0]&7u, (extra->sampler[0]>>3)&7u,
-                                     extra->tsc_words, req->draw_index);
-                sceGxmTextureSetMinFilter(vtex,
-                    ((extra->sampler[1]>>4)&3u)==2u?SCE_GXM_TEXTURE_FILTER_LINEAR:
-                                                      SCE_GXM_TEXTURE_FILTER_POINT);
-                sceGxmTextureSetMagFilter(vtex,
-                    (extra->sampler[1]&3u)==2u?SCE_GXM_TEXTURE_FILTER_LINEAR:
-                                                SCE_GXM_TEXTURE_FILTER_POINT);
-                sceGxmTextureSetMipFilter(vtex,
-                    extra->tex_format!=VP_TEXTURE_UPLOAD_RGBA32F_RG32F &&
-                    ((extra->sampler[1]>>6)&3u)!=0u ? SCE_GXM_TEXTURE_MIP_FILTER_ENABLED :
-                                                       SCE_GXM_TEXTURE_MIP_FILTER_DISABLED);
-                sceGxmTextureSetUAddrMode(vtex,u_mode);
-                sceGxmTextureSetVAddrMode(vtex,v_mode);
                 if (batch_entry != NULL)
                     gxm_texture_desc_store(vertex_desc_backing, desc_width,
                         extra->height, fmt, extra->cube, mip_count,

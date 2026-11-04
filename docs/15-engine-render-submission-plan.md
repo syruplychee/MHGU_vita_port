@@ -183,3 +183,28 @@ program 命令包／底层资源描述对照，找到原接口检查漏查的 re
 以及同进程原／新四相位测量。3033 次查询往返省掉，输出命令和资源描述一致；准备
 框架成本下降，整帧仍未证明稳定净收益。测量将大头定位到命令分派内部的资源／GXM
 绘制准备，不能把其包含时间误当纯解析耗时。数据和下一处边界见 ADR 0022。
+
+## 下游共享准备实验（2026-11-04，默认关闭）
+
+按 ADR 0022 的边界，新增与 root 接管解耦的 mode 3（`shared`）。`engine-full-mode.txt`
+选择 `3` 时仍执行原游戏 trampoline，与 `0` 共用同一 root；只有 `3` 在 root 轮询处、
+计时前发布原子开关，启用下游 shared 准备。`1`／`2` 维持原 C 路径并关闭该路径。
+
+实际替换范围：
+
+- `guest_svc` 在 static shader 包下每 draw 至多取一次 VS／FS shader 资源计划，
+  复用 tex0..tex4 的 declared、resources_active、layout 返回码和值拷贝；
+- `VPStaticPair` 保存已验证的 `SceGxmBlendInfo`、VS／FS 默认 uniform 大小和
+  `vp_face_state` 条件；mode 3 的 pair 命中不再重复 blend 转换和 resident uniform
+  大小查询，实时双面预算与溢出语义保留；
+- primary／extra／vertex sampler 使用有界全键计划，批次预检查与 apply 共用解析结果；
+  primary 不设置 mip filter，extra／vertex 设置，RG32F 例外和原日志／错误码不变。
+
+未替换：TIC／TSC 当前原字节读取、纹理解码／上传、深度 view、GPU 生产者、阴影检查、
+pair miss 创建、resident 注册、NVN 编码与 GXM 解析、所有纹理 setter 和 draw。
+计划与 pair 结果由 resources／resident generation 和自然释放失效，不缓存像素或用地址
+猜内容。宿主 40 项 CTest 通过（L1），带改动 VPK／SELF 构建通过（L2）；Vita3K
+同进程原／shared 对照为 192.663／191.301 ms/帧（约 0.71%，L3），仍不认定稳定
+提速，默认关闭。村庄 GPU 采样未发现新增黑块；全部动画帧、流式场景及真机未验证。
+完整范围、同步条件和测量边界见
+[ADR 0023](decisions/0023-shared-downstream-prepare.md)。

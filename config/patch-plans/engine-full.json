@@ -52,14 +52,15 @@
         "enter": "0x253",
         "leave": "0x254"
       },
-      "control": "engine-full-mode.txt contains exactly one 0, 1 or 2 plus optional trailing whitespace; polled at most every 500000 us before the root entry timestamp. Missing/invalid fails explicitly in A/B mode.",
+      "control": "engine-full-mode.txt contains exactly one 0, 1, 2 or 3 plus optional trailing whitespace; polled at most every 500000 us before the root entry timestamp. Missing/invalid fails explicitly in A/B mode. Modes 0 and 3 execute the same original trampoline; only 3 publishes the downstream shared-preparation flag.",
       "control_poll_us": 500000,
       "modes": {
         "0": "original",
         "1": "native",
-        "2": "fast"
+        "2": "fast",
+        "3": "shared"
       },
-      "wrapper": "push {r4,lr}; bl enter (r0=context preserved, target written to ip); blx ip; bl leave; pop {r4,lr}; bx lr. Only the native C target's r0 is checked; the original root may return any r0."
+      "wrapper": "push {r4,lr}; bl enter (r0=context preserved, target written to ip); blx ip; bl leave; pop {r4,lr}; bx lr. Only the native C targets (modes 1 and 2) have a declared r0; modes 0 and 3 execute the original root, whose callers do not consume r0."
     },
     "island": "The A/B island request is 20 bytes (8-byte veneer + 12-byte trampoline). Alignment, capacity, root-to-veneer branch reach and the pre-patch words are checked and logged before the site write.",
     "abi": "Original root receives r0=context and has no consumed return value at its two direct callers (main+0xbbd8d8 and main+0xbbe714). The single-path shim preserves r4-r11, SP, d8-d15. The A/B wrapper saves r4 and the caller LR with an 8-byte-aligned stack; both host bridges preserve the complete GPR/APSR/FPSCR/VFP frame. The shim calls native C under guest TLS, returns to original LR on success and stops through host bridge service 0x252 on failure. No displaced instruction replay in single-path mode: the entire root body is replaced; A/B mode replays only the first PUSH and returns to the original body."

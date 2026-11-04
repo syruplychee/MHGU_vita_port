@@ -7,6 +7,7 @@
 
 volatile uint32_t vp_engine_full_profile_enabled;
 volatile uint32_t vp_engine_full_fast_enabled;
+volatile uint32_t vp_engine_shared_prepare_enabled;
 typedef struct {
     uint32_t fast,calls,draws,last_site,last_slot,buffers,handles;
 } PrepareFrame;

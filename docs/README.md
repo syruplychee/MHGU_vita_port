@@ -67,3 +67,4 @@
 - [0020 原 SDK 实际编码、资源对照与 restart 索引修复](decisions/0020-engine-sdk-encoding-reference.md)
 - [0021 公共渲染准备的同进程 A/B 计时框架](decisions/0021-engine-prepare-ab.md)
 - [0022 省掉共享查询往返与接管框架重复工作](decisions/0022-engine-prepare-shared-queries.md)
+- [0023 下游共享 shader／纹理资源与 GXM 准备实验](decisions/0023-shared-downstream-prepare.md)

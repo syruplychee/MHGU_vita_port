@@ -45,7 +45,8 @@ file(READ "${VP_SRC}/platform/gxm_runtime.c" VP_GXM_RUNTIME_SOURCE)
 set(VP_GXM_RENDER_PIPELINE_SOURCE "")
 foreach(section
         pair_base pair_struct pair_hint color_mask pair_match pair_probe
-        notify pending_state pending_functions)
+        notify pending_state pending_functions blend_ops blend_build
+        pair_uniform)
     vp_extract_marked("${VP_GXM_RUNTIME_SOURCE}"
         "/* VP_HOST_TEST_EXTRACT:${section}_begin */"
         "/* VP_HOST_TEST_EXTRACT:${section}_end */"
@@ -109,6 +110,8 @@ vp_host_test(gxm_resource_layout
     "${VP_SRC}/platform/gxm_resource_layout.c"
     "${VP_SRC}/platform/static_shader_index.c")
 vp_host_test(gxm_sampler_slots)
+vp_host_test(gxm_sampler_plan)
+vp_host_test(gxm_shader_plan)
 vp_host_test(gxm_shadow_sampler "${VP_SRC}/platform/gxm_shadow_sampler.c")
 vp_host_test(memory_attributes "${VP_SRC}/platform/memory_attributes.c")
 vp_host_test(media_strided_copy)

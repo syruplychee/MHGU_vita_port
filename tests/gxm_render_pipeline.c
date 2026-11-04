@@ -17,6 +17,41 @@ typedef struct SceGxmVertexProgram SceGxmVertexProgram;
 typedef struct SceGxmFragmentProgram SceGxmFragmentProgram;
 typedef uint32_t SceGxmShaderPatcherId;
 
+/* VitaSDK sampler/blend value stubs for the extracted blend planner. The
+ * numeric order matches psp2/gxm.h; the test checks named fields, never the
+ * bitfield packing. */
+typedef enum {
+    SCE_GXM_BLEND_FUNC_NONE = 0,
+    SCE_GXM_BLEND_FUNC_ADD = 1,
+    SCE_GXM_BLEND_FUNC_SUBTRACT = 2,
+    SCE_GXM_BLEND_FUNC_REVERSE_SUBTRACT = 3,
+    SCE_GXM_BLEND_FUNC_MIN = 4,
+    SCE_GXM_BLEND_FUNC_MAX = 5
+} SceGxmBlendFunc;
+typedef enum {
+    SCE_GXM_BLEND_FACTOR_ZERO = 0,
+    SCE_GXM_BLEND_FACTOR_ONE = 1,
+    SCE_GXM_BLEND_FACTOR_SRC_COLOR = 2,
+    SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_COLOR = 3,
+    SCE_GXM_BLEND_FACTOR_SRC_ALPHA = 4,
+    SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA = 5,
+    SCE_GXM_BLEND_FACTOR_DST_COLOR = 6,
+    SCE_GXM_BLEND_FACTOR_ONE_MINUS_DST_COLOR = 7,
+    SCE_GXM_BLEND_FACTOR_DST_ALPHA = 8,
+    SCE_GXM_BLEND_FACTOR_ONE_MINUS_DST_ALPHA = 9,
+    SCE_GXM_BLEND_FACTOR_SRC_ALPHA_SATURATE = 10,
+    SCE_GXM_BLEND_FACTOR_DST_ALPHA_SATURATE = 11
+} SceGxmBlendFactor;
+typedef struct SceGxmBlendInfo {
+    uint8_t colorMask;
+    uint8_t colorFunc : 4;
+    uint8_t alphaFunc : 4;
+    uint8_t colorSrc : 4;
+    uint8_t colorDst : 4;
+    uint8_t alphaSrc : 4;
+    uint8_t alphaDst : 4;
+} SceGxmBlendInfo;
+
 #define VP_UPLOAD_CACHE_SLOTS 4u
 #define VP_GXM_BATCH_ARENAS 3u
 #define VP_SCENE_CLASS_COUNT 2u
@@ -211,6 +246,10 @@ static void test_hint_full_match_rejection(void) {
     assert(pair_probe(&fixture, &req, &owner) == 1);
     assert(fixture.pair.last_use != last_use);
     assert(static_stats.pair_hint_hits == hits + 1u);
+    /* Prepared blend output is not an input identity: changing it must not
+     * make a pair match (or stop matching) on its own. */
+    memset(&fixture.pair.blend_info, 0xff, sizeof(fixture.pair.blend_info));
+    assert(pair_probe(&fixture, &req, &owner) == 1);
 
     owner = NULL;
     assert(static_pair_hint_probe(&req, fixture.vs_token, fixture.fs_token,
@@ -471,12 +510,141 @@ static void test_notify_order_helpers(void) {
     puts("PASS notification ordering skips zero and handles wrap");
 }
 
+static void test_blend_plan_enums_unchanged(void) {
+    static const struct {
+        uint32_t raw, alias, expected;
+    } factors[] = {
+        {1u, 0x4000u, SCE_GXM_BLEND_FACTOR_ZERO},
+        {2u, 0x4001u, SCE_GXM_BLEND_FACTOR_ONE},
+        {3u, 0x4300u, SCE_GXM_BLEND_FACTOR_SRC_COLOR},
+        {4u, 0x4301u, SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_COLOR},
+        {5u, 0x4302u, SCE_GXM_BLEND_FACTOR_SRC_ALPHA},
+        {6u, 0x4303u, SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA},
+        {7u, 0x4304u, SCE_GXM_BLEND_FACTOR_DST_ALPHA},
+        {8u, 0x4305u, SCE_GXM_BLEND_FACTOR_ONE_MINUS_DST_ALPHA},
+        {9u, 0x4306u, SCE_GXM_BLEND_FACTOR_DST_COLOR},
+        {0xau, 0x4307u, SCE_GXM_BLEND_FACTOR_ONE_MINUS_DST_COLOR},
+        {0xbu, 0x4308u, SCE_GXM_BLEND_FACTOR_SRC_ALPHA_SATURATE},
+    };
+    static const struct {
+        uint32_t raw, alias, expected;
+    } ops[] = {
+        {1u, 0x8006u, SCE_GXM_BLEND_FUNC_ADD},
+        {2u, 0x800au, SCE_GXM_BLEND_FUNC_SUBTRACT},
+        {3u, 0x800bu, SCE_GXM_BLEND_FUNC_REVERSE_SUBTRACT},
+        {4u, 0x8007u, SCE_GXM_BLEND_FUNC_MIN},
+        {5u, 0x8008u, SCE_GXM_BLEND_FUNC_MAX},
+    };
+    unsigned i;
+    VPGxmDrawRequest req;
+    SceGxmBlendInfo info;
+    memset(&req, 0, sizeof(req));
+    req.color_mask = 0x1111u;
+    for (i = 0; i < sizeof(factors) / sizeof(factors[0]); ++i) {
+        req.blend_color_op = ops[0].raw;
+        req.blend_alpha_op = ops[0].alias;
+        req.blend_color_src = factors[i].raw;
+        req.blend_color_dst = factors[i].alias;
+        req.blend_alpha_src = factors[i].alias;
+        req.blend_alpha_dst = factors[i].raw;
+        assert(build_blend_info(&req, &info) == 0);
+        assert(info.colorFunc == SCE_GXM_BLEND_FUNC_ADD);
+        assert(info.alphaFunc == SCE_GXM_BLEND_FUNC_ADD);
+        assert(info.colorSrc == factors[i].expected);
+        assert(info.colorDst == factors[i].expected);
+        assert(info.alphaSrc == factors[i].expected);
+        assert(info.alphaDst == factors[i].expected);
+    }
+    for (i = 0; i < sizeof(ops) / sizeof(ops[0]); ++i) {
+        req.blend_color_op = ops[i].raw;
+        req.blend_alpha_op = ops[i].alias;
+        req.blend_color_src = 2u;
+        req.blend_color_dst = 1u;
+        req.blend_alpha_src = 2u;
+        req.blend_alpha_dst = 1u;
+        assert(build_blend_info(&req, &info) == 0);
+        assert(info.colorFunc == ops[i].expected);
+        assert(info.alphaFunc == ops[i].expected);
+    }
+    req.blend_color_op = 0u;
+    assert(build_blend_info(&req, &info) < 0);
+    req.blend_color_op = 6u;
+    assert(build_blend_info(&req, &info) < 0);
+    req.blend_color_op = 1u;
+    req.blend_color_src = 0u;
+    assert(build_blend_info(&req, &info) < 0);
+    req.blend_color_src = 0xcu;
+    assert(build_blend_info(&req, &info) < 0);
+    puts("PASS blend planner keeps every accepted enum and rejects the rest");
+}
+
+static void test_pair_uniform_budget(void) {
+    static const SceGxmProgram *dummy_program =
+        (const SceGxmProgram *)(uintptr_t)1u;
+    VPStaticPair pair;
+    VPGxmDrawRequest req;
+    size_t vs = gxm_batch_align_size(100u);
+    size_t fs = gxm_batch_align_size(200u);
+
+    memset(&pair, 0, sizeof(pair));
+    memset(&req, 0, sizeof(req));
+    pair.vs_program = dummy_program;
+    pair.fs_program = dummy_program;
+    pair.vs_default_uniform_bytes = 100u;
+    pair.fs_default_uniform_bytes = 200u;
+
+    /* Two-face budget requires: face uniform present, culling disabled and one
+     * of the three two-sided face selectors on this draw. */
+    assert(static_pair_uniform_bytes(&pair, &req) == vs + fs);
+    pair.fs_face_state = 1u;
+    req.cull_enable = 0u;
+    req.cull_face = 0x404u;
+    assert(static_pair_uniform_bytes(&pair, &req) == vs + fs + fs);
+    req.cull_face = 0x405u;
+    assert(static_pair_uniform_bytes(&pair, &req) == vs + fs + fs);
+    req.cull_face = 0x408u;
+    assert(static_pair_uniform_bytes(&pair, &req) == vs + fs + fs);
+    req.cull_face = 0x409u;
+    assert(static_pair_uniform_bytes(&pair, &req) == vs + fs);
+    req.cull_face = 0x404u;
+    req.cull_enable = 1u;
+    assert(static_pair_uniform_bytes(&pair, &req) == vs + fs);
+    req.cull_enable = 0u;
+    pair.fs_face_state = 0u;
+    assert(static_pair_uniform_bytes(&pair, &req) == vs + fs);
+
+    /* Saturating addition keeps the existing size-overflow semantics. On a
+     * 64-bit host the three uint32_t sizes cannot overflow size_t, so the
+     * helper sums exactly; the saturation itself is checked directly. */
+    pair.vs_default_uniform_bytes = UINT32_MAX;
+    pair.fs_default_uniform_bytes = UINT32_MAX;
+    pair.fs_face_state = 1u;
+    req.cull_enable = 0u;
+    req.cull_face = 0x404u;
+    {
+        size_t expected = gxm_batch_add_size(0u, UINT32_MAX);
+        expected = gxm_batch_add_size(expected, UINT32_MAX);
+        expected = gxm_batch_add_size(expected, UINT32_MAX);
+        assert(static_pair_uniform_bytes(&pair, &req) == expected);
+    }
+    assert(gxm_batch_add_size((size_t)-1, 1u) == (size_t)-1);
+    assert(gxm_batch_add_size((size_t)-1 - 8u, 16u) == (size_t)-1);
+    pair.fs_program = NULL;
+    assert(static_pair_uniform_bytes(&pair, &req) ==
+           gxm_batch_add_size(0u, UINT32_MAX));
+    /* A released pair has no prepared size; callers still see zero. */
+    assert(static_pair_uniform_bytes(NULL, &req) == 0u);
+    puts("PASS pair uniform plan keeps live face and overflow bounds");
+}
+
 int main(void) {
     test_hint_alternating_keys();
     test_hint_full_match_rejection();
     test_hint_lifecycle();
     test_hint_lru();
     test_hint_refresh_after_hole();
+    test_blend_plan_enums_unchanged();
+    test_pair_uniform_budget();
     test_completion_no_pending();
     test_completion_newest_arena();
     test_completion_failure_keeps_resources();
