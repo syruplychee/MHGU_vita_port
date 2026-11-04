@@ -17,6 +17,14 @@ int main(void) {
     vp_gpu_wait_record(&profile, "sync-blit", 1u, 20001u, 1, 0, 0, 0, 1);
     cause = &profile.causes[vp_gpu_wait_cause("sync-blit")];
     assert(cause->synchronous == 1u && cause->buckets[4] == 1u);
+    /* The mode-6 materialization drain is a named cause, not the fallback
+     * "other" row, so its waits reconcile against the global total. */
+    assert(vp_gpu_wait_cause("clear-materialize") !=
+           vp_gpu_wait_cause("unrecognized"));
+    vp_gpu_wait_record(&profile, "clear-materialize", 5u, 65u, 1, 0, 1, 2, 0);
+    cause = &profile.causes[vp_gpu_wait_cause("clear-materialize")];
+    assert(cause->calls == 1u && cause->real_waits == 1u &&
+           cause->block_us == 60u && cause->buckets[0] == 1u);
     assert(vp_gpu_wait_cause("unrecognized") == VP_GPU_WAIT_CAUSES - 1u);
     assert(sizeof(profile) < 4096u);
     puts("gpu_wait_profile: all checks passed");

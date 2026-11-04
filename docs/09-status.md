@@ -65,6 +65,16 @@ decoder-owned RGBA 直接作为 GXM 纹理 backing；不启用 mode 3 的 shared
 全场景/长时间与真机未验证。计数契约、失败范围及有效复测见
 [ADR 0025](decisions/0025-gpu-wait-attribution.md)。
 
+2026-11-04 后续新增默认关闭的 mode 6 `deep-clear`，只把符合契约的完整颜色 clear
+改为异步提交后记录状态，实际物化前仍证明 GPU 完成。输入锁、46 项宿主测试与 Vita
+构建通过。关闭 GPU 读回 marker 的同进程四段 L3 对照中，原 mode 5 共 480 帧平均
+147.186 ms，候选 mode 6 共 672 帧平均 148.625 ms，慢约 0.98%，未认定净提速。
+通知等待约 21.063 → 19.271 ms/帧，但部分清屏阻塞转移到 arena 复用；画面采样未见
+新增明显黑块/缺件；独立 SurfaceReadback 运行的村庄 GPU 读回正常，捕获后会转回兼容
+同步路径，不能据此声称全程快路像素验收。原安装包未替换。另发现旧 `capture-live inputs=0` 请求后会持续
+关闭 clear fusion，先前带该 marker 的性能数值只代表其诊断条件；新测量把 GPU 读回
+和性能统计分开。契约与完整边界见 [ADR 0026](decisions/0026-deferred-clear-sync.md)。
+
 | 能力 | 证据级别 | 说明 |
 |---|---|---|
 | 四模块 NSO 解码、重定位、导入绑定 | L3 | Vita3K OpenGL 下加载并执行 |

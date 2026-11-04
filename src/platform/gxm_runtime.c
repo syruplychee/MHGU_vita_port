@@ -544,6 +544,7 @@ static void gpu_free(void *ptr) {
  * game binds as a render target or samples as tex0. The colour buffer is also
  * exposed as a linear texture so a later pass can consume an earlier pass's
  * output without copying or decoding guest block-linear memory. */
+/* VP_HOST_TEST_EXTRACT:clear_surface_begin */
 typedef struct {
     int used;
     uint64_t va;
@@ -574,7 +575,15 @@ typedef struct {
      * target. Marker-gated; materialized before sampling/present/readback. */
     unsigned clear_pending;
     uint32_t clear_pending_color;
+    /* Mode-6 fast path: the pending clear was recorded after the worker
+     * submitted the open scene through a non-synchronous boundary. A later
+     * CPU/GPU transfer materialization must first prove every pending scene
+     * complete and keep this tag on failure. In-scene GPU clears consume it
+     * under the same-context submission order. The tag survives a mode
+     * 6 -> 5 switch so an already deferred clear keeps its drain. */
+    unsigned clear_pending_async;
 } VPGxmSurface;
+/* VP_HOST_TEST_EXTRACT:clear_surface_end */
 
 typedef struct {
     unsigned width;
@@ -949,6 +958,37 @@ static uint64_t gxm_clear_fusion_deferred, gxm_clear_fusion_in_scene;
 static uint64_t gxm_clear_fusion_blue;
 static uint64_t gxm_clear_fusion_materialized;
 static uint64_t gxm_clear_fusion_combined;
+/* A/B mode 6 clear-defer experiment. Cumulative worker-only counters; the
+ * debug log prints them at the existing static-draw cadence and never per
+ * clear. The pending tag itself lives on each VPGxmSurface. */
+static uint64_t gxm_clear_defer_tries;
+static uint64_t gxm_clear_defer_accepts;
+static uint64_t gxm_clear_defer_fallbacks;
+static uint64_t gxm_clear_defer_scene_submits;
+static uint64_t gxm_clear_defer_submit_failures;
+static uint64_t gxm_clear_defer_coalesced;
+static uint64_t gxm_clear_defer_materialize_calls;
+static uint64_t gxm_clear_defer_materialize_failures;
+static uint64_t gxm_clear_defer_in_scene;
+static int gxm_clear_defer_seen;
+static int gxm_clear_defer_reported = -1;
+
+/* Published before the root entry, read here on the worker. A mode switch only
+ * changes admission for new clear requests; existing per-surface async tags
+ * stay protective regardless of this value. */
+static int gxm_clear_defer_enabled(void) {
+    int enabled = __atomic_load_n(&vp_engine_clear_defer_enabled,
+                                  __ATOMIC_ACQUIRE) != 0u;
+    if (enabled) gxm_clear_defer_seen = 1;
+    if (enabled != gxm_clear_defer_reported) {
+        /* Default runs stay silent; only an actual transition (including the
+         * 6 -> 5 switch after a deferred clear existed) is reported. */
+        if (enabled || gxm_clear_defer_seen)
+            glog("VP_GXM_CLEAR_DEFER enabled=%d\n", enabled);
+        gxm_clear_defer_reported = enabled;
+    }
+    return enabled;
+}
 
 /* Marker state is read once. The default components are re-resolved only when
  * static mode or the self-test override changes, so the per-draw path stays a
@@ -2382,6 +2422,9 @@ static int depth_clear_materialize_pending(VPGxmDepthEntry *e,
 static int surface_clear_gpu(VPGxmSurface *s, uint32_t color);
 /* Defined with the display blit; draws the solid clear into an open scene. */
 static int frame_clear_in_scene(VPGxmSurface *dst);
+/* Defined next to frame_clear_in_scene; clears the pending colour tags after a
+ * successful in-scene GPU clear. */
+static void surface_clear_consumed_in_scene(VPGxmSurface *s);
 static int frame_blit_gpu(VPGxmSurface *s, void *dst, unsigned x0, unsigned y0,
                           unsigned w, unsigned h, unsigned dst_width,
                           unsigned dst_height, unsigned dst_pitch,
@@ -2506,11 +2549,25 @@ static int surface_clear(VPGxmSurface *s, uint32_t mask, uint32_t color) {    ui
 }
 
 /* Finish a deferred full-colour clear outside an open scene. The surface must
- * not be read or written by any open batch; callers flush first. */
+ * not be read or written by any open batch; callers flush first. A clear that
+ * was recorded through the mode-6 async boundary additionally proves every
+ * pending scene complete before the CPU/GPU transfer writes pixels. A failed
+ * wait returns the original error and leaves the pending colour and its tag
+ * intact; no pixel is written and no GPU reference is released. */
+/* VP_HOST_TEST_EXTRACT:clear_materialize_begin */
 static int surface_clear_materialize(VPGxmSurface *s, const char *why) {
     uint32_t color;
     int rc;
     if (s == NULL || !s->clear_pending) return 0;
+    if (s->clear_pending_async) {
+        gxm_clear_defer_materialize_calls++;
+        rc = gxm_pending_scene_complete("clear-materialize");
+        if (rc < 0) {
+            gxm_clear_defer_materialize_failures++;
+            return rc;
+        }
+        s->clear_pending_async = 0u;
+    }
     color = s->clear_pending_color;
     s->clear_pending = 0;
     gxm_clear_fusion_materialized++;
@@ -2520,6 +2577,7 @@ static int surface_clear_materialize(VPGxmSurface *s, const char *why) {
     rc = surface_clear(s, 0x3cu, color);
     return rc;
 }
+/* VP_HOST_TEST_EXTRACT:clear_materialize_end */
 
 
 static void *host_alloc(void *user, SceSize bytes) { (void)user; return malloc(bytes); }
@@ -4686,6 +4744,26 @@ static void static_log_stats(void) {
              (unsigned long long)gxm_texture_region_arena.subfrees,
              gxm_texture_region_arena.live, gxm_texture_region_arena.failed);
     }
+    if (gxm_clear_defer_seen) {
+        unsigned pending_async = 0u;
+        for (unsigned i = 0u; i < VP_GXM_SURFACE_LIMIT; ++i)
+            if (gxm_surfaces[i].used && gxm_surfaces[i].clear_pending_async)
+                pending_async++;
+        glog("VP_GXM_CLEAR_DEFER_STATS enabled=%d tries=%llu accept=%llu "
+             "fallback=%llu submit_fail=%llu scene_submits=%llu "
+             "coalesced=%llu materialize_calls=%llu materialize_fail=%llu "
+             "in_scene=%llu pending_async=%u\n",
+             gxm_clear_defer_reported == 1,
+             (unsigned long long)gxm_clear_defer_tries,
+             (unsigned long long)gxm_clear_defer_accepts,
+             (unsigned long long)gxm_clear_defer_fallbacks,
+             (unsigned long long)gxm_clear_defer_submit_failures,
+             (unsigned long long)gxm_clear_defer_scene_submits,
+             (unsigned long long)gxm_clear_defer_coalesced,
+             (unsigned long long)gxm_clear_defer_materialize_calls,
+             (unsigned long long)gxm_clear_defer_materialize_failures,
+             (unsigned long long)gxm_clear_defer_in_scene, pending_async);
+    }
     static_log_batch_hist();
     glog("VP_GXM_CLEAR_FUSION_STATS deferred=%llu combined_deferred=%llu "
          "in_scene=%llu materialized=%llu blue_first=%llu\n",
@@ -5964,6 +6042,7 @@ typedef struct {
     unsigned direct_consumed;
 } VPGxmBatchEntry;
 
+/* VP_HOST_TEST_EXTRACT:clear_reason_enum_begin */
 enum {
     GXM_BATCH_REASON_SUBMIT = 0,
     GXM_BATCH_REASON_LIMIT,
@@ -5979,8 +6058,16 @@ enum {
     GXM_BATCH_REASON_RESOURCE,
     GXM_BATCH_REASON_FAILURE,
     GXM_BATCH_REASON_LEGACY,
+    /* Mode-6 clear defer: submit the open scene and record the clear without
+     * proving the scene complete. The recorded surface tag carries that
+     * obligation to the next materialization point. Deliberately absent from
+     * gxm_batch_reason_needs_sync. */
+    GXM_BATCH_REASON_CLEAR_DEFER,
     GXM_BATCH_REASON_COUNT
 };
+/* VP_HOST_TEST_EXTRACT:clear_reason_enum_end */
+_Static_assert(GXM_BATCH_REASON_COUNT <= VP_GXM_BATCH_REASON_LIMIT,
+               "batch reason histogram capacity");
 
 typedef struct {
     VPBatchPolicy policy;
@@ -6798,14 +6885,16 @@ static void gxm_stage_sha_hex(unsigned stage_index, char *out, size_t out_size) 
  * pinned scene target and depth entry; extra GPU producers and depth views
  * are only read, not reallocated, until the scene finishes.
  */
+/* VP_HOST_TEST_EXTRACT:clear_reason_name_begin */
 static const char *gxm_batch_reason_name(unsigned reason) {
     static const char *const names[GXM_BATCH_REASON_COUNT] = {
         "submit-end", "limit", "budget", "scope", "rt-change", "depth-change",
         "mode-change", "ineligible", "clear", "present", "readback",
-        "resource", "failure", "legacy"
+        "resource", "failure", "legacy", "clear-defer"
     };
     return reason < GXM_BATCH_REASON_COUNT ? names[reason] : "unknown";
 }
+/* VP_HOST_TEST_EXTRACT:clear_reason_name_end */
 
 /* Aggregate batch-shape evidence. The per-flush log is sampled, so these
  * counters are the authoritative histogram for the whole run. */
@@ -7810,7 +7899,9 @@ static int gxm_scene_pipeline_active(void) {
 
 /* Reasons after which the caller mutates guest-visible resources or reads GPU
  * output on the CPU. Those must not return while a submitted scene is still
- * executing. */
+ * executing. CLEAR_DEFER is intentionally not listed: it only submits the
+ * open scene, and the per-surface tag keeps the completion obligation. */
+/* VP_HOST_TEST_EXTRACT:clear_reason_sync_begin */
 static int gxm_batch_reason_needs_sync(unsigned reason) {
     switch (reason) {
     case GXM_BATCH_REASON_SUBMIT:
@@ -7825,6 +7916,7 @@ static int gxm_batch_reason_needs_sync(unsigned reason) {
         return 0;
     }
 }
+/* VP_HOST_TEST_EXTRACT:clear_reason_sync_end */
 
 static void gxm_pending_scene_record(unsigned arena, uint32_t value,
                                      uint64_t submit_us, unsigned draws,
@@ -10519,10 +10611,7 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
             target->clear_pending && req->color_mask != 0u) {
             rc = frame_clear_in_scene(target);
             if (rc >= 0) {
-                target->clear_pending = 0u;
-                target->color_clear_mask |= 0x3cu;
-                target->cleared_count++;
-                gxm_clear_fusion_in_scene++;
+                surface_clear_consumed_in_scene(target);
                 if (req->color_mask == 0x100u) gxm_clear_fusion_blue++;
                 /* The clear changed programs, streams and viewport; the game
                  * draw must re-apply every cached piece of state. */
@@ -11454,13 +11543,125 @@ static int frame_draw_internal(VPGxmDrawRequest *req) {
     return rc;
 }
 
-static int frame_clear_internal(VPGxmClearRequest *req) {
+/* Pure mode-6 admission predicate. All inputs are explicit so the host tests
+ * exercise the same decision the worker makes. Every false return keeps the
+ * original synchronous clear path. A surface that does not already exist with
+ * the same VA, size and format, or whose colour backing is missing, is never
+ * admitted. */
+/* VP_HOST_TEST_EXTRACT:clear_defer_admit_begin */
+static int clear_defer_admit(const VPGxmClearRequest *req,
+                             unsigned surface_width, unsigned surface_height,
+                             uint32_t surface_format, int color_mem_present,
+                             int surface_pending, int defer_enabled,
+                             int worker_ready, int scene_poisoned,
+                             int test_active, int capture_active,
+                             int pipeline_active, int fusion_enabled,
+                             int dump_due) {
+    VPClearFusionPlan plan;
+    if (!defer_enabled || !worker_ready || scene_poisoned || test_active ||
+        capture_active || !pipeline_active)
+        return 0;
+    /* Full RGBA in the low six mask bits, no depth/stencil bit and no
+     * unexpected caller bits. Combined depth clears are out of scope. */
+    if ((req->mask & ~VP_CLEAR_FUSION_COLOR_MASK) != 0u) return 0;
+    if (!vp_clear_fusion_full_colour(req->mask)) return 0;
+    if (!color_mem_present) return 0;
+    if (surface_width != req->width || surface_height != req->height ||
+        surface_format != req->format)
+        return 0;
+    plan = vp_clear_fusion_plan(1, fusion_enabled, color_mem_present,
+                                surface_pending, req->mask, dump_due, 0u);
+    return plan.defer_colour;
+}
+/* VP_HOST_TEST_EXTRACT:clear_defer_admit_end */
+
+/* Shared record step for both deferred-clear paths. The latest full colour
+ * wins; `async` records whether a scene was submitted without a completion
+ * proof at this boundary. An older async tag is never dropped by a later
+ * record: only a proven materialization or an in-scene GPU clear consumes it,
+ * so a mode switch or a coalescing clear cannot weaken the drain requirement. */
+/* VP_HOST_TEST_EXTRACT:clear_defer_record_begin */
+static void surface_clear_defer_record(VPGxmSurface *s, uint32_t color,
+                                       unsigned async) {
+    s->clear_pending = 1u;
+    s->clear_pending_color = color;
+    s->clear_pending_async = s->clear_pending_async || async;
+    gxm_clear_fusion_deferred++;
+}
+/* VP_HOST_TEST_EXTRACT:clear_defer_record_end */
+
+/* Worker lookup for the fast path. The surface metadata is read before any
+ * scene is submitted; a missing/mismatched surface or any diagnostic gate
+ * keeps the original path. */
+static int clear_defer_candidate(const VPGxmClearRequest *req,
+                                 VPGxmSurface **out) {
+    VPGxmSurface *s = NULL;
+    int enabled = gxm_clear_defer_enabled();
+    *out = NULL;
+    if (!enabled) return 0;
+    gxm_clear_defer_tries++;
+    s = surface_find(req->target_va);
+    if (!clear_defer_admit(req,
+                           s != NULL ? s->width : 0u,
+                           s != NULL ? s->height : 0u,
+                           s != NULL ? s->format : 0u,
+                           s != NULL && s->color_mem != NULL,
+                           s != NULL && s->clear_pending != 0u,
+                           enabled, gxm_ready, gxm_scene_poisoned,
+                           gxm_batch_test_active(),
+                           b34_dump_surface_capture_active(),
+                           gxm_scene_pipeline_active(),
+                           gxm_clear_fusion_enabled(), b34_dump_due())) {
+        gxm_clear_defer_fallbacks++;
+        return 0;
+    }
+    *out = s;
+    return 1;
+}
+
+/* Submit the open scene through the dedicated non-synchronous boundary, then
+ * record the admitted clear. The flush may fail; the request then keeps the
+ * original error and no clear state changes. */
+/* VP_HOST_TEST_EXTRACT:clear_defer_submit_begin */
+static int clear_defer_submit_and_record(VPGxmClearRequest *req,
+                                         VPGxmSurface *s, int scene_open) {
+    int rc;
+    if (scene_open) {
+        rc = gxm_batch_flush_worker(GXM_BATCH_REASON_CLEAR_DEFER);
+        if (rc < 0) {
+            gxm_clear_defer_submit_failures++;
+            return rc;
+        }
+        gxm_clear_defer_scene_submits++;
+    }
+    if (s->clear_pending) gxm_clear_defer_coalesced++;
+    surface_clear_defer_record(s, req->color, 1u);
+    gxm_clear_defer_accepts++;
+    return 0;
+}
+/* VP_HOST_TEST_EXTRACT:clear_defer_submit_end */
+
+static int frame_clear_internal_impl(VPGxmClearRequest *req, int allow_defer) {
     static unsigned clear_disabled_logs;
     VPGxmSurface *s;
+    VPGxmSurface *defer_surface = NULL;
     int wait_rc;
 
-    /* A clear writes guest-visible memory; no deferred scene may still read or
-     * write the same attachment. */
+    /* Mode 6 keeps the whole original clear machinery but, for a strictly
+     * admitted full-colour clear of an already matching surface, submits the
+     * open scene through the non-synchronous CLEAR_DEFER boundary and records
+     * only the pending colour. Every other request keeps the synchronous
+     * flush + pending drain below. */
+    if (allow_defer && clear_defer_candidate(req, &defer_surface))
+        return clear_defer_submit_and_record(req, defer_surface,
+                                             gxm_batch.scene_open);
+    /* All surface mutation runs on this worker. Admission above found an
+     * existing, matching colour-only surface; no allocation or depth work is
+     * needed on that branch. Every other clear keeps the original boundary. */
+    if (gxm_batch.scene_open) {
+        wait_rc = gxm_batch_flush_worker(GXM_BATCH_REASON_CLEAR);
+        if (wait_rc < 0) return wait_rc;
+    }
     wait_rc = gxm_pending_scene_complete("clear");
     if (wait_rc < 0) return wait_rc;
     VPGxmDepthBinding depth_binding;
@@ -11564,9 +11765,7 @@ static int frame_clear_internal(VPGxmClearRequest *req) {
          * its first in-scene draw. Sampling, present, readback and finish
          * materialize it. A depth/stencil clear in the same request is not
          * deferred and is recorded below. */
-        s->clear_pending = 1u;
-        s->clear_pending_color = req->color;
-        gxm_clear_fusion_deferred++;
+        surface_clear_defer_record(s, req->color, 0u);
         if (clear_plan.apply_depth) gxm_clear_fusion_combined++;
         if (gxm_clear_fusion_deferred <= 16u ||
             (gxm_clear_fusion_deferred % 256u) == 0u)
@@ -11607,6 +11806,13 @@ static int frame_clear_internal(VPGxmClearRequest *req) {
         if (rc == 0) b34_dump_surface("clear", s, NULL, req);
     }
     return rc;
+}
+
+/* Original clear entry. The self test and any non-worker caller never admit
+ * the mode-6 asynchronous record; only the worker dispatch below passes
+ * allow_defer. */
+static int frame_clear_internal(VPGxmClearRequest *req) {
+    return frame_clear_internal_impl(req, 0);
 }
 
 static int frame_finish_internal(void) {
@@ -11843,6 +12049,21 @@ static int surface_clear_gpu(VPGxmSurface *s, uint32_t color) {
 static void *gxm_clear_pixels[VP_GXM_BATCH_ARENAS];
 static void *gxm_clear_vertices[VP_GXM_BATCH_ARENAS];
 static void *gxm_clear_indices[VP_GXM_BATCH_ARENAS];
+
+/* The in-scene GPU clear is encoded after every earlier submitted scene of
+ * this context, so it consumes both the pending colour and its async tag
+ * without a CPU wait. The metadata update is shared by all in-scene consumers
+ * so the tag can never be cleared in one place but missed in another. */
+/* VP_HOST_TEST_EXTRACT:clear_in_scene_consume_begin */
+static void surface_clear_consumed_in_scene(VPGxmSurface *s) {
+    if (s->clear_pending_async) gxm_clear_defer_in_scene++;
+    s->clear_pending = 0u;
+    s->clear_pending_async = 0u;
+    s->color_clear_mask |= VP_CLEAR_FUSION_COLOR_MASK;
+    s->cleared_count++;
+    gxm_clear_fusion_in_scene++;
+}
+/* VP_HOST_TEST_EXTRACT:clear_in_scene_consume_end */
 
 static int frame_clear_in_scene(VPGxmSurface *dst) {
     VPGxmSurface source;
@@ -12293,12 +12514,12 @@ static unsigned gxm_worker_process(void) {
         gxm_api_perf.stream_entries++;
         execute(gxm_execute_user);
     } else if (gxm_pending_clear != NULL) {
-        int flush_rc = 0;
         work_kind = 1;
         VPGxmClearRequest *clear = gxm_pending_clear;
-        if (gxm_batch.scene_open)
-            flush_rc = gxm_batch_flush_worker(GXM_BATCH_REASON_CLEAR);
-        clear->rc = flush_rc < 0 ? flush_rc : frame_clear_internal(clear);
+        /* All clear requests (external worker dispatch and the worker-local
+         * route) share one admission decision. A refused request keeps the
+         * original synchronous clear boundary inside frame_clear_internal. */
+        clear->rc = frame_clear_internal_impl(clear, 1);
         gxm_pending_clear = NULL;
     } else if (gxm_pending_finish) {
         int flush_rc = 0;

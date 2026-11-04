@@ -10,7 +10,7 @@ Marker 是 `ux0:data/mhgu-vita-port/` 下的空文件或短文本文件。运行
 | `engine-full.enable` | 实验：替换公共队列、program／材质资源及状态准备；与 engine-layout／engine-submit-probe 互斥；默认关闭，restart 修正后村庄采样画面恢复，见 ADR 0019–0020 |
 | `engine-full-fast.enable` | 实验：启用已核对的纯查询直接计算、减少准备开销；存在时启用完整接管，默认关闭，见 ADR 0022 |
 | `engine-full-ab.enable` | 实验：同进程交替运行完整接管的原入口与 C 路径。存在时即使没有 `engine-full.enable` 也启用完整接管；与 engine-layout／engine-submit-probe 互斥；`VITA_PORT_ENGINE_CAPTURE` 诊断构建显式拒绝；见 ADR 0021、0023 |
-| `engine-full-mode.txt` | A/B 控制文件（不是 marker）：内容必须是一个 `0`–`5`，允许尾部空白。`0`=原 root，`1`=基础 C，`2`=优化 C，`3`=shared（原 root + 下游共享准备），`4`=deep（原 root + 独立深纹理管线），`5`=deep-recycle（同 4，允许先回收空闲的异尺寸纹理页）。仅 `engine-full-ab.enable` 存在时读取；补丁阶段先校验，运行时每 500 ms 轮询，缺失或非法时显式失败，不回退。`0`／`3`／`4`／`5` 使用同一原游戏 trampoline；只有 `3` 发布 shared 开关，`4`／`5` 发布纹理管线开关；5 的回收策略默认关闭，见 ADR 0025 |
+| `engine-full-mode.txt` | A/B 控制文件（不是 marker）：内容必须是一个 `0`–`6`，允许尾部空白。`0`=原 root，`1`=基础 C，`2`=优化 C，`3`=shared（原 root + 下游共享准备），`4`=deep（原 root + 独立深纹理管线），`5`=deep-recycle（同 4，允许先回收空闲的异尺寸纹理页），`6`=deep-clear（同 5，另允许符合准入的全通道颜色 clear 延迟到消费点并延后同步；depth/stencil、部分通道、资源不匹配及诊断/capture 仍走原同步路径）。仅 `engine-full-ab.enable` 存在时读取；补丁阶段先校验，运行时每 500 ms 轮询，缺失或非法时显式失败，不回退。`0`／`3`／`4`／`5`／`6` 使用同一原游戏 trampoline；只有 `3` 发布 shared 开关，`4`／`5`／`6` 发布纹理管线开关，`5`／`6` 允许空闲页回收，只有 `6` 发布 clear 延迟开关。见 ADR 0025、0026 |
 | `texture-pipeline.disable` | 退出当前分支默认启用的深纹理管线。存在 A/B 控制时由 `engine-full-mode.txt` 决定，本 marker 不覆盖。切换在 GPU submission 边界 drain 后应用，不改变 draw 内控制流 |
 | `play.enable` | 进入可玩路径；runner 默认写入 |
 | `display-bridge.enable` | 启用显示桥 |
@@ -46,7 +46,7 @@ Marker 是 `ux0:data/mhgu-vita-port/` 下的空文件或短文本文件。运行
 | Marker | 作用 |
 |---|---|
 | `play-perf.enable` | 启用逐帧/服务计时；关闭时计时字段为 0 |
-| `VP_GPU_WAIT` / `VP_GPU_WAIT_TOTAL` | play-perf 下每 32 个 present 输出完整 27 原因累计快照；记录真实通知等待、poll 命中、失败、阻塞时间及粗直方图，与原全局通知计时对账。用 `analyze_gpu_wait.py` 做完整快照端点差分；不是 GPU 硬件执行时间 |
+| `VP_GPU_WAIT` / `VP_GPU_WAIT_TOTAL` | play-perf 下每 32 个 present 输出完整 28 原因累计快照；记录真实通知等待、poll 命中、失败、阻塞时间及粗直方图，与原全局通知计时对账。mode 6 的 clear-materialize 等待单列一行。用 `analyze_gpu_wait.py` 做完整快照端点差分；不是 GPU 硬件执行时间 |
 | `draw-trace.enable` | draw 跟踪 |
 | `vtx-dump.enable` | 顶点 dump |
 | `b34-passdump.enable` | pass 级 dump；存在期间强制同步 scene，marker 消失前保持原行为 |
@@ -55,6 +55,7 @@ Marker 是 `ux0:data/mhgu-vita-port/` 下的空文件或短文本文件。运行
 | `texture-asset-dump.enable` | 纹理资产 dump |
 | `media-instrument.enable` | 媒体详细计时 |
 | `VP_TEX_POOL_STATS` / `VP_GXM_TEXTURE_PIPELINE_STATS` | deep 管线累计计数日志（既有 512 request／256 draw 节奏）：region 申请/复用、pressure、decode family、direct bind/bytes、retain/release/quarantine、实际 memcpy 字节、deferred scene、notification poll/real wait、combined drain、mode transition。region 模式的 arena 碎片项为 0，不能据此判断系统碎片；普通计时包含嵌套项 |
+| `VP_GXM_CLEAR_DEFER_STATS` | mode 6 累计计数，在既有 `static_log_stats` 节奏输出：try／accept／fallback／scene submit／coalesce／materialize 调用与失败／in-scene 消费／仍带 async 标签的 surface 数。不新增逐 clear 日志；`tries` 与 accept+fallback+submit_fail 对账，失败含真实错误传播 |
 
 ## 4. 输入
 

@@ -370,7 +370,10 @@ int vp_gxm_log_get_stats(VPLogSinkStats *out);
 int vp_gxm_worker_submit(VPGxmDrawRequest *request);
 
 /* Full-frame clear: create/lookup the surface named by target_va and apply the
- * Maxwell clear mask. Synchronous on the GXM worker. */
+ * Maxwell clear mask. Synchronous on the GXM worker. The A/B mode-6
+ * experiment may instead record an admitted full-colour clear and materialize
+ * it at a later consumption point; depth/stencil and every unadmitted request
+ * keep the original synchronous path. */
 int vp_gxm_frame_clear(VPGxmClearRequest *request);
 
 /* Present and dump the surface written by the last full-frame draw. Called when

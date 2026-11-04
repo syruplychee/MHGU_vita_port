@@ -10,6 +10,7 @@ volatile uint32_t vp_engine_full_fast_enabled;
 volatile uint32_t vp_engine_shared_prepare_enabled;
 volatile uint32_t vp_engine_texture_pipeline_enabled;
 volatile uint32_t vp_engine_texture_idle_resize_enabled;
+volatile uint32_t vp_engine_clear_defer_enabled;
 typedef struct {
     uint32_t fast,calls,draws,last_site,last_slot,buffers,handles;
 } PrepareFrame;

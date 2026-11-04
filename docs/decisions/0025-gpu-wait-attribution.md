@@ -15,8 +15,9 @@ ADR 0024 的最终 deep 路径中，通知阻塞约 21.619 ms/帧，旧路径约
 
 ## 决定与计数契约
 
-`gpu_wait_profile.h` 保存 27 类固定原因，每类累计 calls、real、polls、failures、
-block_us、pending_sum、draws、sync 和五桶等待直方图，结构共 2808 字节。
+`gpu_wait_profile.h` 保存固定原因（本轮 27 类；ADR 0026 增加
+`clear-materialize` 后共 28 类），每类累计 calls、real、polls、failures、
+block_us、pending_sum、draws、sync 和五桶等待直方图。
 桶边界为 `[0,100)`、`[100,1000)`、`[1000,5000)`、`[5000,20000)` 和 ≥20000 µs。
 
 - 同步 `frame_end_scene_timed` 与 deferred `gxm_pending_scene_wait` 全部计入；
@@ -127,6 +128,10 @@ SELF `cbe18dce3efa3cd4e25cf3a0097f6f4e1698aa157acf806ba8a2a0c81ecd6fae`。
 不把 Qt 启动器截图当游戏画面验收。
 
 ### 有效同进程复测（L3）
+
+后续范围校正（ADR 0026）：该轮带 `capture-live inputs=0`，其捕获后 enabled 状态
+会让旧 clear fusion 持续关闭。下面 5.25% 的同进程对照仍是该配置下的观察，但不能
+当作完全关闭诊断时的生产默认性能；新清屏实验将 GPU 读回与性能测量分开。
 
 目录：`build/runs/gpu-wait-recycle-repeat-20261104`，同一 VPK/SELF、模拟器及资源包，
 普通 OpenGL、540p、`disable-surface-sync=true`，没有使用 SurfaceReadback。

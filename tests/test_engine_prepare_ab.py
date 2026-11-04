@@ -22,9 +22,10 @@ ELAPSED = {
     "shared": [95, 105, 115, 125, 135, 145, 155, 165, 175, 185],
     "deep": [90, 100, 110, 120, 130, 140, 150, 160, 170, 180],
     "deep-recycle": [85, 95, 105, 115, 125, 135, 145, 155, 165, 175],
+    "deep-clear": [87, 97, 107, 117, 127, 137, 147, 157, 167, 177],
 }
 ENCODED = {"original": 100, "native": 200, "fast": 150, "shared": 120,
-           "deep": 110, "deep-recycle": 110}
+           "deep": 110, "deep-recycle": 110, "deep-clear": 110}
 
 
 def prepare_line(mode, entry_us, elapsed_us, encoded, growth, presents):
@@ -207,6 +208,26 @@ class PrepareAbTests(unittest.TestCase):
         sdk, gxm = build_case(phases)
         report = analyze_logs(sdk, gxm, phases, warmup_seconds=1.0)
         self.assertIn("deep-recycle", report["aggregate"])
+
+    def test_clear_defer_mode_name_is_accepted(self):
+        phases = [dict(p, mode="deep-recycle" if i % 2 == 0 else "deep-clear")
+                  for i, p in enumerate(PHASES)]
+        sdk, gxm = build_case(phases)
+        report = analyze_logs(sdk, gxm, phases, warmup_seconds=1.0)
+        self.assertIn("deep-clear", report["aggregate"])
+        self.assertIn("deep-recycle", report["aggregate"])
+        self.assertEqual(report["delta"]["comparison_mode"], "deep-clear")
+        # A raw control digit is not a phase name.
+        with self.assertRaisesRegex(ValueError, "unknown mode"):
+            validate_phases([
+                {"mode": "deep-recycle", "start_us": 1_000_000,
+                 "end_us": 4_000_000},
+                {"mode": "6", "start_us": 4_100_000, "end_us": 7_100_000},
+                {"mode": "deep-recycle", "start_us": 7_200_000,
+                 "end_us": 10_200_000},
+                {"mode": "deep-clear", "start_us": 10_300_000,
+                 "end_us": 13_300_000},
+            ])
 
     def test_deep_mode_name_is_accepted(self):
         phases = [

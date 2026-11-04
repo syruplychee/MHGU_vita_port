@@ -57,6 +57,33 @@ foreach(section
 endforeach()
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/gxm_render_pipeline_production.inc"
      "${VP_GXM_RENDER_PIPELINE_SOURCE}")
+
+# Mode-6 clear defer: admission, record, materialization and in-scene
+# consumption are extracted from the same production file. The surface struct
+# is a separate include so the host fixture can define its GXM handle stubs
+# before referencing the type. Section order follows the definitions the
+# remaining extracted bodies need.
+vp_extract_marked("${VP_GXM_RUNTIME_SOURCE}"
+    "/* VP_HOST_TEST_EXTRACT:clear_surface_begin */"
+    "/* VP_HOST_TEST_EXTRACT:clear_surface_end */"
+    vp_clear_surface_section)
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/clear_surface_production.inc"
+     "${vp_clear_surface_section}")
+
+set(VP_CLEAR_DEFER_SOURCE "")
+foreach(section
+        clear_reason_enum clear_reason_name clear_reason_sync
+        clear_defer_admit clear_defer_record clear_defer_submit
+        clear_materialize clear_in_scene_consume)
+    vp_extract_marked("${VP_GXM_RUNTIME_SOURCE}"
+        "/* VP_HOST_TEST_EXTRACT:${section}_begin */"
+        "/* VP_HOST_TEST_EXTRACT:${section}_end */"
+        extracted)
+    string(APPEND VP_CLEAR_DEFER_SOURCE "${extracted}\n")
+endforeach()
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/clear_defer_production.inc"
+     "${VP_CLEAR_DEFER_SOURCE}")
+
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
              "${VP_SRC}/platform/gxm_runtime.c")
 
@@ -86,7 +113,11 @@ vp_host_test(engine_queue_native "${VP_SRC}/platform/engine_queue_native.c"
 vp_host_test(engine_layout "${VP_SRC}/platform/engine_layout.c" "${VP_SRC}/platform/gpu_stream.c")
 target_compile_definitions(engine_layout PRIVATE VP_ENGINE_LAYOUT_CORE_ONLY=1)
 # audio_auto_catchup needs MAP_32BIT and is built in the UNIX block below.
+vp_host_test(clear_defer)
+target_include_directories(clear_defer PRIVATE
+                           "${CMAKE_CURRENT_BINARY_DIR}")
 vp_host_test(clear_fusion "${VP_SRC}/platform/gxm_depth.c")
+vp_host_test(engine_mode)
 vp_host_test(float_bits_numeric)
 vp_host_test(gpu_command_buffer "${VP_SRC}/platform/gpu_stream.c")
 vp_host_test(gpu_effective_rt "${VP_SRC}/platform/gpu_stream.c")

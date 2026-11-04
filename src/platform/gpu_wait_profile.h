@@ -11,7 +11,8 @@ static const char *const vp_gpu_wait_names[] = {
     "mode-change", "ineligible", "clear", "present", "readback", "resource",
     "failure", "legacy", "arena-reuse", "texture-pool", "surface-release",
     "depth-destroy", "resident-evict", "pair-release", "surface-recycle",
-    "abort", "frame-finish", "refresh", "sync-scene", "sync-blit", "other"
+    "abort", "frame-finish", "refresh", "sync-scene", "sync-blit",
+    "clear-materialize", "other"
 };
 #define VP_GPU_WAIT_CAUSES (sizeof(vp_gpu_wait_names) / sizeof(vp_gpu_wait_names[0]))
 #define VP_GPU_WAIT_BUCKETS 5u

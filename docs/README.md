@@ -70,3 +70,4 @@
 - [0023 下游共享 shader／纹理资源与 GXM 准备实验](decisions/0023-shared-downstream-prepare.md)
 - [0024 深纹理解码池与 decoder-owned 直接绑定实验](decisions/0024-deep-texture-pipeline.md)
 - [0025 GPU 通知等待按触发原因计时](decisions/0025-gpu-wait-attribution.md)
+- [0026 延迟 clear 的提交与同步契约](decisions/0026-deferred-clear-sync.md)
