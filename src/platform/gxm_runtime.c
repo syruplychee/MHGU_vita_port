@@ -22,6 +22,7 @@
 #include "vertex_format.h"
 #include "vertex_window.h"
 #include "gpu_indices.h"
+#include "gpu_wait_profile.h"
 
 #include <psp2/display.h>
 #include <psp2/gxm.h>
@@ -997,6 +998,9 @@ static int gxm_clear_fusion_enabled(void) {
  * zero unless the play-perf marker gates the timestamps on. */
 static uint64_t gxm_endscene_calls, gxm_endscene_us;
 static uint64_t gxm_notify_wait_calls, gxm_notify_wait_us;
+static VPGpuWaitProfile gxm_wait_profile;
+static unsigned gxm_wait_reclaim_active;
+static unsigned gxm_wait_snapshot;
 static uint64_t gxm_notify_poll_hits, gxm_notify_real_waits;
 static uint64_t gxm_finish_calls, gxm_finish_us;
 static uint64_t gxm_pending_complete_calls, gxm_pending_wait_us;
@@ -1018,6 +1022,31 @@ static unsigned gxm_pending_scene_count;
 /* Age since EndScene, not blocking; the worker may have encoded a whole scene
  * while the deferred scene ran. Kept only for overlap diagnostics. */
 static uint64_t gxm_pipeline_waits, gxm_pipeline_age_us, gxm_pipeline_age_max;
+
+static void gxm_wait_profile_log(uint64_t now, uint64_t frames) {
+    if (gxm_profile_state != 1) return;
+    unsigned snapshot = ++gxm_wait_snapshot;
+    for (unsigned i = 0u; i < VP_GPU_WAIT_CAUSES; ++i) {
+        const VPGpuWaitCause *c = &gxm_wait_profile.causes[i];
+        glog("VP_GPU_WAIT snap=%u t_us=%llu frames=%llu row=%u rows=%u "
+             "cause=%s calls=%llu real=%llu polls=%llu failures=%llu "
+             "block_us=%llu pending_sum=%llu draws=%llu sync=%llu "
+             "b0=%llu b1=%llu b2=%llu b3=%llu b4=%llu\n",
+             snapshot, (unsigned long long)now, (unsigned long long)frames,
+             i, (unsigned)VP_GPU_WAIT_CAUSES, vp_gpu_wait_names[i],
+             (unsigned long long)c->calls, (unsigned long long)c->real_waits,
+             (unsigned long long)c->polls, (unsigned long long)c->failures,
+             (unsigned long long)c->block_us, (unsigned long long)c->pending_sum,
+             (unsigned long long)c->draws, (unsigned long long)c->synchronous,
+             (unsigned long long)c->buckets[0], (unsigned long long)c->buckets[1],
+             (unsigned long long)c->buckets[2], (unsigned long long)c->buckets[3],
+             (unsigned long long)c->buckets[4]);
+    }
+    glog("VP_GPU_WAIT_TOTAL snap=%u t_us=%llu frames=%llu real=%llu "
+         "block_us=%llu\n", snapshot, (unsigned long long)now,
+         (unsigned long long)frames, (unsigned long long)gxm_notify_wait_calls,
+         (unsigned long long)gxm_notify_wait_us);
+}
 
 /* Bounded draw timing. Fields are split exactly at the synchronous boundaries
  * this backend owns: CPU preparation, BeginScene, state/encode, sceGxmDraw,
@@ -1682,6 +1711,7 @@ static void gxm_perf_present(uint64_t fn_us, uint64_t now) {
              (unsigned long long)gxm_perf_global_fail,
              (unsigned long long)gxm_perf_global_skip);
     if ((gxm_perf_present_frames % 32u) == 0u) {
+        gxm_wait_profile_log(now, gxm_perf_present_frames);
         glog("VP_GXM_FRAME_INTERVALS t_us=%llu count=%llu sum_us=%llu width_us=1000\n",
             (unsigned long long)now,(unsigned long long)gxm_perf_present_interval_count,
             (unsigned long long)gxm_perf_present_interval_sum);
@@ -2950,7 +2980,7 @@ static int init_vertex_uniforms(void *buffer, const SceGxmProgram *program) {
  * this again if it fails: a failed EndScene leaves the context in an explicit
  * failed state rather than silently resetting it. The context is explicit so
  * the local bring-up probe never ends the worker's main scene by accident. */
-static int frame_end_scene_timed(SceGxmContext *context,
+static int frame_end_scene_timed(SceGxmContext *context, const char *why,
                                  uint64_t *out_end, uint64_t *out_notify,
                                  uint64_t *out_finish) {
     SceGxmNotification notification;
@@ -2982,6 +3012,8 @@ static int frame_end_scene_timed(SceGxmContext *context,
     started = gxm_prof_now();
     rc = sceGxmNotificationWait(&notification);
     finished = gxm_prof_now();
+    vp_gpu_wait_record(&gxm_wait_profile, why, started, finished, 1, rc,
+                       gxm_pending_scene_count, 0u, 1);
     if (started != 0u) {
         gxm_notify_wait_calls++;
         gxm_notify_wait_us += finished - started;
@@ -3003,7 +3035,7 @@ static int frame_end_scene_timed(SceGxmContext *context,
 }
 
 static int frame_end_scene(SceGxmContext *context) {
-    return frame_end_scene_timed(context, NULL, NULL, NULL);
+    return frame_end_scene_timed(context, "sync-scene", NULL, NULL, NULL);
 }
 
 
@@ -7846,6 +7878,10 @@ static int gxm_pending_scene_wait(VPGxmPendingScene *pending, const char *why) {
         real_wait = 1;
     }
     finished = gxm_prof_now();
+    vp_gpu_wait_record(&gxm_wait_profile,
+                       gxm_wait_reclaim_active ? "texture-pool" : why,
+                       started, finished, real_wait, rc,
+                       gxm_pending_scene_count, pending->draws, 0);
     if (started != 0u && real_wait) {
         blocked = finished - started;
         gxm_notify_wait_calls++;
@@ -8019,7 +8055,7 @@ static int gxm_batch_flush_worker(unsigned reason) {
     if (gxm_pending_scene_count &&
         (!pipeline || (needs_sync && (!combine || !gxm_batch.scene_open)))) {
         /* CPU-visible boundaries drain pending work before touching backing. */
-        int wait_rc = gxm_pending_scene_complete("flush");
+        int wait_rc = gxm_pending_scene_complete(gxm_batch_reason_name(reason));
         if (wait_rc < 0) {
             unsigned dropped = vp_batch_policy_abort(&gxm_batch.policy,
                                                      &gxm_batch.stats);
@@ -8052,7 +8088,7 @@ static int gxm_batch_flush_worker(unsigned reason) {
     }
     pending = gxm_batch.policy.open ? gxm_batch.policy.draws : 0u;
     if (pending != gxm_batch.count) {
-        int cleanup = frame_end_scene_timed(gxm_context, &t_end, &t_notify,
+        int cleanup = frame_end_scene_timed(gxm_context, "failure", &t_end, &t_notify,
                                             &t_finished);
         gxm_scene_poisoned = 1;
         vp_batch_policy_abort(&gxm_batch.policy, &gxm_batch.stats);
@@ -8088,7 +8124,8 @@ static int gxm_batch_flush_worker(unsigned reason) {
             deferred_value = notification.value;
         }
     } else {
-        rc = frame_end_scene_timed(gxm_context, &t_end, &t_notify, &t_finished);
+        rc = frame_end_scene_timed(gxm_context, gxm_batch_reason_name(reason),
+                                   &t_end, &t_notify, &t_finished);
     }
     if (rc < 0) {
         frame_poison_context(rc);
@@ -8209,7 +8246,7 @@ static int gxm_batch_flush_worker(unsigned reason) {
     if (deferred && needs_sync) {
         /* One wait for the newest notification proves every earlier scene,
          * including the current one submitted above. */
-        rc = gxm_pending_scene_complete("flush-sync");
+        rc = gxm_pending_scene_complete(gxm_batch_reason_name(reason));
         if (rc < 0) return rc;
     }
     return 0;
@@ -8330,7 +8367,9 @@ static int gxm_texture_pipeline_reclaim_worker(void) {
     /* Inline on the GXM worker: no second worker wait can deadlock here. The
      * RESOURCE boundary submits the open scene and waits for the newest
      * notification, which also proves every older deferred scene. */
+    gxm_wait_reclaim_active = 1u;
     rc = gxm_batch_flush_worker(GXM_BATCH_REASON_RESOURCE);
+    gxm_wait_reclaim_active = 0u;
     if (rc < 0) return rc;
     rc = gxm_pending_scene_complete("texture-pool");
     if (rc < 0) return rc;
@@ -8378,7 +8417,7 @@ static int gxm_batch_finish_aborted_worker(const char *why, int draw_rc) {
         return 0;
     }
     pending = gxm_batch.policy.open ? gxm_batch.policy.draws : 0u;
-    rc = frame_end_scene_timed(gxm_context, &t_end, &t_notify, &t_finished);
+    rc = frame_end_scene_timed(gxm_context, "abort", &t_end, &t_notify, &t_finished);
     if (rc < 0) {
         frame_poison_context(rc);
         vp_batch_policy_abort(&gxm_batch.policy, &gxm_batch.stats);
@@ -11088,7 +11127,8 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
     }
     {
         gxm_draw_stage = 13u;
-        rc = frame_end_scene_timed(gxm_context, &t_end, &t_notify, &t_finished);
+        rc = frame_end_scene_timed(gxm_context, "sync-scene",
+                                   &t_end, &t_notify, &t_finished);
         if (rc < 0) {
             /* The scene is no longer safely owned: never retry EndScene. */
             scene_state = 2;
@@ -11764,7 +11804,7 @@ static int frame_blit_gpu(VPGxmSurface *s,void *dst,unsigned x0,unsigned y0,
     if (rc>=0) rc=sceGxmDraw(gxm_context,SCE_GXM_PRIMITIVE_TRIANGLE_STRIP,
         SCE_GXM_INDEX_FORMAT_U16,gxm_blit_indices,4);
     {
-        int end = frame_end_scene(gxm_context);
+        int end = frame_end_scene_timed(gxm_context, "sync-blit", NULL, NULL, NULL);
         if (end < 0) {
             frame_poison_context(end);
             glog("VP_GXM_PRESENT scene_unwind rc=%d draw_rc=%d context_failed=1\n",

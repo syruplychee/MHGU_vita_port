@@ -24,7 +24,7 @@ import re
 import statistics
 import sys
 
-MODES = ("original", "native", "fast", "shared", "deep")
+MODES = ("original", "native", "fast", "shared", "deep", "deep-recycle")
 FIELD = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=([^\s]+)")
 REQUIRED_PREPARE = (
     "mode", "thread", "context", "entry_us", "t_us", "elapsed_us",

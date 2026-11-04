@@ -10,7 +10,7 @@ Marker 是 `ux0:data/mhgu-vita-port/` 下的空文件或短文本文件。运行
 | `engine-full.enable` | 实验：替换公共队列、program／材质资源及状态准备；与 engine-layout／engine-submit-probe 互斥；默认关闭，restart 修正后村庄采样画面恢复，见 ADR 0019–0020 |
 | `engine-full-fast.enable` | 实验：启用已核对的纯查询直接计算、减少准备开销；存在时启用完整接管，默认关闭，见 ADR 0022 |
 | `engine-full-ab.enable` | 实验：同进程交替运行完整接管的原入口与 C 路径。存在时即使没有 `engine-full.enable` 也启用完整接管；与 engine-layout／engine-submit-probe 互斥；`VITA_PORT_ENGINE_CAPTURE` 诊断构建显式拒绝；见 ADR 0021、0023 |
-| `engine-full-mode.txt` | A/B 控制文件（不是 marker）：内容必须是一个 `0`、`1`、`2`、`3` 或 `4`，允许尾部空白。`0`=原 root，`1`=基础 C，`2`=优化 C，`3`=shared（原 root + 下游共享准备），`4`=deep（原 root + 独立深纹理管线，不启用 shared）。仅 `engine-full-ab.enable` 存在时读取；补丁阶段先校验，运行时每 500 ms 轮询，缺失或非法时显式失败，不回退。`0`／`3`／`4` 使用同一原游戏 trampoline；只有 `3` 发布 shared 开关，只有 `4` 发布纹理管线开关 |
+| `engine-full-mode.txt` | A/B 控制文件（不是 marker）：内容必须是一个 `0`–`5`，允许尾部空白。`0`=原 root，`1`=基础 C，`2`=优化 C，`3`=shared（原 root + 下游共享准备），`4`=deep（原 root + 独立深纹理管线），`5`=deep-recycle（同 4，允许先回收空闲的异尺寸纹理页）。仅 `engine-full-ab.enable` 存在时读取；补丁阶段先校验，运行时每 500 ms 轮询，缺失或非法时显式失败，不回退。`0`／`3`／`4`／`5` 使用同一原游戏 trampoline；只有 `3` 发布 shared 开关，`4`／`5` 发布纹理管线开关；5 的回收策略默认关闭，见 ADR 0025 |
 | `texture-pipeline.disable` | 退出当前分支默认启用的深纹理管线。存在 A/B 控制时由 `engine-full-mode.txt` 决定，本 marker 不覆盖。切换在 GPU submission 边界 drain 后应用，不改变 draw 内控制流 |
 | `play.enable` | 进入可玩路径；runner 默认写入 |
 | `display-bridge.enable` | 启用显示桥 |
@@ -46,6 +46,7 @@ Marker 是 `ux0:data/mhgu-vita-port/` 下的空文件或短文本文件。运行
 | Marker | 作用 |
 |---|---|
 | `play-perf.enable` | 启用逐帧/服务计时；关闭时计时字段为 0 |
+| `VP_GPU_WAIT` / `VP_GPU_WAIT_TOTAL` | play-perf 下每 32 个 present 输出完整 27 原因累计快照；记录真实通知等待、poll 命中、失败、阻塞时间及粗直方图，与原全局通知计时对账。用 `analyze_gpu_wait.py` 做完整快照端点差分；不是 GPU 硬件执行时间 |
 | `draw-trace.enable` | draw 跟踪 |
 | `vtx-dump.enable` | 顶点 dump |
 | `b34-passdump.enable` | pass 级 dump；存在期间强制同步 scene，marker 消失前保持原行为 |

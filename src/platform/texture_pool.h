@@ -92,6 +92,9 @@ typedef struct {
     void *(*allocate)(void *user, size_t bytes, int gpu_read);
     int (*release)(void *user, void *base);
     int failed;
+    /* Page-backed providers can resize idle regions without a kernel remap.
+     * This never permits eviction of CPU pins or GPU references. */
+    unsigned idle_resize;
     size_t bytes;
     unsigned pages;
     uint8_t page_map[VP_TEXTURE_POOL_MAX_PAGES];

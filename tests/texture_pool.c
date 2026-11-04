@@ -551,6 +551,41 @@ static void test_pressure_preserves_wrong_size_regions(void) {
 }
 
 static VPTextureRegions mapped_regions;
+static void test_idle_resize_keeps_gpu_payload(void) {
+    Fixture f;
+    uint8_t bytes[PAGE * 2u];
+    VPTexturePoolToken held, lease, next;
+    uint8_t *raw, *rgba, *held_pixels;
+    int reused;
+    memset(&f, 0, sizeof(f)); memset(bytes, 0x39, sizeof(bytes));
+    region_allocs = region_frees = 0u; region_fail = 0;
+    assert(vp_texture_pool_init_regions(&f.pool, 6u * PAGE, NULL,
+        region_allocate, region_release) == 0);
+    f.pool.idle_resize = 1u;
+    held = store(&f, 1u, bytes, PAGE, PAGE, NULL);
+    held_pixels = f.pool.slots[held.slot].rgba;
+    memset(held_pixels, 0xa7, PAGE);
+    assert(vp_texture_pool_retain_gpu(&f.pool, held_pixels, &lease) == 1);
+    vp_texture_pool_begin_request(&f.pool);
+    store(&f, 2u, bytes, 2u * PAGE, 2u * PAGE, NULL);
+    vp_texture_pool_begin_request(&f.pool);
+    VPTexturePoolKey key = key_for(3u);
+    assert(vp_texture_pool_begin_store(&f.pool, &key, PAGE, PAGE, &next,
+        &raw, &rgba, &reused) == VP_TEXTURE_POOL_STORE_OK);
+    assert(next.slot != held.slot && f.pool.pressure_events == 0u);
+    for (unsigned i = 0; i < PAGE; ++i) assert(held_pixels[i] == 0xa7);
+    assert(f.pool.slots[held.slot].gpu_refs == 1u);
+    vp_texture_pool_abort_store(&f.pool, next);
+    /* CPU-pinned regions still cannot be resized, even by the experiment. */
+    vp_texture_pool_begin_request(&f.pool);
+    store(&f, 4u, bytes, 2u * PAGE, 2u * PAGE, NULL);
+    assert(vp_texture_pool_begin_store(&f.pool, &key, PAGE, PAGE, &next,
+        &raw, &rgba, &reused) == VP_TEXTURE_POOL_STORE_PRESSURE);
+    assert(vp_texture_pool_release_gpu(&f.pool, lease) == 0);
+    assert(vp_texture_pool_reset(&f.pool) == 0);
+    assert(region_allocs == region_frees);
+    puts("PASS idle resize evicts only idle payloads and preserves GPU/CPU pins");
+}
 static void *mapped_create(void *user, size_t bytes) {
     return region_allocate(user, bytes, 1);
 }
@@ -599,6 +634,7 @@ int main(void) {
     test_reusable_regions();
     test_region_updates_and_kernel_pressure();
     test_pressure_preserves_wrong_size_regions();
+    test_idle_resize_keeps_gpu_payload();
     test_working_set_replaces_cold_large_textures();
     test_inflight_content_version();
     test_init_validation();

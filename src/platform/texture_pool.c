@@ -399,6 +399,7 @@ int vp_texture_pool_begin_store(VPTexturePool *pool,
              * remain invisible to the allocator and trigger kernel churn. */
             if ((pool->slots[victim].raw_bytes != raw_bytes ||
                  pool->slots[victim].rgba_bytes != rgba_bytes) &&
+                !pool->idle_resize &&
                 pool_pressure_possible(pool)) {
                 pool->pressure_events++;
                 return VP_TEXTURE_POOL_STORE_PRESSURE;

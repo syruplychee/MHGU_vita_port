@@ -21,9 +21,10 @@ ELAPSED = {
     "fast": [75, 85, 95, 105, 115, 125, 135, 145, 155, 165],
     "shared": [95, 105, 115, 125, 135, 145, 155, 165, 175, 185],
     "deep": [90, 100, 110, 120, 130, 140, 150, 160, 170, 180],
+    "deep-recycle": [85, 95, 105, 115, 125, 135, 145, 155, 165, 175],
 }
 ENCODED = {"original": 100, "native": 200, "fast": 150, "shared": 120,
-           "deep": 110}
+           "deep": 110, "deep-recycle": 110}
 
 
 def prepare_line(mode, entry_us, elapsed_us, encoded, growth, presents):
@@ -200,6 +201,13 @@ class PrepareAbTests(unittest.TestCase):
         self.assertIn("shared", report["aggregate"])
         self.assertEqual(report["phases"][1]["samples"], 10)
 
+    def test_recycle_mode_name_is_accepted(self):
+        phases = [dict(p, mode="deep" if i % 2 == 0 else "deep-recycle")
+                  for i, p in enumerate(PHASES)]
+        sdk, gxm = build_case(phases)
+        report = analyze_logs(sdk, gxm, phases, warmup_seconds=1.0)
+        self.assertIn("deep-recycle", report["aggregate"])
+
     def test_deep_mode_name_is_accepted(self):
         phases = [
             {"mode": "original", "start_us": 1_000_000, "end_us": 4_000_000},
@@ -219,7 +227,7 @@ class PrepareAbTests(unittest.TestCase):
         bad_mode = sdk.replace("mode=original", "mode=other", 1)
         with self.assertRaisesRegex(ValueError, "unknown preparation mode"):
             analyze_logs(bad_mode, gxm, PHASES, warmup_seconds=1.0)
-        # The runtime accepts control digits 0..4, but a logged mode=4 is not
+        # The runtime accepts control digits 0..5, but a logged mode=4 is not
         # a phase name; the phase name for mode 4 is "deep".
         mode4 = sdk.replace("mode=original", "mode=4", 1)
         with self.assertRaisesRegex(ValueError, "unknown preparation mode"):

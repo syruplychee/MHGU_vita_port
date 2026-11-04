@@ -13,6 +13,8 @@ add_test(NAME frame_window_metrics
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_frame_window.py")
 add_test(NAME engine_prepare_ab_metrics
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_engine_prepare_ab.py")
+add_test(NAME gpu_wait_metrics
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_gpu_wait_metrics.py")
 
 set(VP_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../src")
 set(VP_INCLUDES
@@ -92,6 +94,7 @@ vp_host_test(gpu_indices)
 vp_host_test(gpu_stream "${VP_SRC}/platform/gpu_stream.c")
 vp_host_test(gpu_texture_decode "${VP_SRC}/platform/gpu_texture.c")
 vp_host_test(gpu_uniform_state "${VP_SRC}/platform/gpu_stream.c")
+vp_host_test(gpu_wait_profile)
 vp_host_test(gxm_depth "${VP_SRC}/platform/gxm_depth.c")
 vp_host_test(gxm_render_pipeline)
 target_include_directories(gxm_render_pipeline PRIVATE

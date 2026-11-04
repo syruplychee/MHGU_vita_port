@@ -6,6 +6,7 @@
  * algorithm. */
 #include "gxm_runtime.h"
 #include "texture_pipeline.h"
+#include "gpu_wait_profile.h"
 
 #include <assert.h>
 #include <stdint.h>
@@ -140,6 +141,8 @@ static void glog(const char *format, ...) {
     (void)format;
 }
 
+static VPGpuWaitProfile gxm_wait_profile;
+static unsigned gxm_wait_reclaim_active;
 #include "gxm_render_pipeline_production.inc"
 
 typedef struct {
@@ -368,6 +371,8 @@ static void test_hint_refresh_after_hole(void) {
 }
 
 static void pending_reset(void) {
+    memset(&gxm_wait_profile, 0, sizeof(gxm_wait_profile));
+    gxm_wait_reclaim_active = 0u;
     memset(gxm_pending_scenes, 0, sizeof(gxm_pending_scenes));
     gxm_pending_scene_count = 0u;
     memset(gxm_uploads, 0, sizeof(gxm_uploads));
@@ -536,6 +541,8 @@ static void test_completion_poll_skips_duplicate_wait(void) {
     assert(test_wait_calls == 0u);
     assert(gxm_notify_poll_hits == 1u);
     assert(gxm_notify_real_waits == 0u);
+    assert(gxm_wait_profile.causes[vp_gpu_wait_cause("other")].polls == 1u);
+    assert(gxm_wait_profile.causes[vp_gpu_wait_cause("other")].block_us == 0u);
     assert(gxm_pending_scene_count == 0u);
     assert(test_direct_releases == 2u);
     assert(test_last_released.slot == 4u && test_last_released.generation == 9u);
@@ -564,6 +571,9 @@ static void test_completion_failure_keeps_direct_refs(void) {
     assert(gxm_notify_real_waits == 1u);
     assert(test_direct_releases == 0u);
     assert(gxm_pending_scenes[0].direct_count == 1u);
+    assert(gxm_wait_profile.causes[vp_gpu_wait_cause("other")].failures == 1u);
+    assert(gxm_wait_profile.causes[vp_gpu_wait_cause("other")].block_us ==
+           gxm_notify_wait_us);
 
     /* A later observation that already equals the pending value proves
      * completion without the SVC; only then is the lease released. */

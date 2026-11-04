@@ -2163,6 +2163,8 @@ static uint8_t *texture_pool_decode(VPGuestSvc *svc, const VPGpuTextureInfo *t,
     deep_misses++;
     texture_misses++;
     if (lookup_started) texture_lookup_us += sceKernelGetProcessTimeWide() - lookup_started;
+    deep_texture_pool.idle_resize = __atomic_load_n(
+        &vp_engine_texture_idle_resize_enabled, __ATOMIC_ACQUIRE);
     rc = vp_texture_pool_begin_store(&deep_texture_pool, &key, t->storage,
                                      rgba_bytes, &token, &raw, &rgba, &reused);
     if (rc == VP_TEXTURE_POOL_STORE_PRESSURE) {
