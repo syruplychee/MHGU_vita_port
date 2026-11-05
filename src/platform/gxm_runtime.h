@@ -424,7 +424,7 @@ void vp_gxm_texture_owned_retire(const void *source);
 
 /* Deep texture-pipeline support. Reusable regions back the pool. Decoded
  * regions use class 0 (uncached, GXM-mapped for read); split raw snapshots use
- * class 1 (cached, never GXM-mapped). Reclaim
+ * class 1 (existing cached C heap, never GXM-mapped). Reclaim
  * flushes the open scene and waits for every deferred notification so all
  * direct-texture leases are provably released before the pool is reused,
  * torn down or retried. */

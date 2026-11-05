@@ -33,6 +33,7 @@
 #include <psp2/kernel/processmgr.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <malloc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1060,6 +1061,7 @@ static uint64_t gxm_direct_retains;
 static uint64_t gxm_direct_bind_failures;
 static int gxm_direct_seen;
 static VPTextureRegions gxm_texture_region_arena;
+static uint64_t gxm_texture_kernel_allocs, gxm_texture_kernel_frees;
 /* Tentative declarations used by the early statistics logger; the
  * authoritative definitions live in the extracted direct/pending sections. */
 static uint64_t gxm_direct_releases;
@@ -5101,8 +5103,8 @@ static void static_log_stats(void) {
              "mapped_allocated_bytes=%u cached_allocated_bytes=%u\n",
              (unsigned)gxm_texture_region_arena.physical_bytes,
              (unsigned)gxm_texture_region_arena.peak_bytes,
-             (unsigned long long)gxm_texture_region_arena.kernel_allocs,
-             (unsigned long long)gxm_texture_region_arena.kernel_frees,
+             (unsigned long long)gxm_texture_kernel_allocs,
+             (unsigned long long)gxm_texture_kernel_frees,
              (unsigned long long)gxm_texture_region_arena.suballocs,
              (unsigned long long)gxm_texture_region_arena.subfrees,
              gxm_texture_region_arena.live, gxm_texture_region_arena.failed,
@@ -8738,31 +8740,54 @@ typedef struct {
 static VPGxmTextureRegion gxm_texture_regions[VP_TEXTURE_REGION_CHUNKS];
 
 /* Class 0 is the decoded GPU payload: uncached main memory mapped for GPU
- * read. Class 1 is a CPU-only raw snapshot: ordinary cached main memory that
- * is never passed to sceGxmMapMemory and never bound to a texture unit. */
+ * read. Class 1 suballocates the existing cached C heap: the emulator's large
+ * guest arena leaves no space for new USER_RW blocks after boot. It never
+ * maps these CPU-only snapshots or binds them to a texture unit. */
 static void *gxm_texture_chunk_create(void *user, size_t bytes,
                                       unsigned allocation_class) {
     unsigned slot;
     SceUID uid;
     void *base = NULL;
     int mapped = allocation_class == VP_TEXTURE_REGION_CLASS_MAPPED;
-    SceKernelMemBlockType type = mapped
-        ? SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE
-        : SCE_KERNEL_MEMBLOCK_TYPE_USER_RW;
     (void)user;
     if (allocation_class >= VP_TEXTURE_REGION_CLASSES) return NULL;
     for (slot = 0; slot < VP_TEXTURE_REGION_CHUNKS; ++slot)
         if (!gxm_texture_regions[slot].base) break;
     if (slot == VP_TEXTURE_REGION_CHUNKS) return NULL;
-    uid = sceKernelAllocMemBlock("vpTexPool", type, bytes, NULL);
+    if (!mapped) {
+        SceKernelMemBlockInfo info;
+        int rc;
+        base = memalign(VP_TEXTURE_REGION_PAGE, bytes);
+        if (!base) {
+            glog("VP_TEX_POOL_ALLOC_FAIL bytes=%u class=%u mapped=0 "
+                 "kind=cached-heap\n", (unsigned)bytes, allocation_class);
+            return NULL;
+        }
+        memset(&info, 0, sizeof(info));
+        info.size = sizeof(info);
+        rc = sceKernelGetMemBlockInfoByAddr(base, &info);
+        if (rc < 0 || info.type != SCE_KERNEL_MEMBLOCK_TYPE_USER_RW) {
+            glog("VP_TEX_POOL_HEAP_TYPE_FAIL rc=%d type=0x%x bytes=%u\n",
+                 rc, (unsigned)info.type, (unsigned)bytes);
+            free(base);
+            return NULL;
+        }
+        glog("VP_TEX_POOL_BACKING class=1 mapped=0 kind=cached-heap "
+             "type=0x%x bytes=%u\n", (unsigned)info.type, (unsigned)bytes);
+        gxm_texture_regions[slot] = (VPGxmTextureRegion){base, -1, 0};
+        return base;
+    }
+    uid = sceKernelAllocMemBlock("vpTexPool",
+        SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, bytes, NULL);
     if (uid < 0) {
         glog("VP_TEX_POOL_ALLOC_FAIL bytes=%u class=%u mapped=%d rc=%d kind=chunk\n",
              (unsigned)bytes, allocation_class, mapped, uid);
         return NULL;
     }
+    gxm_texture_kernel_allocs++;
     if (sceKernelGetMemBlockBase(uid, &base) < 0 || !base ||
         (mapped && sceGxmMapMemory(base, bytes, SCE_GXM_MEMORY_ATTRIB_READ) < 0)) {
-        sceKernelFreeMemBlock(uid);
+        if (sceKernelFreeMemBlock(uid) == 0) gxm_texture_kernel_frees++;
         return NULL;
     }
     gxm_texture_regions[slot] = (VPGxmTextureRegion){base, uid, mapped};
@@ -8787,8 +8812,13 @@ static int gxm_texture_chunk_release(void *user, void *base) {
             rc = sceGxmUnmapMemory(base);
             if (rc < 0) return rc;
         }
-        rc = sceKernelFreeMemBlock(region->uid);
-        if (rc < 0) return rc;
+        if (region->mapped) {
+            rc = sceKernelFreeMemBlock(region->uid);
+            if (rc < 0) return rc;
+            gxm_texture_kernel_frees++;
+        } else {
+            free(region->base);
+        }
         memset(region, 0, sizeof(*region));
         return 0;
     }
@@ -8826,8 +8856,8 @@ void vp_gxm_texture_region_stats(VPGxmTextureRegionStats *out) {
         gxm_texture_region_arena.class_allocated[VP_TEXTURE_REGION_CLASS_MAPPED];
     out->cached_allocated_bytes =
         gxm_texture_region_arena.class_allocated[VP_TEXTURE_REGION_CLASS_CPU_CACHED];
-    out->kernel_allocs = gxm_texture_region_arena.kernel_allocs;
-    out->kernel_frees = gxm_texture_region_arena.kernel_frees;
+    out->kernel_allocs = gxm_texture_kernel_allocs;
+    out->kernel_frees = gxm_texture_kernel_frees;
     out->suballocs = gxm_texture_region_arena.suballocs;
     out->subfrees = gxm_texture_region_arena.subfrees;
     out->live = gxm_texture_region_arena.live;

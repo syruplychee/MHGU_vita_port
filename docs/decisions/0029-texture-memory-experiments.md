@@ -1,9 +1,9 @@
 # 0029：纹理内存容量与 raw/decoded 分离实验
 
 - 日期：2026-11-05
-- 状态：实验实现完成，默认关闭；L0（源码/ABI 静态审计）、L1（宿主回归）已验证
-- L2（Vita 构建）、L3（Vita3K 同进程 A/B）与真机 L4 待主 agent 独立执行
-- 本文不包含性能结论，也不认为 128 MiB 适合真机
+- 状态：实现及有限村庄同进程对照已完成；两项均未证明提速，默认关闭
+- L0/L1/L2 通过；L3 有效窗口及两次失败见 [验证报告](../17-texture-memory-validation.md)
+- 128 MiB 仅实际取得约 88 MiB；cached C 堆路径启动加载失败，不能作为通用策略；无 L4
 
 ## 背景
 
@@ -29,7 +29,7 @@ region provider 当前忽略 raw/decoded 的差别。因此两个问题可以分
 |---:|---|---|---|---|---|
 | 4 | `deep` | 是 | 0：64 MiB，raw/decoded 同 class 0，uncached + mapped | 否 | 否 |
 | 7 | `deep-large` | 是 | 1：128 MiB，其余同 mode 4 | 否 | 否 |
-| 8 | `deep-split` | 是 | 2：64 MiB，raw class 1 cached 且不映射；decoded class 0 uncached + mapped | 否 | 否 |
+| 8 | `deep-split` | 是 | 2：64 MiB，raw class 1 从现有 cached C 堆取、不映射；decoded class 0 uncached + mapped | 否 | 否 |
 
 旧 mode 0–6 的语义不变；7/8 都使用原游戏 root trampoline，不启用 mode 5 的 idle
 resize，也不启用 mode 6 的 deferred clear。普通启动不读该控制文件，仍走 mode 4 的
@@ -58,7 +58,7 @@ resize，也不启用 mode 6 的 deferred clear。普通启动不读该控制文
 `VPTextureRegions`），新增：
 
 - `class 0`：decoded / unified，uncached，GXM READ mapped；
-- `class 1`：split raw，cached，CPU-only，不调用 `sceGxmMapMemory`；
+- `class 1`：split raw，从现有 cached C 堆分配，CPU-only，不调用 `sceGxmMapMemory`；
 - 动态 budget：默认调用明确传 `VP_TEXTURE_REGION_BUDGET`（64 MiB），实验最大
   `VP_TEXTURE_REGION_MAX_BUDGET`（128 MiB）。
 
@@ -83,17 +83,27 @@ resize，也不启用 mode 6 的 deferred clear。普通启动不读该控制文
 `gxm_texture_chunk_create` 接收 allocation class：
 
 - class 0：`SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE` + `sceGxmMapMemory(...READ)`；
-- class 1：`SCE_KERNEL_MEMBLOCK_TYPE_USER_RW`（cached main memory），不映射、不绑定
-  shader。
+- class 1：`memalign(4096, bytes)` 从现有 C 堆分配。每块用
+  `sceKernelGetMemBlockInfoByAddr` 核对实际 `type == USER_RW`；不符合就明确失败。
+  不新申请内核 memblock，不映射、不绑定 shader。不是申请失败后静默改用另一类内存。
 
 `VPGxmTextureRegion` 记录实际 `mapped` 标志；释放时只有 mapped chunk 才遍历 texture
-unit 清除绑定并 `sceGxmUnmapMemory`，cached raw 只做 `sceKernelFreeMemBlock`。raw 只
+unit 清除绑定并 `sceGxmUnmapMemory` 后释放其 memblock，cached raw 只做 `free`，
+绝不释放整个 C 堆所在 memblock。raw 只
 是 CPU 快照，不做任何 GPU cache flush；decoded 仍是 uncached，不允许改成 cached 后
 遗漏可见性维护。
 
+首版 `eacfe9f` 曾为 class 1 直接新建 `USER_RW` memblock；真实运行第一次切到 mode 8
+即分配失败、缺失强制顶点纹理并触发 `SDK_THREAD_POOL_FATAL`。该失败运行仅作诊断，
+不作性能验收。锁定模拟器 d7edcbe9 源码确认两类内存分配的搜索起点不同：uncached 从
+`0x70000000`，cached 从 `0x80000000`；本运行原游戏 arena 已占
+`0x88000000..0xfff00000`，新建 cached 大块受当前地址布局限制。改用已有 cached C 堆
+保留原 guest arena 大小与位置，也不扩大原 32 MiB C 堆。C 堆自身容量仍可能先于逻辑
+64 MiB 预算限制 raw 常驻量，必须报告实际占用/失败，不能冒称拥有独立 64 MiB raw 池。
+
 ## 计数与验收线索
 
-保持既有 `VP_GXM_TEXTURE_REGIONS` 字段兼容，并增加 `budget/memory_mode` 与逐 class
+保持既有 `VP_GXM_TEXTURE_REGION_STATS` 字段兼容，并增加 `budget/memory_mode` 与逐 class
 的 chunk/allocated 字节。每 32 个 present 在 frame-cost 同一端点输出
 `VP_TEX_MEMORY_METRICS`（独立于 frame-cost 是否开启，仅在 deep 已应用时）：
 
@@ -103,6 +113,11 @@ unit 清除绑定并 `sceGxmUnmapMemory`，cached raw 只做 `sceKernelFreeMemBl
 - `physical_bytes` / `peak_bytes`：唯一的合计实际申请量与峰值；
 - `pool_used/pool_peak/live/peak_live/evictions/pressure/nomem/gpu_refs`；
 - `user_free` / `cdram_free`。
+
+`physical_bytes` 在此表示池拥有的两类 backing 范围合计，cached 范围来自已保留的 C
+堆，不代表额外向内核申请了同样多的字节；不包含 C 分配器元数据/对齐开销，也不等于
+整个进程占用。`region_kernel_allocs/frees` 仅计真实新建/释放的 mapped memblock；
+纯逻辑分配器内部历史名为 kernel 的计数仍是 provider create/destroy 次数。
 
 这些值用于判定：mode 7 是否真的驻留超过 64 MiB 且总 physical ≤ 128 MiB；mode 8 的
 raw chunk 是否 cached/unmapped，decoded 是否仍 mapped；总 physical 是否 ≤ 64 MiB。
@@ -144,11 +159,15 @@ SVC 的 branch reach 和既有 patch ledger；本轮增量未在运行期验证�
 - `test_engine_prepare_ab.py`：接受 `deep-large`、`deep-split` phase 名，旧名称和
   数字 phase 名拒绝逻辑不变。
 
-## 未验证
+## 验证范围
 
-- L2：Vita SDK 构建、SELF/VPK、SDK DSO 落点与 ARM branch reach。
-- L3：Vita3K 同进程 A/B 的 mode 4 对 7、mode 4 对 8；真实驻留、miss/等待、整帧和
-  图像对照，以及模式切换 warmup 排除。
+- 主 agent 独立输入校验、50/50 宿主测试和 Vita 构建通过；最终 SELF/VPK 与有效实测
+  一致。SDK DSO 落点与原 root branch reach 在真实启动/调用中接受。
+- L3：同一 SELF 的 mode 4/7、mode 4/8 各两对，完整直方图、同端点内存/成本对账和
+  恢复通过。有限完整画面已查看，截出屏幕的图像排除。不能把模拟器 exit 0 当作游戏
+  成功：专用分析器拒绝 GPU entry/execute、heap 类型及 SDK fatal。
+- mode 8 首版 cached 内核块分配失败；改用 C 堆后启动加载仍失败，只有先用 mode 4
+  完成加载、再切换的村庄稳态范围可测。详见验证报告，失败不混入性能表。
 - L4：真机 cached `USER_RW` raw 的 CPU 一致性、uncached decoded 的 GPU 可见性、
   128 MiB 的进程内存压力、长时间流式资源与所有场景。
-- 本文不声明任何性能收益，也不建议把 128 MiB 作为真机默认值。
+- 不声明任何性能收益，也不建议把 128 MiB 或当前 C 堆方案作为默认值。

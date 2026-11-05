@@ -4,7 +4,7 @@ import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "engine"))
-from analyze_texture_memory import memory_window, COUNTERS, MODES
+from analyze_texture_memory import memory_window, validate_runtime_errors, COUNTERS, MODES
 
 MIB = 1024 * 1024
 WINDOW = {"actual_window_us": [100, 500], "frames": 128, "snapshot_seq": [1, 5]}
@@ -40,6 +40,12 @@ def logs(rows, mode, extra=""):
 
 
 class MemoryMetricsTests(unittest.TestCase):
+    def test_game_fatal_is_rejected_even_if_emulator_later_exits_zero(self):
+        for failure in ("SDK_THREAD_POOL_FATAL ", "VP_TEX_POOL_MEMORY_FAIL ",
+                        "VP_TEX_POOL_HEAP_TYPE_FAIL ", "VP_GPU_ENTRY_REJECT "):
+            with self.assertRaisesRegex(ValueError, "runtime reported"):
+                validate_runtime_errors("", failure + "action=process-exit")
+
     def test_large_budget_proves_resident_over_64(self):
         result = memory_window(*logs(samples(7), 7), WINDOW, 7)
         self.assertTrue(result["resident_over_64_mib"])

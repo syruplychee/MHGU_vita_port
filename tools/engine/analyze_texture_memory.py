@@ -79,21 +79,29 @@ def memory_window(gxm, sdk, window, mode):
               "snapshots": len(rows), "counters_delta": {
                   key: rows[-1][key] - rows[0][key] for key in COUNTERS}}
     for key in ("physical_bytes", "raw_cached_bytes", "decoded_mapped_bytes",
-                "pool_used_bytes", "pool_live", "user_free", "cdram_free"):
+                "raw_cached_alloc_bytes", "decoded_mapped_alloc_bytes",
+                "pool_used_bytes", "pool_peak_used_bytes", "pool_live",
+                "pool_peak_live", "user_free", "cdram_free"):
         result[key] = {"min": min(row[key] for row in rows),
                        "max": max(row[key] for row in rows)}
     result["resident_over_64_mib"] = result["physical_bytes"]["min"] > 64 * 1024 * 1024
     return result
 
 
+def validate_runtime_errors(gxm, sdk):
+    for failure in ("VP_TEX_POOL_MODE_FAIL ", "VP_TEX_POOL_MEMORY_FAIL ",
+                    "ENGINE_PREPARE_CONTROL_ERROR ", "SDK_THREAD_POOL_FATAL ",
+                    "ENGINE_FULL_FATAL ", "VP_TEX_POOL_HEAP_TYPE_FAIL ",
+                    "VP_GPU_ENTRY_REJECT ", "VP_GPU_EXECUTE_FAILED "):
+        if failure in sdk or failure in gxm:
+            raise ValueError(f"runtime reported {failure.strip()}")
+
+
 def analyze(run, plan):
     raw = (run / "gxm-runtime.log").read_bytes()
     gxm = raw.decode("utf-8")
     sdk = (run / "sdk-dso.log").read_text(encoding="utf-8")
-    for failure in ("VP_TEX_POOL_MODE_FAIL ", "VP_TEX_POOL_MEMORY_FAIL ",
-                    "ENGINE_PREPARE_CONTROL_ERROR "):
-        if failure in sdk or failure in gxm:
-            raise ValueError(f"runtime reported {failure.strip()}")
+    validate_runtime_errors(gxm, sdk)
     windows = [(int(phase["start_s"] * 1000000), int(phase["end_s"] * 1000000))
                for phase in plan]
     cost = frame_cost.analyze(
@@ -118,19 +126,24 @@ def analyze(run, plan):
     for name in dict.fromkeys(phase["group"] for phase in plan):
         selected = [phase for phase in phases if phase["plan"]["group"] == name]
         modes = [phase["plan"]["mode"] for phase in selected]
-        if len(selected) != 4 or modes[0] != 4 or modes[2] != 4 or (
-                modes[1] not in (7, 8) or modes[1] != modes[3]):
-            raise ValueError("each experiment must contain baseline/candidate/baseline/candidate")
+        candidates = set(modes) - {4}
+        if (len(selected) != 4 or len(candidates) != 1 or
+                modes[0] != modes[2] or modes[1] != modes[3] or
+                4 not in modes or not candidates <= {7, 8}):
+            raise ValueError("each experiment must alternate baseline and one candidate twice")
+        candidate = candidates.pop()
         aggregate = {}
-        for mode in (4, modes[1]):
+        for mode in (4, candidate):
             same = [phase for phase in selected if phase["plan"]["mode"] == mode]
             frames = sum(phase["cost"]["frames"] for phase in same)
             wall = sum(phase["cost"]["wall_us"] for phase in same)
             aggregate[str(mode)] = {"frames": frames, "mean_ms": wall / frames / 1000}
-        pair_changes = [100 * (selected[i + 1]["frame_intervals"]["mean_ms"] /
-                              selected[i]["frame_intervals"]["mean_ms"] - 1)
-                        for i in (0, 2)]
-        change = 100 * (aggregate[str(modes[1])]["mean_ms"] /
+        pair_changes = []
+        for index in (0, 2):
+            pair = {phase["plan"]["mode"]: phase["frame_intervals"]["mean_ms"]
+                    for phase in selected[index:index + 2]}
+            pair_changes.append(100 * (pair[candidate] / pair[4] - 1))
+        change = 100 * (aggregate[str(candidate)]["mean_ms"] /
                         aggregate["4"]["mean_ms"] - 1)
         groups[name] = {"aggregate": aggregate, "frame_time_change_percent": change,
                         "pair_frame_time_change_percent": pair_changes}

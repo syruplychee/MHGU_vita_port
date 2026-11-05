@@ -66,6 +66,11 @@ Marker 是 `ux0:data/mhgu-vita-port/` 下的空文件或短文本文件。运行
 | `VP_TEX_MEMORY_METRICS` | deep 已应用时每 32 个 present 在 frame-cost 同一端点输出：`memory_mode/split/raw_cached/raw_mapped/decoded_mapped`、实际 raw cached 与 decoded mapped 的 chunk/子分配字节、合计 physical/peak、pool 使用/峰值/槽/淘汰/pressure/nomem/GPU refs 和 user/CDRAM free；不依赖 `frame-cost.enable`，不是期望预算 |
 | `VP_GXM_CLEAR_DEFER_STATS` | mode 6 累计计数，在既有 `static_log_stats` 节奏输出：try／accept／fallback／scene submit／coalesce／materialize 调用与失败／in-scene 消费／仍带 async 标签的 surface 数。不新增逐 clear 日志；`tries` 与 accept+fallback+submit_fail 对账，失败含真实错误传播 |
 
+mode 8 的 cached raw 最终实现来自现有 C 堆，并逐块核对 USER_RW 类型；不新建 cached
+内核块、不扩大 C 堆、不做 uncached 回退。启动即启用已观察到加载失败，当前只完成
+进村后切换的稳态对照，未证明提速。mode 7 实际分配也未达到 128 MiB；见
+[纹理内存验证](../17-texture-memory-validation.md)。两项均默认关闭。
+
 ## 4. 输入
 
 | Marker/文件 | 作用 |

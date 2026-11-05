@@ -31,6 +31,7 @@
 14. [村庄黑块：原始代码、GXM 与模拟器的证据边界](14-render-black-block-investigation.md)
 15. [游戏内部渲染提交：公共入口、字段与已实施切片](15-engine-render-submission-plan.md)
 16. [整帧主要成本审计与深层接管依据](16-frame-cost-audit.md)
+17. [纹理预算与 raw/decoded 内存策略验证](17-texture-memory-validation.md)
 
 ## 参考
 

@@ -217,6 +217,10 @@ producer 的静态角色没有被冒充为实测热点；下一刀仍按上面�
 它会增加最多约 64 MiB 内存压力，不代表适合真实 Vita，也未在本轮执行。长期方案
 优先解决 raw/decoded 双份保存和版本关系，不依赖无界常驻。
 
+后续已分别实测扩大预算和 cached raw 拆分，见 [纹理内存验证](17-texture-memory-validation.md)。
+128 MiB 预算实际只取得约 88 MiB；拆分受现有 C 堆空间限制，两项均未证明提速。
+不能把这些有限分配结果当作完整 128 MiB 容量或纯 CPU cache 属性的否定结论。
+
 ## 9. 证据文件、复跑与结论边界
 
 每个有效目录保存 `process.json`、`process-lifecycle.json`、`save-protection.json`、
