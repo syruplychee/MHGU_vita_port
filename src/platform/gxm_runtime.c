@@ -25,6 +25,7 @@
 #include "gpu_wait_profile.h"
 #include "frame_cost_profile.h"
 #include "work_log.h"
+#include "guest_svc.h"
 
 #include <psp2/display.h>
 #include <psp2/gxm.h>
@@ -664,6 +665,11 @@ static int gxm_render_resolution_ensure(void) {
              gxm_render_resolution_height == 360u ? "360p" : "540p",
              native.width, native.height);
     }
+    if (vp_guest_pixel_font_native_enabled() && gxm_render_resolution_height!=540u) {
+        glog("NATIVE_FONT_REJECT reason=requires-540p-render-grid\n");
+        gxm_render_resolution_state=2;
+        return -1;
+    }
     return 0;
 }
 
@@ -673,6 +679,11 @@ static unsigned render_extent(unsigned width, unsigned height, unsigned extent) 
     if (extent == width) return native.width;
     if (extent == height) return native.height;
     return extent;
+}
+
+float vp_gxm_native_font_scale(void) {
+    if (gxm_render_resolution_ensure()) return 0.0f;
+    return (float)gxm_render_resolution_height/720.0f;
 }
 
 static VPGxmSurface *surface_find(uint64_t va) {
@@ -2802,7 +2813,7 @@ static void surface_clear_consumed_in_scene(VPGxmSurface *s);
 static int frame_blit_gpu(VPGxmSurface *s, void *dst, unsigned x0, unsigned y0,
                           unsigned w, unsigned h, unsigned dst_width,
                           unsigned dst_height, unsigned dst_pitch,
-                          int surface_source);
+                          int bottom_origin, int native_grid);
 
 /* B42 diagnostic: only while the B34 pass capture is due, report which clear
  * branch ran and whether the backing changed, so a dump that still shows
@@ -2829,7 +2840,7 @@ static int surface_gpu_blue_probe(const VPGxmSurface *s, unsigned *max_b) {
     if (buf == NULL) return -1;
     memset(buf, 0, 16u * 16u * 4u);
     rc = frame_blit_gpu((VPGxmSurface *)s, buf, 0u, 0u, s->width, s->height,
-                        16u, 16u, 16u, 1);
+                        16u, 16u, 16u, 1, 0);
     if (rc == 0) {
         const uint8_t *p = (const uint8_t *)buf;
         for (unsigned i = 0; i < 16u * 16u; ++i)
@@ -4358,6 +4369,8 @@ static void gxm_model_probe_draw(const VPGxmDrawRequest *req) {
         gxm_model_probe_bytes(name,t->texels,bytes);
     }
 }
+
+#include "pixel_font_probe.inc"
 
 static void gxm_scene_probe_uniform(const char *stage, unsigned bank,
                                     const VPGxmUniform *b, unsigned floats) {
@@ -9461,6 +9474,7 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
     /* Diagnostic cull/depth override must be known before a fully masked draw
      * is classified: with depth write forced off it is a side-effect-free
      * no-op rather than a refused depth write. */
+    pixel_font_probe_draw(req);
     if (req->hash == 0xf8u) {
         static int f8_state_override = -1;
         if (f8_state_override < 0) {
@@ -12541,7 +12555,8 @@ static void *gxm_blit_vertices,*gxm_blit_indices;
  * or resource is substituted. Double-buffered scanout remains GPU-owned. */
 static int frame_blit_gpu(VPGxmSurface *s,void *dst,unsigned x0,unsigned y0,
                           unsigned w,unsigned h,unsigned dst_width,
-                          unsigned dst_height,unsigned dst_pitch,int bottom_origin) {
+                          unsigned dst_height,unsigned dst_pitch,int bottom_origin,
+                          int native_grid) {
     SceGxmColorSurface color;
     SceGxmRenderTarget *target=target_for(dst_width,dst_height);
     const SceGxmProgramParameter *p;
@@ -12553,7 +12568,9 @@ static int frame_blit_gpu(VPGxmSurface *s,void *dst,unsigned x0,unsigned y0,
      * image, so the canonical mapping is unswapped; the swap is only the
      * opt-in bottom-origin display mode. Native Vita stays unverified. */
     if (bottom_origin) { float swap=v0; v0=v1; v1=swap; }
-    const float vertices[16]={0,1,u0,v0,1,1,u1,v0,0,0,u0,v1,1,0,u1,v1};
+    float top=1.0f,bottom=0.0f;
+    if (native_grid) { top=1.0f-2.0f/544.0f;bottom=2.0f/544.0f; }
+    const float vertices[16]={0,top,u0,v0,1,top,u1,v0,0,bottom,u0,v1,1,bottom,u1,v1};
     const uint16_t indices[4]={0,1,2,3};
     void *ub=NULL;
     if (gxm_scene_poisoned) return frame_context_reject("present-gpu");
@@ -12569,6 +12586,18 @@ static int frame_blit_gpu(VPGxmSurface *s,void *dst,unsigned x0,unsigned y0,
     if (rc<0) return rc;
     rc=sceGxmBeginScene(gxm_context,0,target,NULL,NULL,NULL,&color,NULL);
     if (rc<0) return rc;
+    if (native_grid) {
+        VPGxmSurface background={0};
+        background.color_mem=dst;
+        background.render_width=dst_width;background.render_height=dst_height;
+        background.clear_pending_color=0xff000000u;
+        rc=frame_clear_in_scene(&background);
+        if (rc<0) {
+            int end=frame_end_scene(gxm_context);
+            if (end<0) frame_poison_context(end);
+            return rc;
+        }
+    }
     /* Negate in float: -dst_height on an unsigned value wraps to ~2^32 and
      * turns the viewport into a 2^32-high (sub-pixel quad) region. */
     sceGxmSetViewport(gxm_context,(float)dst_width*0.5f,(float)dst_width*0.5f,
@@ -12595,8 +12624,13 @@ static int frame_blit_gpu(VPGxmSurface *s,void *dst,unsigned x0,unsigned y0,
     p=sceGxmProgramFindParameterByName(gxm_fs_program,"fs_cbuf3");
     if (rc>=0 && p) rc=sceGxmSetUniformDataF(ub,p,0,4,gain);
     p=sceGxmProgramFindParameterByName(gxm_fs_program,"tex0");
+    SceGxmTexture texture=s->texture;
+    if (native_grid) {
+        sceGxmTextureSetMinFilter(&texture,SCE_GXM_TEXTURE_FILTER_POINT);
+        sceGxmTextureSetMagFilter(&texture,SCE_GXM_TEXTURE_FILTER_POINT);
+    }
     if (rc>=0 && p) rc=sceGxmSetFragmentTexture(gxm_context,
-        sceGxmProgramParameterGetResourceIndex(p),&s->texture);
+        sceGxmProgramParameterGetResourceIndex(p),&texture);
     if (rc>=0) rc=sceGxmSetVertexStream(gxm_context,0,gxm_blit_vertices);
     if (rc>=0) rc=sceGxmDraw(gxm_context,SCE_GXM_PRIMITIVE_TRIANGLE_STRIP,
         SCE_GXM_INDEX_FORMAT_U16,gxm_blit_indices,4);
@@ -12625,7 +12659,7 @@ static int surface_clear_gpu(VPGxmSurface *s, uint32_t color) {
             SCE_GXM_TEXTURE_FORMAT_A8B8G8R8, 8u, 8u, 1u);
     if (rc < 0) return rc;
     return frame_blit_gpu(&source, s->color_mem, 0u, 0u, 8u, 8u,
-                          s->render_width, s->render_height, s->render_width, 0);
+                        s->render_width, s->render_height, s->render_width, 0, 0);
 }
 
 /* Encode the deferred solid clear into the scene the caller already opened for
@@ -12788,10 +12822,20 @@ static int frame_present_internal(uint64_t va) {
         if (f) fclose(f);
         glog("VP_GPU_PRESENT_ORIGIN bottom=%d\n",gxm_gpu_present_bottom_origin);
     }
+    if (vp_guest_pixel_font_native_enabled() && !gxm_gpu_present) {
+        glog("NATIVE_FONT_REJECT reason=requires-gpu-present\n");
+        return -4;
+    }
     if (gxm_gpu_present) {
+        int native_grid=vp_guest_pixel_font_native_enabled();
+        if (native_grid && (gxm_render_resolution_height!=540u || gxm_gpu_present_bottom_origin)) return -4;
         rc=frame_blit_gpu(s,dst,x0,y0,w,h,VP_GXM_WIDTH,VP_GXM_HEIGHT,VP_GXM_PITCH,
-                          gxm_gpu_present_bottom_origin);
+                          gxm_gpu_present_bottom_origin,native_grid);
         if (rc<0) return rc;
+        static unsigned native_notes;
+        if (native_grid && native_notes++<4u)
+            glog("NATIVE_FONT_SCANOUT source=%ux%u rect=%u,%u,%u,%u output=960x544 content=960x540 offset=0,2 filter=point\n",
+                 s->render_width,s->render_height,x0,y0,w,h);
     } else {
     for (y = 0; y < VP_GXM_HEIGHT; y++) {
         unsigned sy = (y0 + (y * h) / VP_GXM_HEIGHT) * s->render_height / s->height;

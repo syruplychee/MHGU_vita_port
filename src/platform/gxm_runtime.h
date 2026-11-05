@@ -386,6 +386,7 @@ typedef struct {
 /* Start the GXM worker thread and run the bring-up on it. Returns 0 when the
  * bring-up succeeded. All GXM calls happen on this one thread. */
 int vp_gxm_worker_start(void);
+float vp_gxm_native_font_scale(void);
 /* Execute one command-stream entry synchronously on the context-owning worker.
  * Nested GXM requests execute directly there, without another thread handoff. */
 int vp_gxm_worker_execute(void (*execute)(void *), void *user);

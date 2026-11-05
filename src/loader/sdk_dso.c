@@ -842,6 +842,22 @@ static int title_heap_experiment_patch(FILE *log, VPNativeModule *m) {
     return rc;
 }
 
+static int native_display_patch(FILE *log, VPNativeModule *game) {
+    if (!vp_guest_pixel_font_native_enabled()) return 0;
+    int rc=resource_guard(game,VP_NATIVE_DISPLAY_GUARD_OFFSET,
+                          VP_NATIVE_DISPLAY_GUARD_BYTES,VP_NATIVE_DISPLAY_GUARD_SHA);
+    if (rc) return rc;
+    VPPatchTarget target;
+    rc=vp_patch_open(&target,game->image,game->nso.span,game->base);
+    for (unsigned i=0;i<2u && !rc;++i) {
+        const VPNativeDisplayWord *p=&vp_native_display_words[i];
+        rc=vp_patch_word(&target,p->offset,p->original,p->replacement);
+        fprintf(log,"NATIVE_FONT_DISPLAY_PATCH site=0x%x original=%08x replacement=%08x status=%d\n",
+                p->offset,p->original,p->replacement,rc);
+    }
+    return rc;
+}
+
 static int resource_lifecycle_patch(FILE *log, VPNativeModule modules[4]) {
     FILE *marker=fopen("ux0:data/mhgu-vita-port/resource-lifecycle.enable","rb");
     unsigned trace=marker!=NULL;
@@ -851,7 +867,9 @@ static int resource_lifecycle_patch(FILE *log, VPNativeModule modules[4]) {
     if (!trace && !font) return 0;
     VPNativeModule *game=&modules[1],*sdk=&modules[3];
     FILE *font_trace=fopen("ux0:data/mhgu-vita-port/pixel-font-trace.enable","rb");
-    const unsigned count=font && font_trace ? sizeof(vp_resource_probe_sites)/sizeof(vp_resource_probe_sites[0]) : 6u;
+    unsigned trace_font=font && font_trace!=NULL;
+    unsigned native_font=font && vp_guest_pixel_font_native_enabled();
+    const unsigned count=6u+(trace_font?2u:0u)+((trace_font||native_font)?4u:0u);
     if (font_trace) fclose(font_trace);
     const uint32_t bytes=(uint32_t)(vp_sdk_svc_site_end-vp_sdk_svc_site_template);
     const uint32_t service_at=(uint32_t)(vp_sdk_svc_site_service_value-vp_sdk_svc_site_template);
@@ -863,7 +881,7 @@ static int resource_lifecycle_patch(FILE *log, VPNativeModule modules[4]) {
         count*stride>sdk->capacity-base || service_at+4u>bytes ||
         return_at+4u>bytes || branch_at+4u>bytes) return VP_PATCH_RANGE;
     for (unsigned i=0;i<count;++i) {
-        const VPResourceProbeSite *p=&vp_resource_probe_sites[i];
+        const VPResourceProbeSite *p=&vp_resource_probe_sites[(i<6u || trace_font)?i:i+2u];
         int rc=resource_guard(game,p->offset,64u,p->sha);
         if (rc) return rc;
         int64_t delta=(int64_t)(uint32_t)(uintptr_t)vp_bridge_saved_entry-
@@ -875,7 +893,7 @@ static int resource_lifecycle_patch(FILE *log, VPNativeModule modules[4]) {
     int rc=vp_patch_open(&target,game->image,game->nso.span,game->base);
     if (rc) return rc;
     for (unsigned i=0;i<count;++i) {
-        const VPResourceProbeSite *p=&vp_resource_probe_sites[i];
+        const VPResourceProbeSite *p=&vp_resource_probe_sites[(i<6u || trace_font)?i:i+2u];
         uint32_t at=base+i*stride, island=sdk->base+at;
         uint32_t continuation=game->base+p->offset+8u;
         uint32_t original[2]={p->first,p->second};
@@ -901,6 +919,7 @@ static int resource_lifecycle_patch(FILE *log, VPNativeModule modules[4]) {
 
 int vp_sdk_dso_patch(FILE *log,VPNativeModule modules[4]) {
     int resource_rc=title_heap_experiment_patch(log,&modules[1]);
+    if (!resource_rc) resource_rc=native_display_patch(log,&modules[1]);
     if (!resource_rc) resource_rc=resource_lifecycle_patch(log,modules);
     if (resource_rc) return resource_rc;
     int engine_rc=engine_submit_probe_patch(log,&modules[1]);
@@ -1606,6 +1625,52 @@ static int dispatch_locked(VPExecutor *e, VPBridgeFrame *f) {
 
 static int dispatch_locked_body(VPExecutor *e,VPBridgeFrame *f) {
     Session *s=e->user;
+    if (f->service==0x261u || f->service==0x262u) {
+        return vp_guest_pixel_font_quad_uv(&s->svc,f->regs)<0?VP_BRIDGE_ARGUMENT:0;
+    }
+    if (f->service==0x25fu || f->service==0x260u) {
+        if (vp_guest_pixel_font_quad(&s->svc,f->regs,f->service-0x25fu)<0)
+            return VP_BRIDGE_ARGUMENT;
+        static int trace_font=-1;
+        if (trace_font<0) {
+            FILE *marker=fopen("ux0:data/mhgu-vita-port/pixel-font-trace.enable","rb");
+            trace_font=marker!=NULL;
+            if (marker) fclose(marker);
+        }
+        if (!trace_font) return 0;
+        static uint32_t signatures[128];
+        static unsigned used;
+        uint32_t owner=f->regs[0],ctx=f->regs[1],ch=f->regs[2];
+        if (!vp_guest_svc_readable(&s->svc,owner,0x58u) ||
+            !vp_guest_svc_readable(&s->svc,ctx,0x40u) ||
+            !vp_guest_svc_readable(&s->svc,ch,0x2cu)) return VP_BRIDGE_ARGUMENT;
+        const uint8_t *p=(const uint8_t *)(uintptr_t)ch;
+        uint32_t glyph=word(p+0xcu);
+        if (!glyph) return 0;
+        if (!vp_guest_svc_readable(&s->svc,glyph,20u)) return VP_BRIDGE_ARGUMENT;
+        const uint8_t *g=(const uint8_t *)(uintptr_t)glyph;
+        uint32_t cp=word(g);
+        if (cp<0x3000u) return 0;
+        uint32_t sig=2166136261u;
+        const uint8_t *o=(const uint8_t *)(uintptr_t)owner;
+        const uint8_t *c=(const uint8_t *)(uintptr_t)ctx;
+        for (unsigned i=0;i<12u;++i) sig=(sig^word(o+0x10u+i*4u))*16777619u;
+        sig=(sig^word(c))*16777619u;
+        sig=(sig^word(p+0x18u))*16777619u;
+        sig=(sig^word(p+0x1cu))*16777619u;
+        for (unsigned i=0;i<used;++i) if (signatures[i]==sig) return 0;
+        if (used==128u) return 0;
+        signatures[used++]=sig;
+        fprintf(s->log,"PIXEL_FONT_QUAD kind=%u owner=%x ctx=%x cp=%x glyph=%08x,%08x,%08x,%08x,%08x xywh=",
+                f->service-0x25fu,owner,ctx,cp,word(g),word(g+4u),word(g+8u),word(g+12u),word(g+16u));
+        for (unsigned i=0;i<4u;++i) {float v;memcpy(&v,p+0x10u+i*4u,4u);fprintf(s->log,"%s%.9g",i?",":"",(double)v);}
+        fprintf(s->log," matrix=");
+        for (unsigned i=0;i<16u;++i) {float v;memcpy(&v,o+0x10u+i*4u,4u);fprintf(s->log,"%s%.9g",i?",":"",(double)v);}
+        fprintf(s->log," ctxwords=");
+        for (unsigned i=0;i<16u;++i) fprintf(s->log,"%s%08x",i?",":"",word(c+i*4u));
+        fprintf(s->log,"\n");
+        return 0;
+    }
     if (f->service==0x25du || f->service==0x25eu) {
         static unsigned calls[2];
         unsigned kind=f->service-0x25du;

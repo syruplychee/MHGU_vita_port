@@ -107,7 +107,8 @@ mode 8 的 cached raw 最终实现来自现有 C 堆，并逐块核对 USER_RW �
 | `native-movie.limit-ms` | 诊断：文件内十进制毫秒数，原生播放在该时长后停止并走游戏停止命令；只用于有界测试，不作为验收结果 |
 | `thread-probe.enable` | 诊断：记录 guest ThreadType 的 user entry/arg/name、uMovie vtable 和 movie 控制地址；只读，默认关闭 |
 | `pixel-font.enable` | 启用独立 font-pixel RomFS 包、原 rTexture 身份登记和点阵字体单通道采样；启动时读取。缺少配套包明确失败；移除并重启恢复原字体。见 ADR 0033 |
-| `pixel-font-trace.enable` | 配合字体模式，额外观测原 GFD 查字/取页入口；每类只记录前 48 次，默认关闭 |
+| `pixel-font-native.enable` | 配合 pixel-font.enable，读取 font-native/ 包并接管原字形发射；原生字模、720p 原游戏显示预设与上下 2px 像素对齐显示。要求 540p、gpu-present，重启生效；见 ADR 0034 |
+| `pixel-font-trace.enable` | 配合字体模式，观测原 GFD 查字/取页、字形发射和有界真实 GPU 顶点/copy；默认关闭，会增加 bridge 和日志成本 |
 | `movie-force-stop.enable` | 诊断：首次解码 5 秒后向游戏 uMovie 命令字写入 8，用于单独验证停止路径；不用于正式播片 |
 
 ## 6. 优先级

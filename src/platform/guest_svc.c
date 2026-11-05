@@ -7,6 +7,7 @@
 #include "engine_full.h"
 #include "gpu_texture.h"
 #include "pixel_font.h"
+#include "pixel_font_draw.h"
 #include "texture_pool.h"
 #include "texture_pipeline.h"
 #include "work_log.h"
@@ -34,6 +35,16 @@
 #define VP_GUEST_TRACE_PATH "ux0:data/mhgu-vita-port/sdk-svc.log"
 
 static VPPixelFontResource pixel_fonts[VP_PIXEL_FONT_SLOTS];
+
+/* The native font mode keeps the modeled handheld UI and VI buffers on the
+ * same 720-line logical grid. A 1080-line VI buffer with a 720-line viewport
+ * otherwise shrinks the 960x540 UI to 640x360 before scanout enlarges it. */
+static unsigned pixel_display_width(void) {
+    return vp_guest_pixel_font_native_enabled()?1280u:1920u;
+}
+static unsigned pixel_display_height(void) {
+    return vp_guest_pixel_font_native_enabled()?720u:1080u;
+}
 
 int vp_guest_pixel_font_enabled(void) {
     static int enabled=-1;
@@ -81,6 +92,8 @@ int vp_guest_pixel_font_event(VPGuestSvc *svc, unsigned event, uint32_t object) 
         (unsigned long long)va,format,width,height,rc);
     return rc;
 }
+
+#include "pixel_font_draw.inc"
 
 static int svc_play_perf_enabled(void) {
     static int enabled = -1;
@@ -6326,6 +6339,11 @@ static int ensure_storage(VPGuestSvc *svc) {
     int font=vp_guest_pixel_font_enabled();
     const char *index=font?"ux0:data/mhgu-vita-port/font-pixel/romfs.index":VP_GUEST_STORAGE_INDEX_PATH;
     const char *map=font?"ux0:data/mhgu-vita-port/font-pixel/romfs.map":VP_GUEST_STORAGE_MAP_PATH;
+    if (vp_guest_pixel_font_native_enabled()) {
+        if (!font) return -1;
+        index="ux0:data/mhgu-vita-port/font-native/romfs.index";
+        map="ux0:data/mhgu-vita-port/font-native/romfs.map";
+    }
     const char *tree=font?"ux0:data/mhgu-vita-port":VP_GUEST_STORAGE_TREE_PATH;
     if (vp_guest_storage_open(&svc->storage,index,map,tree) != 0) {
         slog(svc, "SVC_STORAGE_OPEN result=failed index=%s map=%s tree=%s error=%s\n",
@@ -10448,16 +10466,15 @@ swkbd_queue_full:
                         || controlled > 1u) {
                         result = SVC_RESULT_INVALID_COMBINATION;
                     } else {
-                        /* QueueBufferOutput {width, height, transformHint,
-                         * numPendingBuffers} followed by the connect status.
-                         * The dimensions are the docked 1920x1080 the locked
-                         * title renders to and match the modeled display. */
+                        /* QueueBufferOutput followed by connect status. The
+                         * native font profile uses the same 720p preset as
+                         * the original handheld renderer and VI allocation. */
                         put32(out_address + 0x00, 0x14u); /* data size */
                         put32(out_address + 0x04, 0x10u); /* data offset */
                         put32(out_address + 0x08, 0u);    /* objects size */
                         put32(out_address + 0x0c, 0x24u); /* objects offset */
-                        put32(out_address + 0x10, 1920u);
-                        put32(out_address + 0x14, 1080u);
+                        put32(out_address + 0x10, pixel_display_width());
+                        put32(out_address + 0x14, pixel_display_height());
                         put32(out_address + 0x18, 0u);
                         put32(out_address + 0x1c, 0u);
                         put32(out_address + 0x20, 0u);
@@ -10477,11 +10494,11 @@ swkbd_queue_full:
                     switch (what) {
                     case 0:
                         name = "Width";
-                        value = state->binder_width ? state->binder_width : 1920u;
+                        value = state->binder_width ? state->binder_width : pixel_display_width();
                         break;
                     case 1:
                         name = "Height";
-                        value = state->binder_height ? state->binder_height : 1080u;
+                        value = state->binder_height ? state->binder_height : pixel_display_height();
                         break;
                     case 2:
                         name = "Format";
@@ -10788,8 +10805,8 @@ swkbd_queue_full:
                     put32(out_address + 0x04, 0x10u);
                     put32(out_address + 0x08, 0u);
                     put32(out_address + 0x0c, 0x24u);
-                    put32(out_address + 0x10, state->binder_width ? state->binder_width : 1920u);
-                    put32(out_address + 0x14, state->binder_height ? state->binder_height : 1080u);
+                    put32(out_address + 0x10, state->binder_width ? state->binder_width : pixel_display_width());
+                    put32(out_address + 0x14, state->binder_height ? state->binder_height : pixel_display_height());
                     put32(out_address + 0x18, 0u); /* transform hint */
                     put32(out_address + 0x1c, state->binder_queues);
                     put32(out_address + 0x20, status);
@@ -11185,9 +11202,8 @@ swkbd_queue_full:
         && state->vi_role == VP_GUEST_VI_APPLICATION && command == 1000) {
         /* IApplicationDisplayService command 1000 ListDisplays: one OutArray
          * of 0x60-byte DisplayInfo records plus the returned count. The
-         * modeled target has the single "Default" display; its reported
-         * maximum layer size is the docked 1920x1080 the locked title also
-         * renders to in the reference captures. */
+         * modeled target has one "Default" display. Native fonts select the
+         * 720p handheld preset; the legacy profile retains its 1080p maximum. */
         uint32_t descriptor = (header0 & 0x01000000u) != 0;
         uint32_t capacity = descriptor ? get32(buffer + 8) / 0x60u : 0;
         uint32_t address = descriptor ? get32(buffer + 0xc) : 0;
@@ -11197,7 +11213,7 @@ swkbd_queue_full:
             result = SVC_RESULT_INVALID_COMBINATION;
         } else {
             uint8_t *info = (uint8_t *)(uintptr_t)address;
-            uint64_t values[3] = {1, 1920, 1080}; /* layer max, width, height */
+            uint64_t values[3] = {1, pixel_display_width(), pixel_display_height()};
             memset(info, 0, 0x60);
             memcpy(info, "Default", 8);
             info[0x40] = 1; /* HasLayerLimit */

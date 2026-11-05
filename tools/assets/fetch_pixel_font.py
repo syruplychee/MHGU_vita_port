@@ -36,7 +36,7 @@ def main():
     notice = "\n".join(line for line in properties.splitlines() if line.startswith("COPYRIGHT "))
     if not notice:
         raise ValueError("font copyright property is absent")
-    notice += "\nDerived masks: MHGU Vita Pixel, 2026-11-05. Original Unifont glyphs resampled to the 540p grid.\n"
+    notice += "\nDerived masks: MHGU Vita Pixel. Bitmap atlas generation and sampling strategy are recorded in the package manifest.\n"
     (args.output/"COPYRIGHT.txt").write_text(notice,encoding="utf-8")
     print(f"Pinned Unifont input and OFL attribution verified: {args.output}")
 

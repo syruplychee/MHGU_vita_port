@@ -9,6 +9,12 @@ enable_testing()
 find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
 add_test(NAME pixel_font_tools
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_pixel_fonts.py")
+add_test(NAME native_font_strikes
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/native_font_strikes.py")
+add_test(NAME native_game_fonts
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_native_game_fonts.py")
+add_test(NAME native_font_draws
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_native_font_draws.py")
 add_test(NAME vertex_rg32f_lowering
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_vertex_rg32f.py")
 add_test(NAME frame_window_metrics
@@ -147,6 +153,7 @@ vp_host_test(gpu_indices)
 vp_host_test(gpu_stream "${VP_SRC}/platform/gpu_stream.c")
 vp_host_test(gpu_texture_decode "${VP_SRC}/platform/gpu_texture.c")
 vp_host_test(pixel_font)
+vp_host_test(pixel_font_draw)
 vp_host_test(gpu_uniform_state "${VP_SRC}/platform/gpu_stream.c")
 vp_host_test(gpu_wait_profile)
 vp_host_test(gxm_depth "${VP_SRC}/platform/gxm_depth.c")

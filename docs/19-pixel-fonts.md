@@ -1,5 +1,9 @@
 # 点阵字体与 Alpha8 结果
 
+本文的内存/上传结论继续有效；旧 cell 缩放方案未达到清晰度要求。显示字号、字形发射
+和最终整帧缩放已经由 [原生字号与屏幕像素网格](20-native-pixel-fonts.md) 取代。
+不要把本文“文字可见”的 L3 证据当作清晰度验收。
+
 2026-11-05。代码/离线验证 L0–L2；Vita3K 中文村长对话 L3；真机 L4 和完整玩法 L5
 未验证。用户选择“保持原来的视觉大小，只改成清晰点阵”。
 
@@ -91,3 +95,20 @@ $tree = 'build/vita3k-pref/ux0/data/mhgu-vita-port/romfs-tree'
 清单和许可文件，配套使用包含本改动的 VPK。在数据根目录创建 `pixel-font.enable`
 并重启即可启用；删除该 marker 并重启恢复原字体。不要覆盖原 `romfs-tree/` 或复用
 旧 index/map。缺包会明确报错。稳定安装没有被测试流程永久覆盖；本地已留好可试用包。
+
+## 离线原生字模库（独立工具）
+
+`tools/assets/native_font_strikes.py` 是独立资产工具：只读取调用者指定的公开 BDF
+2.1/2.2 或 GNU Unifont `.hex`/`.hex.gz`，按原始点阵导出单通道 Alpha8 页和 JSON
+元数据，不做栅格化、缩放或 resize。缺字明确失败，不退回其他字体，也不生成方框。
+
+```powershell
+& $py tools/assets/native_font_strikes.py --font path/to/font.bdf `
+  --font build/fonts/unifont-18.0.01/unifont-18.0.01.hex.gz `
+  --codepoints build/fonts/codepoints.json --output build/fonts/native-strikes
+```
+
+输出 `native-font.json`、`coverage.json` 和 `page-NNN.alpha8`（每字节 0/255）。
+同一 `pixel_height` 只允许一个 strike，重复字号会明确报错；缺字不会退回其他字体。
+该 CLI 不生成游戏 GFD/ARC，不修改游戏资源，不联网。它只提供离线字模资产；实际屏幕
+1:1 显示高度、采样和清晰度仍需运行时验证，不能据此声称已经清晰或完成运行时接入。

@@ -1004,5 +1004,8 @@ int vp_guest_svc_process_exit_requested(VPGuestSvc *);
 int vp_guest_svc_dispatch(VPGuestSvc *, VPBridgeFrame *);
 /* Original rTexture lifecycle hooks also identify the private R8 font pack. */
 int vp_guest_pixel_font_enabled(void);
+int vp_guest_pixel_font_native_enabled(void);
+int vp_guest_pixel_font_quad(VPGuestSvc *, uint32_t *regs, unsigned kind);
+int vp_guest_pixel_font_quad_uv(VPGuestSvc *, uint32_t *regs);
 int vp_guest_pixel_font_event(VPGuestSvc *, unsigned event, uint32_t object);
 #endif

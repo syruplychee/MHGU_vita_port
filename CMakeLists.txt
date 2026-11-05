@@ -119,7 +119,7 @@ target_link_options(vita_port_native_loader PRIVATE
     "LINKER:--defsym=__sce_headroom=0x10000")
 target_link_libraries(vita_port_native_loader PRIVATE
     SceSysmem_stub SceIofilemgr_stub SceGxm_stub SceDisplay_stub
-    SceCtrl_stub SceLibKernel_stub)
+    SceCtrl_stub SceLibKernel_stub m)
 target_compile_definitions(vita_port_native_loader PRIVATE
     "VP_GXM_STATIC_DIR=\"${VITA_PORT_STATIC_SHADER_PACKAGE_DIR}\"")
 

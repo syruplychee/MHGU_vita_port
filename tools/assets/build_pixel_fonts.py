@@ -241,7 +241,7 @@ def page_entries(entries, gfd):
     return [matched[i] for i in range(gfd.pages)], suffixes.pop()
 
 
-def build(tree, font_path, output):
+def build(tree, font_path, output, native_fonts=None, native_licenses=None):
     if sha((tree/"nativeNX/loc/arc/resident.arc").read_bytes()) != RESIDENT_SHA:
         raise ValueError("resident.arc input identity mismatch")
     if sha(font_path.read_bytes()) != UNIFONT_SHA:
@@ -252,6 +252,12 @@ def build(tree, font_path, output):
     if output.exists():
         raise ValueError("output already exists; use a fresh output directory")
     font = load_unifont(font_path)
+    converter = convert_family
+    if native_fonts:
+        from native_game_fonts import NativeGameFonts
+        converter = NativeGameFonts(native_fonts).convert
+        if not native_licenses or not native_licenses.is_dir():
+            raise ValueError("native font license directory is required")
     cache, loose_map, families, skipped, changes = {}, {}, [], [], []
     previews = []
     counts = dict(arcs_scanned=0, embedded_gfd=0, loose_gfd=0, converted_embedded_gfd=0)
@@ -288,7 +294,7 @@ def build(tree, font_path, output):
             pages = [entries[j].raw() for j in indices]
             key = (sha(raw), tuple(sha(page) for page in pages))
             if key not in cache:
-                cache[key] = convert_family(gfd, pages, font)
+                cache[key] = converter(gfd, pages, font)
                 if cache[key]:
                     families.append(cache[key][2])
                     if "font_festa" in gfd.prefix:
@@ -368,6 +374,12 @@ def build(tree, font_path, output):
                                  source="https://unifoundry.com/pub/unifont/unifont-18.0.01/font-builds/unifont-18.0.01.hex.gz",
                                  license="OFL-1.1",derivative_name="MHGU Vita Pixel"),
                     native_scale=[3, 4], preserve_metrics=True)
+    if native_fonts:
+        import shutil
+        manifest["native_scale"] = "runtime-integer-strike"
+        manifest["native_sources"] = [dict(name=p.name,sha256=sha(p.read_bytes())) for p in native_fonts]
+        manifest["requires_marker"] = "pixel-font-native.enable"
+        shutil.copytree(native_licenses, output/"native-font-licenses")
     (output/"manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2)+"\n", encoding="utf-8")
     license_path = font_path.parent/"OFL-1.1.txt"
     (output/"OFL-1.1.txt").write_bytes(license_path.read_bytes())
@@ -394,8 +406,11 @@ def main():
     parser.add_argument("--tree", required=True, type=Path)
     parser.add_argument("--unifont", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--native-font", action="append", type=Path)
+    parser.add_argument("--native-licenses", type=Path)
     args = parser.parse_args()
-    result = build(args.tree.resolve(), args.unifont.resolve(), args.output.resolve())
+    result = build(args.tree.resolve(), args.unifont.resolve(), args.output.resolve(),
+                   args.native_font, args.native_licenses)
     print(json.dumps(result["counts"], ensure_ascii=False))
 
 
