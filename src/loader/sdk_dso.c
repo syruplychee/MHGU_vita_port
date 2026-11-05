@@ -567,9 +567,10 @@ static int engine_layout_patch(FILE *log,VPNativeModule modules[4]) {
 }
 
 /* The A/B control file is host state, never guest memory. Exactly one '0',
- * '1', '2', '3', '4', '5' or '6' is required; trailing whitespace is accepted
- * and any other byte is invalid. Missing and malformed files are distinct so
- * the caller can report the actual failure instead of falling back to a path. */
+ * '1', '2', '3', '4', '5', '6', '7' or '8' is required; trailing whitespace
+ * is accepted and any other byte is invalid. Missing and malformed files are
+ * distinct so the caller can report the actual failure instead of falling
+ * back to a path. */
 static int engine_ab_read_control(uint32_t *mode) {
     FILE *f=fopen(VP_ENGINE_AB_CONTROL_PATH,"rb");
     if (!f) return 1;
@@ -595,6 +596,22 @@ static int engine_texture_pipeline_marker(void) {
     return enabled;
 }
 
+/* Publish the complete texture memory configuration as one atomic value.
+ * When the deep pipeline is enabled, the memory mode is stored first and the
+ * pipeline flag second, so a reader can never observe "deep enabled" with a
+ * stale budget/class pair. When it is disabled, the pipeline flag is cleared
+ * first and the memory mode returns to the ordinary 64 MiB unified value. */
+static void engine_publish_texture_mode(uint32_t mode) {
+    uint32_t memory_mode=vp_engine_ab_mode_texture_memory(mode);
+    if (!vp_engine_ab_mode_uses_deep_texture(mode)) {
+        __atomic_store_n(&vp_engine_texture_pipeline_enabled,0u,__ATOMIC_RELEASE);
+        __atomic_store_n(&vp_engine_texture_memory_mode,0u,__ATOMIC_RELEASE);
+    } else {
+        __atomic_store_n(&vp_engine_texture_memory_mode,memory_mode,__ATOMIC_RELEASE);
+        __atomic_store_n(&vp_engine_texture_pipeline_enabled,1u,__ATOMIC_RELEASE);
+    }
+}
+
 static int engine_full_patch(FILE *log,VPNativeModule *m) {
     FILE *marker=fopen("ux0:data/mhgu-vita-port/engine-full.enable","rb");
     int full=marker!=NULL;
@@ -615,6 +632,9 @@ static int engine_full_patch(FILE *log,VPNativeModule *m) {
     __atomic_store_n(&vp_engine_clear_defer_enabled,0u,__ATOMIC_RELEASE);
     if (!ab) {
         int texture_pipeline=engine_texture_pipeline_marker();
+        /* Ordinary startup never reads the mode experiment file and keeps the
+         * original 64 MiB unified configuration. */
+        __atomic_store_n(&vp_engine_texture_memory_mode,0u,__ATOMIC_RELEASE);
         __atomic_store_n(&vp_engine_texture_pipeline_enabled,
             texture_pipeline?1u:0u,__ATOMIC_RELEASE);
     }
@@ -669,8 +689,7 @@ static int engine_full_patch(FILE *log,VPNativeModule *m) {
             VP_ENGINE_AB_CONTROL_PATH,vp_engine_ab_mode_name(initial));
         __atomic_store_n(&vp_engine_shared_prepare_enabled,
             initial==3u?1u:0u,__ATOMIC_RELEASE);
-        __atomic_store_n(&vp_engine_texture_pipeline_enabled,
-            vp_engine_ab_mode_uses_deep_texture(initial)?1u:0u,__ATOMIC_RELEASE);
+        engine_publish_texture_mode(initial);
         __atomic_store_n(&vp_engine_texture_idle_resize_enabled,
             vp_engine_ab_mode_uses_idle_resize(initial)?1u:0u,__ATOMIC_RELEASE);
         __atomic_store_n(&vp_engine_clear_defer_enabled,
@@ -1263,6 +1282,7 @@ static int engine_prepare_ab_poll(Session *s,uint64_t now) {
     if (rc) {
         __atomic_store_n(&vp_engine_shared_prepare_enabled,0u,__ATOMIC_RELEASE);
         __atomic_store_n(&vp_engine_texture_pipeline_enabled,0u,__ATOMIC_RELEASE);
+        __atomic_store_n(&vp_engine_texture_memory_mode,0u,__ATOMIC_RELEASE);
         __atomic_store_n(&vp_engine_texture_idle_resize_enabled,0u,__ATOMIC_RELEASE);
         __atomic_store_n(&vp_engine_clear_defer_enabled,0u,__ATOMIC_RELEASE);
         fprintf(s->log,"ENGINE_PREPARE_CONTROL_ERROR path=%s reason=%s status=%d thread=0x%x\n",
@@ -1275,8 +1295,7 @@ static int engine_prepare_ab_poll(Session *s,uint64_t now) {
      * the elapsed_us interval see the same mode decision. */
     __atomic_store_n(&vp_engine_shared_prepare_enabled,
         mode==3u?1u:0u,__ATOMIC_RELEASE);
-    __atomic_store_n(&vp_engine_texture_pipeline_enabled,
-        vp_engine_ab_mode_uses_deep_texture(mode)?1u:0u,__ATOMIC_RELEASE);
+    engine_publish_texture_mode(mode);
     __atomic_store_n(&vp_engine_texture_idle_resize_enabled,
         vp_engine_ab_mode_uses_idle_resize(mode)?1u:0u,__ATOMIC_RELEASE);
     __atomic_store_n(&vp_engine_clear_defer_enabled,
@@ -1332,13 +1351,14 @@ static int engine_prepare_ab_service(Session *s,VPExecutor *e,VPBridgeFrame *f) 
             return VP_BRIDGE_ARGUMENT;
         }
         uint32_t mode=s->engine_ab_mode;
-        /* Modes 0, 3, 4, 5 and 6 execute the original root trampoline. Mode 3
-         * enables shared preparation; 4/5/6 enable the deep texture pipeline;
-         * 5 and 6 enable idle page resizing before a GPU drain, and only 6
-         * defers the full-colour clear boundary. */
+        /* Modes 0, 3, 4, 5, 6, 7 and 8 execute the original root trampoline.
+         * Mode 3 enables shared preparation; 4/5/6/7/8 enable the deep texture
+         * pipeline; 5 and 6 enable idle page resizing before a GPU drain, and
+         * only 6 defers the full-colour clear boundary. Modes 7 and 8 change
+         * only the texture memory budget/class published atomically above. */
         uint32_t target=mode==2u?(uint32_t)(uintptr_t)vp_engine_full_run_fast:
             mode==1u?(uint32_t)(uintptr_t)vp_engine_full_run:engine_full_ab_trampoline;
-        if (!s->engine_ab_mode_valid || mode>6u || !target) {
+        if (!s->engine_ab_mode_valid || !vp_engine_ab_mode_valid(mode) || !target) {
             fprintf(s->log,"ENGINE_PREPARE_ENTER_ERROR slot=%u thread=0x%x reason=target mode=%u target=0x%08x\n",
                 slot,s->svc.current_thread_handle,mode,target);
             fflush(s->log);
@@ -1364,8 +1384,8 @@ static int engine_prepare_ab_service(Session *s,VPExecutor *e,VPBridgeFrame *f) 
         return VP_BRIDGE_ARGUMENT;
     }
     /* Only the native C bodies (modes 1 and 2) declare a result. The original
-     * root trampoline is used by modes 0, 3, 4, 5 and 6; its callers do not
-     * consume r0, so any value is valid there. */
+     * root trampoline is used by modes 0, 3, 4, 5, 6, 7 and 8; its callers do
+     * not consume r0, so any value is valid there. */
     if ((t->mode==1u || t->mode==2u) && f->regs[0]) {
         fprintf(s->log,"ENGINE_FULL_FATAL rc=%d\n",(int32_t)f->regs[0]);
         vp_engine_full_report(s->log);

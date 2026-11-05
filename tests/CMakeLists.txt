@@ -19,6 +19,8 @@ add_test(NAME frame_cost_metrics
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_frame_cost_metrics.py")
 add_test(NAME game_cost_metrics
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_game_cost_metrics.py")
+add_test(NAME texture_memory_metrics
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_texture_memory_metrics.py")
 
 set(VP_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../src")
 set(VP_INCLUDES

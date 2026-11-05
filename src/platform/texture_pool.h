@@ -22,7 +22,11 @@
 #define VP_TEXTURE_POOL_SLOTS 128u
 #define VP_TEXTURE_POOL_PAGE_BYTES 4096u
 #define VP_TEXTURE_POOL_PAGE_MASK (VP_TEXTURE_POOL_PAGE_BYTES - 1u)
-#define VP_TEXTURE_POOL_MAX_BYTES (64u * 1024u * 1024u)
+/* The default mode explicitly initializes the pool with 64 MiB. The larger
+ * maximum exists only for the deep-large experiment; slot count does not grow
+ * with it. */
+#define VP_TEXTURE_POOL_DEFAULT_BYTES (64u * 1024u * 1024u)
+#define VP_TEXTURE_POOL_MAX_BYTES (128u * 1024u * 1024u)
 #define VP_TEXTURE_POOL_MAX_PAGES \
     (VP_TEXTURE_POOL_MAX_BYTES / VP_TEXTURE_POOL_PAGE_BYTES)
 
@@ -84,8 +88,10 @@ typedef struct {
     uint64_t raw_reclaims, raw_reclaimed_bytes;
     unsigned live_slots;
     unsigned peak_live_slots;
+    size_t budget_bytes;
     size_t used_bytes;
     size_t peak_used_bytes;
+    unsigned raw_class;
     unsigned free_runs;
     size_t largest_free_run_bytes;
     unsigned gpu_refs;
@@ -95,8 +101,12 @@ typedef struct {
 typedef struct {
     uint8_t *base;
     void *memory_user;
-    void *(*allocate)(void *user, size_t bytes, int gpu_read);
+    /* The class argument is the allocator's raw/decoded separation. Decoded
+     * RGBA always requests class 0; raw snapshots request raw_class (0 for the
+     * unified experiment, 1 for split cached CPU-only payloads). */
+    void *(*allocate)(void *user, size_t bytes, unsigned allocation_class);
     int (*release)(void *user, void *base);
+    unsigned raw_class;
     int failed;
     /* Page-backed providers can resize idle regions without a kernel remap.
      * This never permits eviction of CPU pins or GPU references. */
@@ -120,10 +130,12 @@ typedef struct {
 /* base must be non-NULL and page aligned; bytes is rounded down to pages and
  * must not exceed VP_TEXTURE_POOL_MAX_BYTES. */
 int vp_texture_pool_init(VPTexturePool *pool, void *base, size_t bytes);
-/* Bounded reusable regions: no single contiguous 48 MiB allocation required.
- * raw and RGBA regions count against the same capacity, including alignment. */
-int vp_texture_pool_init_regions(VPTexturePool *pool, size_t bytes, void *user,
-    void *(*allocate)(void *, size_t, int), int (*release)(void *, void *));
+/* Bounded reusable regions: no single contiguous allocation is required.
+ * raw and RGBA regions count against the same capacity, including alignment.
+ * raw_class selects the region class for raw snapshots; RGBA always uses 0. */
+int vp_texture_pool_init_regions(VPTexturePool *pool, size_t bytes,
+    unsigned raw_class, void *user,
+    void *(*allocate)(void *, size_t, unsigned), int (*release)(void *, void *));
 void vp_texture_pool_set_retire(VPTexturePool *pool,
                                 VPTexturePoolRetireFn retire, void *user);
 /* Drop every payload association and free all ranges. Returns -1 while any

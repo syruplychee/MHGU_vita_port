@@ -1160,6 +1160,7 @@ static uint64_t gxm_frame_cost_boundaries;
 static int gxm_frame_resource_audit;
 static uint64_t gxm_frame_resource_start_frame;
 static void gxm_frame_cost_details(uint64_t now, uint64_t frames, unsigned seq);
+static void gxm_texture_memory_log(uint64_t now, uint64_t frames);
 
 int vp_gxm_frame_cost_active(void) {
     return gxm_frame_cost_enabled;
@@ -2101,6 +2102,7 @@ static void gxm_perf_present(uint64_t fn_us, uint64_t now) {
         /* Frame-cost snapshots use this exact existing reporting point. The
          * profile must be closed here; otherwise the snapshot is refused. */
         gxm_frame_cost_log_snapshot(now, gxm_perf_present_frames, "periodic");
+        gxm_texture_memory_log(now, gxm_perf_present_frames);
         glog("VP_GXM_FRAME_INTERVALS t_us=%llu count=%llu sum_us=%llu width_us=1000\n",
             (unsigned long long)now,(unsigned long long)gxm_perf_present_interval_count,
             (unsigned long long)gxm_perf_present_interval_sum);
@@ -5094,14 +5096,26 @@ static void static_log_stats(void) {
              gxm_pending_scene_count);
         glog("VP_GXM_TEXTURE_REGION_STATS physical_bytes=%u peak_bytes=%u "
              "kernel_allocs=%llu kernel_frees=%llu suballocs=%llu "
-             "subfrees=%llu live=%u failed=%u\n",
+             "subfrees=%llu live=%u failed=%u budget=%u memory_mode=%u "
+             "mapped_physical_bytes=%u cached_physical_bytes=%u "
+             "mapped_allocated_bytes=%u cached_allocated_bytes=%u\n",
              (unsigned)gxm_texture_region_arena.physical_bytes,
              (unsigned)gxm_texture_region_arena.peak_bytes,
              (unsigned long long)gxm_texture_region_arena.kernel_allocs,
              (unsigned long long)gxm_texture_region_arena.kernel_frees,
              (unsigned long long)gxm_texture_region_arena.suballocs,
              (unsigned long long)gxm_texture_region_arena.subfrees,
-             gxm_texture_region_arena.live, gxm_texture_region_arena.failed);
+             gxm_texture_region_arena.live, gxm_texture_region_arena.failed,
+             (unsigned)gxm_texture_region_arena.budget,
+             __atomic_load_n(&vp_engine_texture_memory_mode, __ATOMIC_ACQUIRE),
+             (unsigned)gxm_texture_region_arena
+                 .class_physical[VP_TEXTURE_REGION_CLASS_MAPPED],
+             (unsigned)gxm_texture_region_arena
+                 .class_physical[VP_TEXTURE_REGION_CLASS_CPU_CACHED],
+             (unsigned)gxm_texture_region_arena
+                 .class_allocated[VP_TEXTURE_REGION_CLASS_MAPPED],
+             (unsigned)gxm_texture_region_arena
+                 .class_allocated[VP_TEXTURE_REGION_CLASS_CPU_CACHED]);
     }
     if (gxm_clear_defer_seen) {
         unsigned pending_async = 0u;
@@ -8719,30 +8733,39 @@ static int gxm_batch_flush_worker(unsigned reason) {
 typedef struct {
     void *base;
     SceUID uid;
+    int mapped;
 } VPGxmTextureRegion;
 static VPGxmTextureRegion gxm_texture_regions[VP_TEXTURE_REGION_CHUNKS];
 
-static void *gxm_texture_chunk_create(void *user, size_t bytes) {
+/* Class 0 is the decoded GPU payload: uncached main memory mapped for GPU
+ * read. Class 1 is a CPU-only raw snapshot: ordinary cached main memory that
+ * is never passed to sceGxmMapMemory and never bound to a texture unit. */
+static void *gxm_texture_chunk_create(void *user, size_t bytes,
+                                      unsigned allocation_class) {
     unsigned slot;
     SceUID uid;
     void *base = NULL;
+    int mapped = allocation_class == VP_TEXTURE_REGION_CLASS_MAPPED;
+    SceKernelMemBlockType type = mapped
+        ? SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE
+        : SCE_KERNEL_MEMBLOCK_TYPE_USER_RW;
     (void)user;
+    if (allocation_class >= VP_TEXTURE_REGION_CLASSES) return NULL;
     for (slot = 0; slot < VP_TEXTURE_REGION_CHUNKS; ++slot)
         if (!gxm_texture_regions[slot].base) break;
     if (slot == VP_TEXTURE_REGION_CHUNKS) return NULL;
-    uid = sceKernelAllocMemBlock("vpTexPool",
-        SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, bytes, NULL);
+    uid = sceKernelAllocMemBlock("vpTexPool", type, bytes, NULL);
     if (uid < 0) {
-        glog("VP_TEX_POOL_ALLOC_FAIL bytes=%u rc=%d kind=chunk\n",
-             (unsigned)bytes, uid);
+        glog("VP_TEX_POOL_ALLOC_FAIL bytes=%u class=%u mapped=%d rc=%d kind=chunk\n",
+             (unsigned)bytes, allocation_class, mapped, uid);
         return NULL;
     }
     if (sceKernelGetMemBlockBase(uid, &base) < 0 || !base ||
-        sceGxmMapMemory(base, bytes, SCE_GXM_MEMORY_ATTRIB_READ) < 0) {
+        (mapped && sceGxmMapMemory(base, bytes, SCE_GXM_MEMORY_ATTRIB_READ) < 0)) {
         sceKernelFreeMemBlock(uid);
         return NULL;
     }
-    gxm_texture_regions[slot] = (VPGxmTextureRegion){base, uid};
+    gxm_texture_regions[slot] = (VPGxmTextureRegion){base, uid, mapped};
     return base;
 }
 
@@ -8752,7 +8775,7 @@ static int gxm_texture_chunk_release(void *user, void *base) {
         VPGxmTextureRegion *region = &gxm_texture_regions[slot];
         int rc;
         if (region->base != base) continue;
-        {
+        if (region->mapped) {
             /* No lease names this payload. Remove persistent driver bindings
              * before unmapping, including currently inactive sampler units. */
             for (unsigned unit = 0; unit < SCE_GXM_MAX_TEXTURE_UNITS; ++unit) {
@@ -8772,12 +8795,16 @@ static int gxm_texture_chunk_release(void *user, void *base) {
     return -1;
 }
 
-void *vp_gxm_texture_region_create(void *user, size_t bytes, int gpu_read) {
+int vp_gxm_texture_regions_init(size_t budget_bytes) {
+    return vp_texture_regions_configure(&gxm_texture_region_arena, budget_bytes,
+        NULL, gxm_texture_chunk_create, gxm_texture_chunk_release);
+}
+
+void *vp_gxm_texture_region_create(void *user, size_t bytes,
+                                   unsigned allocation_class) {
     (void)user;
-    (void)gpu_read;
-    gxm_texture_region_arena.create = gxm_texture_chunk_create;
-    gxm_texture_region_arena.destroy = gxm_texture_chunk_release;
-    return vp_texture_regions_alloc(&gxm_texture_region_arena, bytes);
+    return vp_texture_regions_alloc(&gxm_texture_region_arena, bytes,
+                                    allocation_class);
 }
 
 int vp_gxm_texture_region_release(void *user, void *base) {
@@ -8785,8 +8812,78 @@ int vp_gxm_texture_region_release(void *user, void *base) {
     return vp_texture_regions_free(&gxm_texture_region_arena, base);
 }
 
+void vp_gxm_texture_region_stats(VPGxmTextureRegionStats *out) {
+    if (out == NULL) return;
+    memset(out, 0, sizeof(*out));
+    out->budget_bytes = gxm_texture_region_arena.budget;
+    out->physical_bytes = gxm_texture_region_arena.physical_bytes;
+    out->peak_bytes = gxm_texture_region_arena.peak_bytes;
+    out->mapped_physical_bytes =
+        gxm_texture_region_arena.class_physical[VP_TEXTURE_REGION_CLASS_MAPPED];
+    out->cached_physical_bytes =
+        gxm_texture_region_arena.class_physical[VP_TEXTURE_REGION_CLASS_CPU_CACHED];
+    out->mapped_allocated_bytes =
+        gxm_texture_region_arena.class_allocated[VP_TEXTURE_REGION_CLASS_MAPPED];
+    out->cached_allocated_bytes =
+        gxm_texture_region_arena.class_allocated[VP_TEXTURE_REGION_CLASS_CPU_CACHED];
+    out->kernel_allocs = gxm_texture_region_arena.kernel_allocs;
+    out->kernel_frees = gxm_texture_region_arena.kernel_frees;
+    out->suballocs = gxm_texture_region_arena.suballocs;
+    out->subfrees = gxm_texture_region_arena.subfrees;
+    out->live = gxm_texture_region_arena.live;
+    out->failed = gxm_texture_region_arena.failed;
+}
+
 int vp_gxm_texture_regions_reset(void) {
     return vp_texture_regions_reset(&gxm_texture_region_arena);
+}
+
+/* Same 32-present endpoint as the frame-cost snapshot. All byte counts are
+ * actual allocations or mapped bytes, never the configured budget presented as
+ * occupancy. Sampled only while the deep pipeline is applied; the budget field
+ * is the explicit configuration so a reader can compare it with the measured
+ * physical bytes. */
+static void gxm_texture_memory_log(uint64_t now, uint64_t frames) {
+    VPGuestTextureMemoryPerf perf;
+    VPGxmTextureRegionStats regions;
+    SceKernelFreeMemorySizeInfo memory;
+    int memory_rc;
+
+    vp_guest_texture_memory_perf(&perf);
+    if (!perf.applied) return;
+    vp_gxm_texture_region_stats(&regions);
+    memset(&memory, 0, sizeof(memory));
+    memory.size = sizeof(memory);
+    memory_rc = sceKernelGetFreeMemorySize(&memory);
+    glog("VP_TEX_MEMORY_METRICS frames=%llu t_us=%llu memory_mode=%u split=%d "
+         "budget=%u raw_class=%u raw_cached=%d raw_mapped=%d decoded_mapped=%d "
+         "raw_cached_bytes=%u raw_cached_alloc_bytes=%u "
+         "decoded_mapped_bytes=%u decoded_mapped_alloc_bytes=%u "
+         "physical_bytes=%u peak_bytes=%u region_kernel_allocs=%llu "
+         "region_kernel_frees=%llu region_live=%u region_failed=%u "
+         "pool_used_bytes=%u pool_peak_used_bytes=%u pool_live=%u "
+         "pool_peak_live=%u pool_evictions=%llu pool_alloc_map=%llu "
+         "pool_free_map=%llu pressure=%llu nomem=%llu gpu_refs=%u cpu_pins=%u "
+         "user_free_rc=%d user_free=%u cdram_free=%u\n",
+         (unsigned long long)frames, (unsigned long long)now,
+         perf.memory_mode, perf.memory_mode == 2u ? 1 : 0,
+         (unsigned)perf.budget_bytes, perf.raw_class,
+         perf.memory_mode == 2u ? 1 : 0, perf.memory_mode == 2u ? 0 : 1, 1,
+         (unsigned)regions.cached_physical_bytes,
+         (unsigned)regions.cached_allocated_bytes,
+         (unsigned)regions.mapped_physical_bytes,
+         (unsigned)regions.mapped_allocated_bytes,
+         (unsigned)regions.physical_bytes, (unsigned)regions.peak_bytes,
+         (unsigned long long)regions.kernel_allocs,
+         (unsigned long long)regions.kernel_frees, regions.live, regions.failed,
+         (unsigned)perf.used_bytes, (unsigned)perf.peak_used_bytes,
+         perf.live_slots, perf.peak_live_slots,
+         (unsigned long long)perf.evictions,
+         (unsigned long long)perf.alloc_map_calls,
+         (unsigned long long)perf.free_map_calls,
+         (unsigned long long)perf.pressure_events,
+         (unsigned long long)perf.nomem_events, perf.gpu_refs, perf.cpu_pins,
+         memory_rc, (unsigned)memory.size_user, (unsigned)memory.size_cdram);
 }
 
 int vp_gxm_texture_copy_cache_reset(void) {

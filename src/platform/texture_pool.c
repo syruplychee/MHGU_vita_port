@@ -173,12 +173,14 @@ int vp_texture_pool_init(VPTexturePool *pool, void *base, size_t bytes) {
     return 0;
 }
 
-int vp_texture_pool_init_regions(VPTexturePool *pool, size_t bytes, void *user,
-    void *(*allocate)(void *, size_t, int), int (*release)(void *, void *)) {
+int vp_texture_pool_init_regions(VPTexturePool *pool, size_t bytes,
+    unsigned raw_class, void *user,
+    void *(*allocate)(void *, size_t, unsigned), int (*release)(void *, void *)) {
     if (!pool || !allocate || !release || !bytes ||
         bytes > VP_TEXTURE_POOL_MAX_BYTES) return -1;
     memset(pool, 0, sizeof(*pool));
     pool->bytes = bytes;
+    pool->raw_class = raw_class;
     pool->allocate = allocate;
     pool->release = release;
     pool->memory_user = user;
@@ -332,9 +334,10 @@ int vp_texture_pool_begin_store(VPTexturePool *pool,
         if (pool->allocate && index >= 0 &&
             raw_map + rgba_map <= pool->bytes - pool->used_bytes) {
             VPTexturePoolSlot *slot = &pool->slots[index];
-            uint8_t *new_raw = pool->allocate(pool->memory_user, raw_map, 0);
+            uint8_t *new_raw = pool->allocate(pool->memory_user, raw_map,
+                                               pool->raw_class);
             uint8_t *new_rgba = new_raw ?
-                pool->allocate(pool->memory_user, rgba_map, 1) : NULL;
+                pool->allocate(pool->memory_user, rgba_map, 0u) : NULL;
             if (new_rgba) {
                 slot->used = 1u; slot->live = 0u;
                 slot->raw = new_raw; slot->rgba = new_rgba;
@@ -543,8 +546,10 @@ void vp_texture_pool_stats(const VPTexturePool *pool, VPTexturePoolStats *out) {
     out->raw_reclaimed_bytes = pool->raw_reclaimed_bytes;
     out->live_slots = pool->live_slots;
     out->peak_live_slots = pool->peak_live_slots;
+    out->budget_bytes = pool->bytes;
     out->used_bytes = pool->used_bytes;
     out->peak_used_bytes = pool->peak_used_bytes;
+    out->raw_class = pool->raw_class;
     out->free_runs = runs;
     out->largest_free_run_bytes =
         (size_t)largest * VP_TEXTURE_POOL_PAGE_BYTES;

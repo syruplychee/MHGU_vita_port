@@ -8,6 +8,7 @@
 #include "gpu_texture.h"
 #include "texture_pool.h"
 #include "texture_pipeline.h"
+#include "texture_regions.h"
 #include "texture_snapshot.h"
 #include "gpu_indices.h"
 #include "vertex_window.h"
@@ -1874,9 +1875,18 @@ typedef enum {
 } VPTextureDecodeOutcome;
 
 static VPTexturePool deep_texture_pool;
+/* The pool and the single region arena must agree on both the default and the
+ * deep-large experiment ceiling; otherwise one of them would silently become
+ * the effective limit. */
+_Static_assert(VP_TEXTURE_POOL_DEFAULT_BYTES == VP_TEXTURE_REGION_BUDGET,
+               "default texture memory budget mismatch");
+_Static_assert(VP_TEXTURE_POOL_MAX_BYTES == VP_TEXTURE_REGION_MAX_BUDGET,
+               "maximum texture memory budget mismatch");
 /* 0 = not created, 1 = ready, 2 = creation failed and stays failed. */
 static int deep_pool_state;
 static int deep_pipeline_applied;
+/* Applied memory configuration, 0/1/2 as published by the atomic above. */
+static unsigned deep_pipeline_memory_mode;
 static unsigned deep_pipeline_transitions;
 static int deep_decode_error;
 static uint64_t deep_transition_us_total, deep_transition_us_max;
@@ -1898,6 +1908,12 @@ void vp_texture_direct_fail_submission(void) {
 static int texture_pipeline_desired(void) {
     return __atomic_load_n(&vp_engine_texture_pipeline_enabled,
                            __ATOMIC_ACQUIRE) != 0u;
+}
+
+/* One atomic value selects both the budget and the raw allocation class, so
+ * the worker never applies half of a mode-4/7/8 transition. */
+static unsigned texture_memory_desired(void) {
+    return __atomic_load_n(&vp_engine_texture_memory_mode, __ATOMIC_ACQUIRE);
 }
 
 int vp_texture_direct_active(void) {
@@ -1937,6 +1953,45 @@ static void texture_pool_retire(void *user, const void *rgba) {
     vp_gxm_texture_owned_retire(rgba);
 }
 
+/* One bounded line with the actual region accounting. The byte values are
+ * allocator/mapped bytes, never the requested experiment budget repeated as
+ * occupancy. Used at both sides of a mode switch; the periodic equivalent is
+ * VP_TEX_MEMORY_METRICS at the 32-present frame-cost endpoint. */
+static void texture_memory_log_config(VPGuestSvc *svc, const char *why,
+                                      int applied, unsigned memory_mode,
+                                      size_t budget, unsigned raw_class) {
+    VPGxmTextureRegionStats regions;
+    SceKernelFreeMemorySizeInfo memory;
+    int memory_rc;
+
+    memset(&regions, 0, sizeof(regions));
+    vp_gxm_texture_region_stats(&regions);
+    memset(&memory, 0, sizeof(memory));
+    memory.size = sizeof(memory);
+    memory_rc = sceKernelGetFreeMemorySize(&memory);
+    slog(svc, "VP_TEX_MEMORY_CONFIG why=%s applied=%d memory_mode=%u "
+         "budget=%u split=%d raw_class=%u decoded_class=%u "
+         "raw_cached=%d raw_mapped=%d decoded_mapped=%d "
+         "raw_cached_bytes=%u raw_cached_alloc_bytes=%u "
+         "decoded_mapped_bytes=%u decoded_mapped_alloc_bytes=%u "
+         "physical_bytes=%u peak_bytes=%u kernel_allocs=%llu kernel_frees=%llu "
+         "live=%u failed=%u user_free_rc=%d user_free=%u cdram_free=%u\n",
+         why, applied, memory_mode, (unsigned)budget,
+         memory_mode == 2u ? 1 : 0, raw_class,
+         VP_TEXTURE_REGION_CLASS_MAPPED,
+         applied && memory_mode == 2u ? 1 : 0,
+         applied && memory_mode != 2u ? 1 : 0,
+         applied ? 1 : 0,
+         (unsigned)regions.cached_physical_bytes,
+         (unsigned)regions.cached_allocated_bytes,
+         (unsigned)regions.mapped_physical_bytes,
+         (unsigned)regions.mapped_allocated_bytes,
+         (unsigned)regions.physical_bytes, (unsigned)regions.peak_bytes,
+         (unsigned long long)regions.kernel_allocs,
+         (unsigned long long)regions.kernel_frees, regions.live, regions.failed,
+         memory_rc, (unsigned)memory.size_user, (unsigned)memory.size_cdram);
+}
+
 /* Deep cache counters all live at the existing statistics cadence; no per-draw
  * log or timer is added. Decode timing is only sampled when play-perf asks for
  * timers, matching the legacy cache. */
@@ -1946,6 +2001,7 @@ static void texture_pool_log_stats(VPGuestSvc *svc, const char *why) {
     if (deep_pool_state == 1)
         vp_texture_pool_stats(&deep_texture_pool, &stats);
     slog(svc, "VP_TEX_POOL_STATS why=%s applied=%d state=%d transitions=%u "
+         "memory_mode=%u raw_class=%u budget=%u split=%d "
          "transition_us=%llu transition_max_us=%llu requests=%llu hits=%llu "
          "misses=%llu updates=%llu pressure_waits=%llu pressure_fail=%llu "
          "decode_us_rgba8=%llu decode_us_fp16=%llu decode_us_blocks=%llu decode_us_cube=%llu decode_us_other=%llu "
@@ -1957,6 +2013,8 @@ static void texture_pool_log_stats(VPGuestSvc *svc, const char *why) {
          "direct_retains=%llu direct_releases=%llu direct_stale=%llu "
          "refs_live=%u raw_reclaims=%llu raw_reclaimed_bytes=%llu\n",
          why, deep_pipeline_applied, deep_pool_state, deep_pipeline_transitions,
+         deep_pipeline_memory_mode, stats.raw_class,
+         (unsigned)stats.budget_bytes, deep_pipeline_memory_mode == 2u ? 1 : 0,
          (unsigned long long)deep_transition_us_total,
          (unsigned long long)deep_transition_us_max,
          (unsigned long long)deep_requests, (unsigned long long)deep_hits,
@@ -2019,20 +2077,39 @@ typedef struct {
 } VPTexturePipelineSwitch;
 
 /* Must run on the GXM worker. The caller is a submission boundary: all scenes
- * are drained, no draw is being prepared and no direct lease is consumed. */
+ * are drained, no draw is being prepared and no direct lease is consumed.
+ * Mode 4/7/8 share this path; a memory-configuration change alone still tears
+ * down every pool page and region before the new budget/class is configured. */
 static int texture_pipeline_switch_worker(VPGuestSvc *svc) {
     uint64_t started = sceKernelGetProcessTimeWide();
     unsigned long long transition_us;
     int target = texture_pipeline_desired();
+    unsigned memory_mode = target ? texture_memory_desired() : 0u;
+    size_t budget = memory_mode == 1u ? VP_TEXTURE_POOL_MAX_BYTES :
+        VP_TEXTURE_POOL_DEFAULT_BYTES;
+    unsigned raw_class = memory_mode == 2u ?
+        VP_TEXTURE_REGION_CLASS_CPU_CACHED : VP_TEXTURE_REGION_CLASS_MAPPED;
     int rc;
 
+    if (target && memory_mode > 2u) {
+        slog(svc, "VP_TEX_POOL_MODE_FAIL target=deep memory_mode=%u "
+             "reason=invalid-config action=keep-current\n", memory_mode);
+        return -1;
+    }
     /* Capture the outgoing phase's pool counters before teardown; init on the
      * next deep activation resets the pool-local peak/live values. */
-    if (deep_pipeline_applied) texture_pool_log_stats(svc, "mode-switch-before");
+    if (deep_pipeline_applied) {
+        texture_memory_log_config(svc, "switch-before", deep_pipeline_applied,
+            deep_pipeline_memory_mode,
+            deep_pool_state == 1 ? deep_texture_pool.bytes : 0u,
+            deep_texture_pool.raw_class);
+        texture_pool_log_stats(svc, "mode-switch-before");
+    }
     rc = vp_gxm_texture_pipeline_reclaim();
     if (rc < 0) {
-        slog(svc, "VP_TEX_POOL_MODE_FAIL target=%s rc=%d action=keep-current\n",
-             target ? "deep" : "normal", rc);
+        slog(svc, "VP_TEX_POOL_MODE_FAIL target=%s memory_mode=%u rc=%d "
+             "action=keep-current\n", target ? "deep" : "normal",
+             memory_mode, rc);
         return rc;
     }
     for (unsigned i = 0; i < VP_TEXTURE_CACHE_SLOTS; ++i)
@@ -2041,14 +2118,14 @@ static int texture_pipeline_switch_worker(VPGuestSvc *svc) {
     if (deep_pipeline_applied) {
         if (deep_pool_state == 1) {
             if (vp_texture_pool_gpu_refs(&deep_texture_pool) != 0u) {
-                slog(svc, "VP_TEX_POOL_MODE_FAIL target=%s refs=%u "
-                     "action=keep-current\n", target ? "deep" : "normal",
-                     vp_texture_pool_gpu_refs(&deep_texture_pool));
+                slog(svc, "VP_TEX_POOL_MODE_FAIL target=%s memory_mode=%u "
+                     "refs=%u action=keep-current\n", target ? "deep" : "normal",
+                     memory_mode, vp_texture_pool_gpu_refs(&deep_texture_pool));
                 return -1;
             }
             if (vp_texture_pool_reset(&deep_texture_pool) < 0) {
-                slog(svc, "VP_TEX_POOL_MODE_FAIL target=%s reason=reset\n",
-                     target ? "deep" : "normal");
+                slog(svc, "VP_TEX_POOL_MODE_FAIL target=%s memory_mode=%u "
+                     "reason=reset\n", target ? "deep" : "normal", memory_mode);
                 return -1;
             }
             if (vp_gxm_texture_regions_reset() < 0) return -1;
@@ -2065,12 +2142,22 @@ static int texture_pipeline_switch_worker(VPGuestSvc *svc) {
         memory.size = sizeof(memory);
         int memory_rc = sceKernelGetFreeMemorySize(&memory);
         slog(svc, "VP_TEX_POOL_MEMORY target=%s phase=after-cleanup rc=%d "
+             "memory_mode=%u budget=%u split=%d raw_class=%u "
              "user_free=%u cdram_free=%u\n", target ? "deep" : "normal",
-             memory_rc, (unsigned)memory.size_user, (unsigned)memory.size_cdram);
+             memory_rc, memory_mode, (unsigned)budget,
+             memory_mode == 2u ? 1 : 0, raw_class,
+             (unsigned)memory.size_user, (unsigned)memory.size_cdram);
     }
     if (target) {
-        int alloc_rc = vp_texture_pool_init_regions(&deep_texture_pool,
-            VP_TEXTURE_POOL_MAX_BYTES, NULL, vp_gxm_texture_region_create,
+        int region_rc = vp_gxm_texture_regions_init(budget);
+        if (region_rc < 0) {
+            slog(svc, "VP_TEX_POOL_MODE_FAIL target=deep memory_mode=%u "
+                 "budget=%u reason=region-init rc=%d\n",
+                 memory_mode, (unsigned)budget, region_rc);
+            return region_rc;
+        }
+        int alloc_rc = vp_texture_pool_init_regions(&deep_texture_pool, budget,
+            raw_class, NULL, vp_gxm_texture_region_create,
             vp_gxm_texture_region_release);
         if (alloc_rc < 0) return alloc_rc;
         vp_texture_pool_set_retire(&deep_texture_pool, texture_pool_retire, NULL);
@@ -2078,17 +2165,23 @@ static int texture_pipeline_switch_worker(VPGuestSvc *svc) {
     }
 
     deep_pipeline_applied = target;
+    deep_pipeline_memory_mode = target ? memory_mode : 0u;
     deep_pipeline_transitions++;
     transition_us = (unsigned long long)(sceKernelGetProcessTimeWide() - started);
     deep_transition_us_total += transition_us;
     if (transition_us > deep_transition_us_max)
         deep_transition_us_max = transition_us;
     slog(svc, "VP_TEX_POOL_MODE mode=%s transition=%u transition_us=%llu "
-         "pool_state=%d bytes=%u refs=%u detail=worker-boundary\n",
+         "pool_state=%d bytes=%u memory_mode=%u budget=%u split=%d "
+         "raw_class=%u refs=%u detail=worker-boundary\n",
          target ? "deep" : "normal", deep_pipeline_transitions, transition_us,
-         deep_pool_state, target ? VP_TEXTURE_POOL_MAX_BYTES : 0u,
+         deep_pool_state, target ? (unsigned)budget : 0u,
+         deep_pipeline_memory_mode, target ? (unsigned)budget : 0u,
+         deep_pipeline_memory_mode == 2u ? 1 : 0, raw_class,
          vp_texture_pool_gpu_refs(&deep_texture_pool));
     texture_pool_log_stats(svc, "mode-transition");
+    texture_memory_log_config(svc, "switch-after", deep_pipeline_applied,
+        deep_pipeline_memory_mode, target ? budget : 0u, raw_class);
     return 0;
 }
 
@@ -2098,12 +2191,21 @@ static void texture_pipeline_switch_cb(void *opaque) {
 }
 
 /* Called once per decoded GPU submission, before any draw of that submission
- * is prepared. The host-side root poll only publishes the desired atomic; the
- * actual cache teardown and pool creation happen here on the GXM worker. */
+ * is prepared. The host-side root poll only publishes the desired atomics; the
+ * actual cache teardown and pool creation happen here on the GXM worker. A
+ * memory-only change (4 <-> 7/8) must switch even when the deep flag itself
+ * did not change. */
 static int texture_pipeline_apply_pending(VPGuestSvc *svc) {
     int desired = texture_pipeline_desired();
+    unsigned memory_mode = desired ? texture_memory_desired() : 0u;
     int rc;
-    if (desired == deep_pipeline_applied) return 0;
+    if (desired && memory_mode > 2u) {
+        slog(svc, "VP_TEX_POOL_MODE_FAIL target=deep memory_mode=%u "
+             "reason=invalid-config action=reject\n", memory_mode);
+        return -1;
+    }
+    if (desired == deep_pipeline_applied &&
+        (!desired || memory_mode == deep_pipeline_memory_mode)) return 0;
     if (vp_gxm_worker_is_current())
         return texture_pipeline_switch_worker(svc);
     {
@@ -2237,15 +2339,19 @@ static uint8_t *texture_pool_decode(VPGuestSvc *svc, const VPGpuTextureInfo *t,
     rgba_bytes = cube ? vp_texture_cube_upload_bytes_mips(t->width, t->height,
                                                          mips)
                       : vp_texture_upload_bytes(t->width, t->height, upload);
-    if (!t->storage || rgba_bytes == 0u ||
-        t->storage > VP_TEXTURE_POOL_MAX_BYTES ||
-        rgba_bytes > VP_TEXTURE_POOL_MAX_BYTES - t->storage) {
-        slog(svc, "VP_TEX_POOL_MEMORY_FAIL va=0x%llx raw=%u rgba=%u cap=%u "
-             "detail=request-exceeds-pool\n", (unsigned long long)t->va,
-             (unsigned)t->storage, (unsigned)rgba_bytes,
-             VP_TEXTURE_POOL_MAX_BYTES);
-        *outcome = VP_TEX_DECODE_FAILED;
-        return NULL;
+    {
+        /* The active pool's own budget is the request ceiling. It is 64 MiB
+         * by default and 128 MiB only after an explicit deep-large switch. */
+        size_t pool_cap = deep_texture_pool.bytes;
+        if (!t->storage || rgba_bytes == 0u ||
+            t->storage > pool_cap ||
+            rgba_bytes > pool_cap - t->storage) {
+            slog(svc, "VP_TEX_POOL_MEMORY_FAIL va=0x%llx raw=%u rgba=%u cap=%u "
+                 "detail=request-exceeds-pool\n", (unsigned long long)t->va,
+                 (unsigned)t->storage, (unsigned)rgba_bytes, (unsigned)pool_cap);
+            *outcome = VP_TEX_DECODE_FAILED;
+            return NULL;
+        }
     }
     memset(&key, 0, sizeof(key));
     key.va = t->va;
@@ -2463,6 +2569,30 @@ void vp_guest_frame_perf(VPGuestFramePerf *out) {
         out->tex_family_us[i] = deep_decode_us_family[i];
         out->tex_family_bytes[i] = deep_decode_bytes_family[i];
     }
+}
+
+void vp_guest_texture_memory_perf(VPGuestTextureMemoryPerf *out) {
+    VPTexturePoolStats stats;
+    if (out == NULL) return;
+    memset(out, 0, sizeof(*out));
+    memset(&stats, 0, sizeof(stats));
+    if (deep_pool_state == 1)
+        vp_texture_pool_stats(&deep_texture_pool, &stats);
+    out->applied = deep_pipeline_applied;
+    out->memory_mode = deep_pipeline_applied ? deep_pipeline_memory_mode : 0u;
+    out->raw_class = stats.raw_class;
+    out->budget_bytes = stats.budget_bytes;
+    out->used_bytes = stats.used_bytes;
+    out->peak_used_bytes = stats.peak_used_bytes;
+    out->live_slots = stats.live_slots;
+    out->peak_live_slots = stats.peak_live_slots;
+    out->gpu_refs = stats.gpu_refs;
+    out->cpu_pins = stats.cpu_pins;
+    out->evictions = stats.evictions;
+    out->pressure_events = stats.pressure_events;
+    out->nomem_events = stats.nomem_events;
+    out->alloc_map_calls = stats.alloc_map_calls;
+    out->free_map_calls = stats.free_map_calls;
 }
 
 

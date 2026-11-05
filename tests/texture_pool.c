@@ -405,8 +405,8 @@ static void test_reset_and_teardown(void) {
 static struct { void *base; size_t bytes; } regions[256];
 static unsigned region_allocs, region_frees;
 static int region_fail;
-static void *region_allocate(void *user, size_t bytes, int gpu_read) {
-    (void)user; (void)gpu_read;
+static void *region_allocate(void *user, size_t bytes, unsigned allocation_class) {
+    (void)user; (void)allocation_class;
     if (region_fail) return NULL;
     for (unsigned i = 0; i < 256u; ++i) {
         if (regions[i].base) continue;
@@ -437,7 +437,7 @@ static void test_reusable_regions(void) {
     memset(&f, 0, sizeof(f));
     memset(bytes, 0x24, sizeof(bytes));
     region_allocs = region_frees = 0u; region_fail = 0;
-    assert(vp_texture_pool_init_regions(&f.pool, 4u * PAGE, NULL,
+    assert(vp_texture_pool_init_regions(&f.pool, 4u * PAGE, 0u, NULL,
         region_allocate, region_release) == 0);
     vp_texture_pool_set_retire(&f.pool, retire_cb, NULL);
     store(&f, 1u, bytes, sizeof(bytes), 32u, NULL);
@@ -495,7 +495,7 @@ static void test_region_updates_and_kernel_pressure(void) {
     memset(&f, 0, sizeof(f));
     memset(bytes, 0x35, sizeof(bytes));
     region_allocs = region_frees = 0u; region_fail = 0;
-    assert(vp_texture_pool_init_regions(&f.pool, 16u * PAGE, NULL,
+    assert(vp_texture_pool_init_regions(&f.pool, 16u * PAGE, 0u, NULL,
         region_allocate, region_release) == 0);
     first = store(&f, 4u, bytes, sizeof(bytes), 32u, NULL);
     for (unsigned i = 0; i < 1000u; ++i) {
@@ -527,7 +527,7 @@ static void test_pressure_preserves_wrong_size_regions(void) {
     int reused;
     memset(&f, 0, sizeof(f)); memset(bytes, 0x17, sizeof(bytes));
     region_allocs = region_frees = 0u; region_fail = 0;
-    assert(vp_texture_pool_init_regions(&f.pool, 6u * PAGE, NULL,
+    assert(vp_texture_pool_init_regions(&f.pool, 6u * PAGE, 0u, NULL,
         region_allocate, region_release) == 0);
     small = store(&f, 1u, bytes, PAGE, PAGE, NULL);
     assert(vp_texture_pool_retain_gpu(&f.pool, f.pool.slots[small.slot].rgba,
@@ -559,7 +559,7 @@ static void test_idle_resize_keeps_gpu_payload(void) {
     int reused;
     memset(&f, 0, sizeof(f)); memset(bytes, 0x39, sizeof(bytes));
     region_allocs = region_frees = 0u; region_fail = 0;
-    assert(vp_texture_pool_init_regions(&f.pool, 6u * PAGE, NULL,
+    assert(vp_texture_pool_init_regions(&f.pool, 6u * PAGE, 0u, NULL,
         region_allocate, region_release) == 0);
     f.pool.idle_resize = 1u;
     held = store(&f, 1u, bytes, PAGE, PAGE, NULL);
@@ -586,12 +586,12 @@ static void test_idle_resize_keeps_gpu_payload(void) {
     assert(region_allocs == region_frees);
     puts("PASS idle resize evicts only idle payloads and preserves GPU/CPU pins");
 }
-static void *mapped_create(void *user, size_t bytes) {
-    return region_allocate(user, bytes, 1);
+static void *mapped_create(void *user, size_t bytes, unsigned allocation_class) {
+    return region_allocate(user, bytes, allocation_class);
 }
-static void *mapped_suballocate(void *user, size_t bytes, int gpu_read) {
-    (void)user; (void)gpu_read;
-    return vp_texture_regions_alloc(&mapped_regions, bytes);
+static void *mapped_suballocate(void *user, size_t bytes, unsigned allocation_class) {
+    (void)user;
+    return vp_texture_regions_alloc(&mapped_regions, bytes, allocation_class);
 }
 static int mapped_subfree(void *user, void *base) {
     (void)user;
@@ -603,8 +603,9 @@ static void test_working_set_replaces_cold_large_textures(void) {
     assert(source);
     memset(source, 0x44, 4u * 1024u * 1024u);
     memset(&f, 0, sizeof(f)); memset(&mapped_regions, 0, sizeof(mapped_regions));
-    mapped_regions.create = mapped_create; mapped_regions.destroy = region_release;
-    assert(vp_texture_pool_init_regions(&f.pool, 48u * 1024u * 1024u,
+    assert(vp_texture_regions_init(&mapped_regions,
+        VP_TEXTURE_REGION_BUDGET, NULL, mapped_create, region_release) == 0);
+    assert(vp_texture_pool_init_regions(&f.pool, 48u * 1024u * 1024u, 0u,
         NULL, mapped_suballocate, mapped_subfree) == 0);
     for (unsigned i = 0; i < 3u; ++i) {
         vp_texture_pool_begin_request(&f.pool);
@@ -665,6 +666,128 @@ static void test_lookup_trace_preserves_versions(void) {
     puts("PASS lookup diagnostics retain exact comparison and GPU version lifetime");
 }
 
+static VPTextureRegions split_regions;
+static struct {
+    void *base; size_t bytes; unsigned allocation_class;
+} split_backings[VP_TEXTURE_REGION_CHUNKS];
+static size_t split_provider_bytes;
+static void *split_create(void *user, size_t bytes, unsigned allocation_class) {
+    (void)user;
+    if (allocation_class >= VP_TEXTURE_REGION_CLASSES) return NULL;
+    for (unsigned i = 0; i < VP_TEXTURE_REGION_CHUNKS; ++i) {
+        if (split_backings[i].base) continue;
+        void *base = test_page_alloc(bytes);
+        if (!base) return NULL;
+        split_backings[i].base = base;
+        split_backings[i].bytes = bytes;
+        split_backings[i].allocation_class = allocation_class;
+        split_provider_bytes += bytes;
+        return base;
+    }
+    return NULL;
+}
+static int split_destroy(void *user, void *base) {
+    (void)user;
+    for (unsigned i = 0; i < VP_TEXTURE_REGION_CHUNKS; ++i) {
+        if (split_backings[i].base != base) continue;
+        split_provider_bytes -= split_backings[i].bytes;
+        test_page_free(base);
+        memset(&split_backings[i], 0, sizeof(split_backings[i]));
+        return 0;
+    }
+    return -1;
+}
+static void *split_suballocate(void *user, size_t bytes,
+                               unsigned allocation_class) {
+    (void)user;
+    return vp_texture_regions_alloc(&split_regions, bytes, allocation_class);
+}
+static int split_subfree(void *user, void *base) {
+    (void)user;
+    return vp_texture_regions_free(&split_regions, base);
+}
+static unsigned split_chunk_class(const void *base) {
+    uintptr_t pointer = (uintptr_t)base;
+    for (unsigned i = 0; i < VP_TEXTURE_REGION_CHUNKS; ++i) {
+        const VPTextureRegionChunk *chunk = &split_regions.chunks[i];
+        if (!chunk->base) continue;
+        if (pointer >= (uintptr_t)chunk->base &&
+            pointer < (uintptr_t)chunk->base + chunk->bytes)
+            return chunk->allocation_class;
+    }
+    assert(0);
+    return VP_TEXTURE_REGION_CLASSES;
+}
+static void test_split_classes_and_shared_budget(void) {
+    Fixture f;
+    const size_t four_mib = 4u * 1024u * 1024u;
+    uint8_t *source = malloc(four_mib);
+    VPTexturePoolStats stats;
+    assert(source);
+    memset(source, 0x6d, four_mib);
+    memset(&f, 0, sizeof(f));
+    memset(&split_regions, 0, sizeof(split_regions));
+    memset(split_backings, 0, sizeof(split_backings));
+    split_provider_bytes = 0u;
+    assert(vp_texture_regions_init(&split_regions, VP_TEXTURE_REGION_BUDGET,
+        NULL, split_create, split_destroy) == 0);
+    assert(vp_texture_pool_init_regions(&f.pool, VP_TEXTURE_REGION_BUDGET,
+        VP_TEXTURE_REGION_CLASS_CPU_CACHED, NULL, split_suballocate,
+        split_subfree) == 0);
+    vp_texture_pool_set_retire(&f.pool, retire_cb, NULL);
+    for (unsigned i = 0; i < 8u; ++i) {
+        vp_texture_pool_begin_request(&f.pool);
+        store(&f, 100u + i, source, four_mib, four_mib, NULL);
+        assert(split_chunk_class(f.pool.slots[i].raw) ==
+               VP_TEXTURE_REGION_CLASS_CPU_CACHED);
+        assert(split_chunk_class(f.pool.slots[i].rgba) ==
+               VP_TEXTURE_REGION_CLASS_MAPPED);
+        assert(f.pool.slots[i].raw != f.pool.slots[i].rgba);
+    }
+    vp_texture_pool_stats(&f.pool, &stats);
+    assert(stats.budget_bytes == VP_TEXTURE_REGION_BUDGET);
+    assert(stats.raw_class == VP_TEXTURE_REGION_CLASS_CPU_CACHED);
+    assert(stats.used_bytes == VP_TEXTURE_REGION_BUDGET);
+    assert(split_regions.physical_bytes == VP_TEXTURE_REGION_BUDGET);
+    assert(split_regions.class_physical[VP_TEXTURE_REGION_CLASS_MAPPED] ==
+           VP_TEXTURE_REGION_BUDGET / 2u);
+    assert(split_regions.class_physical[VP_TEXTURE_REGION_CLASS_CPU_CACHED] ==
+           VP_TEXTURE_REGION_BUDGET / 2u);
+    for (unsigned i = 0; i < VP_TEXTURE_REGION_CHUNKS; ++i) {
+        const VPTextureRegionChunk *chunk = &split_regions.chunks[i];
+        if (!chunk->base) continue;
+        for (unsigned j = 0; j < VP_TEXTURE_REGION_ALLOCS; ++j) {
+            const VPTextureRegionAllocation *allocation =
+                &split_regions.allocations[j];
+            if (allocation->base != chunk->base + (size_t)allocation->first *
+                VP_TEXTURE_REGION_PAGE) continue;
+            assert(allocation->allocation_class == chunk->allocation_class);
+        }
+    }
+    /* A ninth pair evicts an idle version but the combined physical total
+     * remains the same 64 MiB. */
+    vp_texture_pool_begin_request(&f.pool);
+    store(&f, 200u, source, four_mib, four_mib, NULL);
+    vp_texture_pool_stats(&f.pool, &stats);
+    assert(stats.evictions >= 1u);
+    assert(stats.used_bytes <= VP_TEXTURE_REGION_BUDGET);
+    assert(split_regions.physical_bytes <= VP_TEXTURE_REGION_BUDGET);
+    assert(split_regions.physical_bytes == VP_TEXTURE_REGION_BUDGET);
+    assert(split_regions.class_physical[VP_TEXTURE_REGION_CLASS_MAPPED] <=
+           VP_TEXTURE_REGION_BUDGET / 2u);
+    /* A small mixed pair reuses the empty chunks of each class. */
+    vp_texture_pool_begin_request(&f.pool);
+    store(&f, 300u, source, PAGE, PAGE, NULL);
+    assert(split_regions.physical_bytes <= VP_TEXTURE_REGION_BUDGET);
+    assert(split_regions.class_allocated[VP_TEXTURE_REGION_CLASS_MAPPED] > 0u);
+    assert(split_regions.class_allocated[VP_TEXTURE_REGION_CLASS_CPU_CACHED] > 0u);
+    assert(vp_texture_pool_reset(&f.pool) == 0);
+    assert(vp_texture_regions_reset(&split_regions) == 0);
+    assert(split_provider_bytes == 0u);
+    free(source);
+    puts("PASS split raw/decoded classes never mix and share one 64 MiB budget");
+}
+
 int main(void) {
     test_lookup_trace_preserves_versions();
     test_reusable_regions();
@@ -672,6 +795,7 @@ int main(void) {
     test_pressure_preserves_wrong_size_regions();
     test_idle_resize_keeps_gpu_payload();
     test_working_set_replaces_cold_large_textures();
+    test_split_classes_and_shared_budget();
     test_inflight_content_version();
     test_init_validation();
     test_exact_identity();

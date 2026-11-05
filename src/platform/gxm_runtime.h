@@ -157,6 +157,19 @@ typedef struct {
 } VPGuestFramePerf;
 void vp_guest_frame_perf(VPGuestFramePerf *out);
 
+typedef struct {
+    int applied;
+    unsigned memory_mode;      /* 0 = 64 MiB unified, 1 = 128 MiB unified, 2 = split */
+    unsigned raw_class;
+    size_t budget_bytes, used_bytes, peak_used_bytes;
+    unsigned live_slots, peak_live_slots, gpu_refs, cpu_pins;
+    uint64_t evictions, pressure_events, nomem_events;
+    uint64_t alloc_map_calls, free_map_calls;
+} VPGuestTextureMemoryPerf;
+/* Snapshot of the applied deep texture memory configuration. Reads only
+ * published atomics and counter fields; it never switches mode or allocates. */
+void vp_guest_texture_memory_perf(VPGuestTextureMemoryPerf *out);
+
 /* Bounded nested frame-cost profile. All entry points must run on the GXM
  * worker; other threads do not record spans and must not read the control
  * file. The boundary poll applies a mode change only while no span is open.
@@ -409,14 +422,25 @@ int vp_gxm_batch_flush(const char *reason);
  * changed, so an earlier scene keeps its immutable copies until completion. */
 void vp_gxm_texture_owned_retire(const void *source);
 
-/* Deep texture-pipeline support. Reusable uncached regions back the pool;
- * decoded regions are mapped for GPU read on the GXM worker. Reclaim
+/* Deep texture-pipeline support. Reusable regions back the pool. Decoded
+ * regions use class 0 (uncached, GXM-mapped for read); split raw snapshots use
+ * class 1 (cached, never GXM-mapped). Reclaim
  * flushes the open scene and waits for every deferred notification so all
  * direct-texture leases are provably released before the pool is reused,
  * torn down or retried. */
-void *vp_gxm_texture_region_create(void *user, size_t bytes, int gpu_read);
+int vp_gxm_texture_regions_init(size_t budget_bytes);
+void *vp_gxm_texture_region_create(void *user, size_t bytes,
+                                   unsigned allocation_class);
 int vp_gxm_texture_region_release(void *user, void *base);
 int vp_gxm_texture_regions_reset(void);
+typedef struct {
+    size_t budget_bytes, physical_bytes, peak_bytes;
+    size_t mapped_physical_bytes, cached_physical_bytes;
+    size_t mapped_allocated_bytes, cached_allocated_bytes;
+    uint64_t kernel_allocs, kernel_frees, suballocs, subfrees;
+    unsigned live, failed;
+} VPGxmTextureRegionStats;
+void vp_gxm_texture_region_stats(VPGxmTextureRegionStats *out);
 int vp_gxm_texture_copy_cache_reset(void);
 int vp_gxm_texture_pipeline_reclaim(void);
 /* Invalidates CPU descriptors that may name a torn-down pool address. */

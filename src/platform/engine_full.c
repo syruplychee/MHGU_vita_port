@@ -9,6 +9,7 @@ volatile uint32_t vp_engine_full_profile_enabled;
 volatile uint32_t vp_engine_full_fast_enabled;
 volatile uint32_t vp_engine_shared_prepare_enabled;
 volatile uint32_t vp_engine_texture_pipeline_enabled;
+volatile uint32_t vp_engine_texture_memory_mode;
 volatile uint32_t vp_engine_texture_idle_resize_enabled;
 volatile uint32_t vp_engine_clear_defer_enabled;
 typedef struct {

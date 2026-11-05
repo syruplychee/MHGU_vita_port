@@ -12,7 +12,7 @@ cmake --build build/host-tests -j
 ctest --test-dir build/host-tests --output-on-failure
 ```
 
-- Windows：49 项 CTest（47 项跨平台，含 6 项 Python 工具回归；另加
+- Windows：50 项 CTest（48 项跨平台，含 7 项 Python 工具回归；另加
   `session_gate`、`runtime_main_window` 两项 Windows 专用）。
 - Linux/WSL：额外 4 项 POSIX 测试（`audio_auto_catchup`、`audio_wave_progress`、
   `guest_storage`、`log_sink`）。
@@ -30,6 +30,8 @@ ctest --test-dir build/host-tests --output-on-failure
   `texture_pool` 另验证诊断仍逐字节比较，GPU 持有的旧像素与 token 生命周期不变。
 - 延迟 clear：`clear_defer` 抽取生产准入、提交、物化和消费逻辑，检查先提交后记录、
   drain 失败保留标签、模式切换和原路径；`engine_mode` 检查共享模式控制谓词。
+- 纹理内存实验：`texture_memory_metrics` 检查同端点实际预算与两类占用对账、跨模式/
+  计数重置/缺快照拒绝；`texture_regions`、`texture_pool` 验证共享总额、类隔离及持有期。
 - `static_shader_candidate.c` 是可选集成检查，需要一个候选包路径，不默认加入 CTest。
 
 覆盖范围与证据规则见 [测试](../docs/08-testing.md)。
