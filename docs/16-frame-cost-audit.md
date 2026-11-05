@@ -134,6 +134,15 @@ submit-end 约 0.78 ms，其余约 0.35 ms。它是该轮约 19.11 ms 的原因�
 容量与运行证据。已有 deep 路径已经把 decoder→staging/upload 的中间复制降到 0，
 但为逐字节身份比较保留的 raw 快照以及 miss 后重新转换/保存仍然昂贵。
 
+这里的 64 MiB 是项目继承原 48 MiB decoder + 16 MiB upload 的合并预算，不是
+CDRAM 容量或 GXM 的硬件限制。源码 L0 确认：`gxm_texture_chunk_create` 申请的是
+`USER_RW_UNCACHE` 主内存，再通过 `sceGxmMapMemory(...READ)` 供 GPU 读取；当前
+decoded 已直接从映射主内存绑定，不是每次必须上传 CDRAM。raw 快照仅供 CPU 比较，
+不绑定 shader；但 region provider 忽略 `gpu_read`，使 raw/decoded 共用上述 uncached、
+GPU-mapped chunk。将 CPU-only raw 拆到 cached 主内存、只映射 decoded 是另一个
+可测试切片；尚无 A/B 证据证明其收益。拆开存放不会自动消除双份总占用，映射也不会
+转换原游戏纹理布局；缓存可见性、源写入和 GPU 持有期仍须分别处理。
+
 这里还有一个必须保留的边界：**同 key 重复，不能证明被淘汰后源像素没变。**
 没有旧 raw 时无法做那次比较，所以不能据本报告按地址跳过校验。要安全地去掉大块
 raw 副本，必须深入原游戏资源创建、写入、更新和释放，建立可靠版本/失效依据；

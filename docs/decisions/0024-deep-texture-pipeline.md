@@ -40,6 +40,8 @@ setter 语义，替换解码缓存内存、批处理上传及对应的场景提�
   64 MiB 物理上限。chunk 以 `SCE_GXM_MEMORY_ATTRIB_READ` 映射；raw 只由 CPU 使用，
   从不绑定给 shader。该上限合并原有 48 MiB decoder cache 与 16 MiB upload cache，
   后者不再同时常驻；不是在两套旧缓存上另加 64 MiB。GPU 映射覆盖范围变大，真机仍待验。
+  此处“物理上限”指本分配器实际申请量的项目预算，不是 PSV/CDRAM/GXM 硬件上限。
+  `USER_RW_UNCACHE` 是主内存；GPU 直接读取其映射区域，并不要求 decoded 常驻 CDRAM。
 - 4 MiB 申请失败时可按资源大小使用较小 chunk（通常至少 256 KiB），成功建块总数最多
   256，物理字节上限仍为 64 MiB。小分配优先进入小 chunk，保留大 chunk 的连续空间。
   本次激活内已失败的大块大小不会每帧重试；能由现有 chunk 服务的请求通过缓存淘汰/
