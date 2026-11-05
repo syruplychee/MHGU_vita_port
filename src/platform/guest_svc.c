@@ -14710,6 +14710,11 @@ static int query_memory(VPGuestSvc *svc, VPBridgeFrame *f) {
     return 0;
 }
 
+static unsigned memory_audit_enabled;
+void vp_guest_memory_audit_set(unsigned enabled) {
+    memory_audit_enabled = enabled;
+}
+
 static int get_info(VPGuestSvc *svc, VPBridgeFrame *f) {
     uint64_t subtype = (uint64_t)f->regs[0] | ((uint64_t)f->regs[3] << 32);
     uint32_t type = f->regs[1], handle = f->regs[2];
@@ -14754,6 +14759,17 @@ static int get_info(VPGuestSvc *svc, VPBridgeFrame *f) {
         slog(svc, "SVC_GETINFO_REJECT type=0x%x handle=0x%08x subtype=0x%llx result=0x%08x\n",
                 type, handle, (unsigned long long)subtype, result);
         sflush(svc);
+    }
+    if (memory_audit_enabled && type >= 4u && type <= 7u) {
+        slog(svc, "MEMORY_AUDIT_QUERY type=%u value=%llu result=%u "
+             "pc=0x%x lr=0x%x sp=0x%x fp=0x%x\n", type,
+             (unsigned long long)value, result, f->pc, f->lr, f->sp, f->regs[11]);
+        if (vp_guest_svc_readable(svc, f->sp, 24u * sizeof(uint32_t))) {
+            const uint32_t *stack = (const uint32_t *)(uintptr_t)f->sp;
+            for (unsigned i = 0u; i < 24u; ++i)
+                slog(svc, "MEMORY_AUDIT_STACK type=%u sp=0x%x index=%u word=0x%x\n",
+                     type, f->sp, i, stack[i]);
+        }
     }
     f->regs[0] = result;
     f->regs[1] = (uint32_t)value;

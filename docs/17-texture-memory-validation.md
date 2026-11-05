@@ -4,6 +4,10 @@
 代码契约见 [ADR 0029](decisions/0029-texture-memory-experiments.md)，成本依据见
 [整帧审计](16-frame-cost-audit.md)。证据 L0/L1/L2/L3；无真机 L4/L5。
 
+后续已查明：本轮仅取得约88 MiB的128 MiB预算实验，不能否定充分驻留本身。
+进入原游戏调整子堆后，另一个包实际取得128 MiB并在有限村庄对照明显提速，详见
+[三项验证](18-resource-lifecycle-and-capacity.md)。以下失败结果仍成立，但不外推到新布局。
+
 ## 1. 结论
 
 **两个简单改动均未证明提速，保持默认关闭。**

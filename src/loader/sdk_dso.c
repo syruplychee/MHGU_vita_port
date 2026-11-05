@@ -18,6 +18,7 @@
 #include "engine_layout.h"
 #include "engine_full.h"
 #include "gxm_runtime.h"
+#include "resource_experiment.h"
 #include <stddef.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/kernel/cpu.h>
@@ -802,7 +803,102 @@ static int game_cost_patch(FILE *log, VPNativeModule *m) {
     return 0;
 }
 
+static int resource_guard(const VPNativeModule *m, uint32_t offset,
+                          uint32_t bytes, const char *expected) {
+    if (offset > m->nso.span || bytes > m->nso.span - offset) return VP_PATCH_RANGE;
+    unsigned char sha[32];
+    const char *digits="0123456789abcdef";
+    vp_sha256(m->image+offset,bytes,sha);
+    for (unsigned i=0;i<32u;++i)
+        if (digits[sha[i]>>4]!=expected[i*2u] ||
+            digits[sha[i]&15u]!=expected[i*2u+1u]) return VP_PATCH_BINDING;
+    return 0;
+}
+
+static int title_heap_experiment_patch(FILE *log, VPNativeModule *m) {
+    FILE *marker=fopen("ux0:data/mhgu-vita-port/title-texture-heap-256.enable","rb");
+    unsigned texture_mib=marker?256u:850u;
+    if (marker) fclose(marker);
+    marker=fopen("ux0:data/mhgu-vita-port/title-texture-heap-512.enable","rb");
+    if (marker) {
+        fclose(marker);
+        if (texture_mib==256u) return VP_PATCH_BINDING;
+        texture_mib=512u;
+    }
+    fprintf(log,"TITLE_HEAP_MODE texture_mib=%u\n",texture_mib);
+    if (texture_mib==850u) return 0;
+    int rc=resource_guard(m,VP_TITLE_HEAP_GUARD_OFFSET,VP_TITLE_HEAP_GUARD_BYTES,
+                          VP_TITLE_HEAP_GUARD_SHA);
+    if (rc) return rc;
+    VPPatchTarget target;
+    rc=vp_patch_open(&target,m->image,m->nso.span,m->base);
+    for (unsigned i=0;i<sizeof(vp_title_heap_words)/sizeof(vp_title_heap_words[0]) && !rc;++i) {
+        const VPTitleHeapWord *p=&vp_title_heap_words[i];
+        uint32_t replacement=texture_mib==512u?p->reduced512:p->reduced256;
+        rc=vp_patch_word(&target,p->offset,p->original,replacement);
+        fprintf(log,"TITLE_HEAP_PATCH site=0x%x original=%08x replacement=%08x status=%d\n",
+                p->offset,p->original,replacement,rc);
+    }
+    return rc;
+}
+
+static int resource_lifecycle_patch(FILE *log, VPNativeModule modules[4]) {
+    FILE *marker=fopen("ux0:data/mhgu-vita-port/resource-lifecycle.enable","rb");
+    fprintf(log,"RESOURCE_LIFECYCLE_MODE enabled=%u\n",marker?1u:0u);
+    if (!marker) return 0;
+    fclose(marker);
+    VPNativeModule *game=&modules[1],*sdk=&modules[3];
+    const unsigned count=sizeof(vp_resource_probe_sites)/sizeof(vp_resource_probe_sites[0]);
+    const uint32_t bytes=(uint32_t)(vp_sdk_svc_site_end-vp_sdk_svc_site_template);
+    const uint32_t service_at=(uint32_t)(vp_sdk_svc_site_service_value-vp_sdk_svc_site_template);
+    const uint32_t return_at=(uint32_t)(vp_sdk_svc_site_continuation_value-vp_sdk_svc_site_template);
+    const uint32_t branch_at=(uint32_t)(vp_sdk_svc_site_branch-vp_sdk_svc_site_template);
+    const uint32_t stride=(8u+bytes+15u)&~15u;
+    const uint32_t base=sdk->island_offset+sdk->island_bytes;
+    if (sdk->island_offset>sdk->capacity || base>sdk->capacity ||
+        count*stride>sdk->capacity-base || service_at+4u>bytes ||
+        return_at+4u>bytes || branch_at+4u>bytes) return VP_PATCH_RANGE;
+    for (unsigned i=0;i<count;++i) {
+        const VPResourceProbeSite *p=&vp_resource_probe_sites[i];
+        int rc=resource_guard(game,p->offset,64u,p->sha);
+        if (rc) return rc;
+        int64_t delta=(int64_t)(uint32_t)(uintptr_t)vp_bridge_saved_entry-
+                      (sdk->base+base+i*stride+8u+branch_at+8u);
+        if ((delta&3) || delta<-(int64_t)VP_PATCH_BRANCH_REACH ||
+            delta>=(int64_t)VP_PATCH_BRANCH_REACH) return VP_PATCH_REACH;
+    }
+    VPPatchTarget target;
+    int rc=vp_patch_open(&target,game->image,game->nso.span,game->base);
+    if (rc) return rc;
+    for (unsigned i=0;i<count;++i) {
+        const VPResourceProbeSite *p=&vp_resource_probe_sites[i];
+        uint32_t at=base+i*stride, island=sdk->base+at;
+        uint32_t continuation=game->base+p->offset+8u;
+        uint32_t original[2]={p->first,p->second};
+        memcpy(sdk->image+at,original,8u);
+        memcpy(sdk->image+at+8u,vp_sdk_svc_site_template,bytes);
+        memset(sdk->image+at+8u+bytes,0,stride-8u-bytes);
+        memcpy(sdk->image+at+8u+service_at,&p->service,4u);
+        memcpy(sdk->image+at+8u+return_at,&continuation,4u);
+        int64_t delta=(int64_t)(uint32_t)(uintptr_t)vp_bridge_saved_entry-
+                      (island+8u+branch_at+8u);
+        uint32_t branch=0xea000000u|((uint32_t)(delta>>2)&0xffffffu);
+        memcpy(sdk->image+at+8u+branch_at,&branch,4u);
+        rc=vp_patch_word(&target,p->offset,p->first,0xe51ff004u);
+        if (!rc) rc=vp_patch_word(&target,p->offset+4u,p->second,island);
+        fprintf(log,"RESOURCE_LIFECYCLE_PATCH name=%s site=0x%x bytes=8 island=0x%x "
+                "return=0x%x bridge_delta=%lld status=%d\n",p->name,p->offset,island,
+                continuation,(long long)delta,rc);
+        if (rc) return rc;
+    }
+    sdk->island_bytes=base+count*stride-sdk->island_offset;
+    return 0;
+}
+
 int vp_sdk_dso_patch(FILE *log,VPNativeModule modules[4]) {
+    int resource_rc=title_heap_experiment_patch(log,&modules[1]);
+    if (!resource_rc) resource_rc=resource_lifecycle_patch(log,modules);
+    if (resource_rc) return resource_rc;
     int engine_rc=engine_submit_probe_patch(log,&modules[1]);
     if (engine_rc) return engine_rc;
     engine_rc=engine_layout_patch(log,modules);
@@ -1506,6 +1602,42 @@ static int dispatch_locked(VPExecutor *e, VPBridgeFrame *f) {
 
 static int dispatch_locked_body(VPExecutor *e,VPBridgeFrame *f) {
     Session *s=e->user;
+    if (f->service>=0x257u && f->service<=0x25cu) {
+        static uint32_t sequence;
+        unsigned id=f->service-0x257u;
+        uint32_t object=id==1u?f->regs[4]:f->regs[0];
+        uint32_t gpu=0u;
+        uint32_t event=++sequence;
+        char event_line[512];
+        size_t event_length=(size_t)snprintf(event_line,sizeof(event_line),
+                "RESOURCE_LIFECYCLE event=%u kind=%s object=0x%x "
+                "lr=0x%x sp=0x%x thread=0x%x",event,vp_resource_probe_sites[id].name,
+                object,f->lr,f->sp,s->svc.current_thread_handle);
+        if (vp_guest_svc_readable(&s->svc,object,0xf0u)) {
+            const unsigned char *p=(const unsigned char *)(uintptr_t)object;
+            gpu=word(p+0xd0u);
+            event_length+=(size_t)snprintf(event_line+event_length,sizeof(event_line)-event_length,
+                    " vptr=0x%x name=%.64s gpu=0x%x width=%u height=%u "
+                    "depth=%u lod=%u",word(p),(const char *)(p+8u),gpu,
+                    word(p+0xdcu),word(p+0xe0u),word(p+0xe4u),word(p+0xe8u));
+        } else event_length+=(size_t)snprintf(event_line+event_length,
+                sizeof(event_line)-event_length," object_readable=0");
+        if (id==3u) event_length+=(size_t)snprintf(event_line+event_length,
+                sizeof(event_line)-event_length," replacement=0x%x",f->regs[1]);
+        event_line[event_length++]='\n';
+        fwrite(event_line,1,event_length,s->log);
+        if (gpu && vp_guest_svc_readable(&s->svc,gpu,0x210u)) {
+            char line[1400];
+            size_t length=(size_t)snprintf(line,sizeof(line),
+                    "RESOURCE_GPU_OBJECT event=%u gpu=0x%x words=",event,gpu);
+            for (unsigned offset=0;offset<0x210u;offset+=4u)
+                length+=(size_t)snprintf(line+length,sizeof(line)-length,"%s%08x",offset?",":"",
+                        word((const unsigned char *)(uintptr_t)gpu+offset));
+            line[length++]='\n';
+            fwrite(line,1,length,s->log);
+        }
+        return 0;
+    }
     if (f->service==0x255u || f->service==0x256u) return game_cost_service(s,e,f);
     if (f->service==0x252u) {
         fprintf(s->log,"ENGINE_FULL_FATAL rc=%d\n",(int32_t)f->regs[0]);
@@ -2309,17 +2441,33 @@ static int dispatch(VPExecutor *e,VPBridgeFrame *f) {
  * extra 8 MiB is borrowed from the heap (0x76F00000 -> 0x76700000). The
  * title's heap high-water mark is 0x76200000, leaving 5 MiB of slack; this is
  * a layout experiment that must be checked against the title's pool init. */
-#define VP_GUEST_HEAP_BYTES  (0x76700000u)
-#define VP_GUEST_ALIAS_BYTES (8u<<20)
-#define VP_GUEST_STACK_BYTES (16u<<20)
-#define VP_GUEST_POOL_BYTES  (VP_GUEST_HEAP_BYTES+VP_GUEST_ALIAS_BYTES+VP_GUEST_STACK_BYTES)
+#include "guest_heap_config.h"
 #define VP_GUEST_LAUNCH_BYTES 0x9000u
 static int setup_guest_memory(Session *s,VPExecutor *e) {
+    uint32_t heap_bytes=VP_GUEST_HEAP_DEFAULT_BYTES;
+    FILE *heap_control=fopen("ux0:data/mhgu-vita-port/guest-heap-limit-mib.txt","rb");
+    int heap_override=heap_control!=NULL;
+    if (heap_override) {
+        char text[32];
+        size_t length=fread(text,1,sizeof(text),heap_control);
+        int extra=fgetc(heap_control);
+        fclose(heap_control);
+        if (extra!=EOF || vp_guest_heap_parse(text,length,&heap_bytes)<0) {
+            fprintf(s->log,"SVC_MEMORY_LIMIT_ERROR reason=invalid-control\n");
+            fflush(s->log);return VP_EXECUTOR_ARGUMENT;
+        }
+    }
+    uint32_t pool_bytes=vp_guest_pool_bytes(heap_bytes);
+    fprintf(s->log,"SVC_MEMORY_LIMIT override=%d heap_bytes=%u pool_bytes=%u\n",
+        heap_override,heap_bytes,pool_bytes);
+    FILE *memory_audit=fopen("ux0:data/mhgu-vita-port/memory-audit.enable","rb");
+    vp_guest_memory_audit_set(memory_audit!=NULL);
+    if (memory_audit) fclose(memory_audit);
     SceKernelAllocMemBlockOpt opt;memset(&opt,0,sizeof(opt));opt.size=sizeof(opt);
     opt.attr=SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT;opt.alignment=0x10000;
-    s->pool_block=sceKernelAllocMemBlock("vp-guest-pool",SCE_KERNEL_MEMBLOCK_TYPE_USER_RW,VP_GUEST_POOL_BYTES,&opt);
+    s->pool_block=sceKernelAllocMemBlock("vp-guest-pool",SCE_KERNEL_MEMBLOCK_TYPE_USER_RW,pool_bytes,&opt);
     if (s->pool_block<0) {
-        fprintf(s->log,"SVC_MEMORY_ALLOC arena=pool bytes=%u status=%d\n",VP_GUEST_POOL_BYTES,s->pool_block);fflush(s->log);
+        fprintf(s->log,"SVC_MEMORY_ALLOC arena=pool bytes=%u status=%d\n",pool_bytes,s->pool_block);fflush(s->log);
         return s->pool_block;
     }
     s->launch_block=sceKernelAllocMemBlock("vp-launch-args",SCE_KERNEL_MEMBLOCK_TYPE_USER_RW,VP_GUEST_LAUNCH_BYTES,&opt);
@@ -2331,15 +2479,15 @@ static int setup_guest_memory(Session *s,VPExecutor *e) {
     int rc=sceKernelGetMemBlockBase(s->pool_block,&pool);if(rc) return rc;
     rc=sceKernelGetMemBlockBase(s->launch_block,&launch);if(rc) return rc;
     s->pool_base=(uint32_t)(uintptr_t)pool;s->launch_address=(uint32_t)(uintptr_t)launch;
-    memset(pool,0,VP_GUEST_POOL_BYTES);memset(launch,0,VP_GUEST_LAUNCH_BYTES);
+    memset(pool,0,pool_bytes);memset(launch,0,VP_GUEST_LAUNCH_BYTES);
     /* The original nnosInitialize parses this NSO argument block: allocated
      * size, command-line length, 0x18 reserved bytes, then the string. */
     static const char command_line[]="mhgu-vita-port";
     uint32_t header[8]={VP_GUEST_LAUNCH_BYTES,(uint32_t)(sizeof(command_line)-1),0,0,0,0,0,0};
     memcpy(launch,header,sizeof(header));memcpy((char *)launch+32,command_line,sizeof(command_line));
     VPGuestSvc *v=&s->svc;
-    v->heap_base=s->pool_base;v->heap_size=VP_GUEST_HEAP_BYTES;
-    v->alias_base=s->pool_base+VP_GUEST_HEAP_BYTES;v->alias_size=VP_GUEST_ALIAS_BYTES;
+    v->heap_base=s->pool_base;v->heap_size=heap_bytes;
+    v->alias_base=s->pool_base+heap_bytes;v->alias_size=VP_GUEST_ALIAS_BYTES;
     v->stack_base=v->alias_base+VP_GUEST_ALIAS_BYTES;v->stack_size=VP_GUEST_STACK_BYTES;
     v->aslr_base=v->alias_base;v->aslr_size=v->alias_size;
     v->plr_base=s->launch_address+0x8000;v->plr_size=0x1000;
@@ -2417,7 +2565,7 @@ static int setup_guest_memory(Session *s,VPExecutor *e) {
      * again instead of converging on the capacity this loader backs. */
     v->total_memory=v->used_memory+(v->used_memory>UINT32_MAX-v->heap_size?0:v->heap_size);
     fprintf(s->log,"SVC_MEMORY profile=title-arena-evidence pool=0x%08x bytes=%u heap=0x%08x+%u alias=0x%08x+%u stack=0x%08x+%u launch=0x%08x+%u executor=0x%08x+%u total=%u used=%u regions=%u\n",
-        s->pool_base,VP_GUEST_POOL_BYTES,v->heap_base,v->heap_size,v->alias_base,v->alias_size,
+        s->pool_base,pool_bytes,v->heap_base,v->heap_size,v->alias_base,v->alias_size,
         v->stack_base,v->stack_size,s->launch_address,VP_GUEST_LAUNCH_BYTES,e->stack_base,e->stack_bytes,v->total_memory,v->used_memory,v->region_count);
     fflush(s->log);return rc;
 }

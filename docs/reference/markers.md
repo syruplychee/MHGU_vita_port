@@ -53,6 +53,10 @@ Marker 是 `ux0:data/mhgu-vita-port/` 下的空文件或短文本文件。运行
 | `VP_FRAME_COST_ROOT` | 闭合 worker 根调用的起止 journal；区间和必须等于同端点 root 累计差。用于和原游戏区间求并集，不能跨线程相加 |
 | `frame-resource-audit.enable` | 默认关；与 frame-cost 一起启用，每个 mode-1 epoch 的前 16 个 present 范围记录纹理完整 key/长度/真实查询结果，不写像素。不纳入正式性能窗口；首尾不完整帧由分析器排除 |
 | `game-cost.enable` | 默认关；安装四个原游戏 A32 函数观测钩子，保留原函数，记录嵌套与平台桥墙钟。入口、原字节、范围和 ABI 见 `config/patch-plans/game-cost.json`、ADR 0028 |
+| `guest-heap-limit-mib.txt` | 默认不存在；启动时读取的真实 guest 堆容量控制，严格十进制 128–1895 MiB。实际内存块和 GetInfo/区域布局同时调整，非法则失败。见 ADR 0031 |
+| `memory-audit.enable` | 默认关；记录实际 GetInfo 内存查询返回值和有界原栈字，仅作候选调用现场，不是展开调用栈 |
+| `title-texture-heap-256.enable` / `title-texture-heap-512.enable` | 默认均关，二选一，冲突则失败；改原游戏 NVNTexture 子堆两条已核对容量指令。256 MiB 已因破图否决，512 MiB 仅有有限 L3；见 ADR 0031 |
+| `resource-lifecycle.enable` | 默认关；启动时安装六处原 rTexture 加载/替换/释放/析构观测点，记录名字、对象、GPU 对象。不会关闭 raw 内容比较；见 ADR 0032 |
 | `VP_GPU_WAIT` / `VP_GPU_WAIT_TOTAL` | play-perf 下每 32 个 present 输出完整 28 原因累计快照；记录真实通知等待、poll 命中、失败、阻塞时间及粗直方图，与原全局通知计时对账。mode 6 的 clear-materialize 等待单列一行。用 `analyze_gpu_wait.py` 做完整快照端点差分；不是 GPU 硬件执行时间 |
 | `draw-trace.enable` | draw 跟踪 |
 | `vtx-dump.enable` | 顶点 dump |

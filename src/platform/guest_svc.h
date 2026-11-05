@@ -1,6 +1,8 @@
 #ifndef VP_GUEST_SVC_H
 #define VP_GUEST_SVC_H
 #include <stdint.h>
+/* Set once by the loader before guest threads start; diagnostic only. */
+void vp_guest_memory_audit_set(unsigned enabled);
 #include <stdio.h>
 #include "host_bridge.h"
 #include "guest_storage.h"

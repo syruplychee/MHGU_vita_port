@@ -21,6 +21,8 @@ add_test(NAME game_cost_metrics
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_game_cost_metrics.py")
 add_test(NAME texture_memory_metrics
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_texture_memory_metrics.py")
+add_test(NAME resource_lifecycle_metrics
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_resource_lifecycle.py")
 
 set(VP_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../src")
 set(VP_INCLUDES
@@ -125,6 +127,7 @@ target_include_directories(clear_defer PRIVATE
 vp_host_test(clear_fusion "${VP_SRC}/platform/gxm_depth.c")
 vp_host_test(engine_mode)
 vp_host_test(work_log)
+vp_host_test(guest_heap_config)
 vp_host_test(float_bits_numeric)
 vp_host_test(frame_cost_profile "${VP_SRC}/platform/frame_cost_profile.c")
 vp_host_test(gpu_command_buffer "${VP_SRC}/platform/gpu_stream.c")
