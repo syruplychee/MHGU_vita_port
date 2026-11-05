@@ -33,6 +33,7 @@
 16. [整帧主要成本审计与深层接管依据](16-frame-cost-audit.md)
 17. [纹理预算与 raw/decoded 内存策略验证](17-texture-memory-validation.md)
 18. [原游戏内存、纹理生命周期与日志三项验证](18-resource-lifecycle-and-capacity.md)
+19. [点阵字体、Alpha8 与原生读取接入](19-pixel-fonts.md)
 
 ## 参考
 
@@ -80,3 +81,4 @@
 - [0030 仅减少正常工作日志的对照](decisions/0030-work-log-experiment.md)
 - [0031 原游戏子堆容量与真实 backing 对照](decisions/0031-original-title-memory-capacity.md)
 - [0032 原游戏 rTexture 生命周期取证](decisions/0032-original-texture-lifecycle-probe.md)
+- [0033 点阵字体与单通道上传](decisions/0033-pixel-fonts-and-alpha8.md)

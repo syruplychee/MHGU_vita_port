@@ -19,6 +19,10 @@
 
 ## 关键边界
 
+点阵字体使用 [GNU Unifont 18.0.01](https://unifoundry.com/unifont/index.html)。
+本项目的派生遮罩采用其 OFL-1.1 选项，附原 copyright 与许可；下载工具固定 HEX、
+BDF 和 OFL 身份，字体本体及游戏字库包不进入 Git。实现和证据见 ADR 0033。
+
 - **SceShaccCg / libshacccg.suprx**：公开可下载不等于允许再分发。不要提交、打包或
   上传到 release；只在本地合法获取和使用。
 - **Shacc**：GPL-2.0。若分发包含 Shacc 的二进制/源码，必须遵守 GPL；本项目默认不

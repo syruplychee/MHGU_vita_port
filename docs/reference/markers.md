@@ -106,6 +106,8 @@ mode 8 的 cached raw 最终实现来自现有 C 堆，并逐块核对 USER_RW �
 | `native-movie.enable` | 启用框架级原生播片；从 ROM 树读取用户自己的 MP4，复用 SceAvcdec，原生呈现视频。默认关闭；当前无音频。移除后重启回到原 guest 管线 |
 | `native-movie.limit-ms` | 诊断：文件内十进制毫秒数，原生播放在该时长后停止并走游戏停止命令；只用于有界测试，不作为验收结果 |
 | `thread-probe.enable` | 诊断：记录 guest ThreadType 的 user entry/arg/name、uMovie vtable 和 movie 控制地址；只读，默认关闭 |
+| `pixel-font.enable` | 启用独立 font-pixel RomFS 包、原 rTexture 身份登记和点阵字体单通道采样；启动时读取。缺少配套包明确失败；移除并重启恢复原字体。见 ADR 0033 |
+| `pixel-font-trace.enable` | 配合字体模式，额外观测原 GFD 查字/取页入口；每类只记录前 48 次，默认关闭 |
 | `movie-force-stop.enable` | 诊断：首次解码 5 秒后向游戏 uMovie 命令字写入 8，用于单独验证停止路径；不用于正式播片 |
 
 ## 6. 优先级

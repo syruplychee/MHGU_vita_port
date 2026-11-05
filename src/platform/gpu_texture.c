@@ -62,9 +62,24 @@ static unsigned vp_texture_bc5_swizzle_code(const unsigned sel[4]) {
     return ~0u;
 }
 
+/* Native Alpha8 contract. The repository's reviewed Maxwell layout table
+ * (tools/shader/maxwell_surface.py, FORMATS) names only 0x1d as R8. The C
+ * decoder below also reads 0x1c with the same byte->R rule, but that shared
+ * branch is not evidence that 0x1c has the same channel meaning, so selecting
+ * it for the (7,7,7,2) contract would guess. Four UNORM component fields and
+ * the exact selector tuple (1,1,1,R) are required; every other descriptor
+ * keeps the previous RGBA path. */
+static int vp_texture_alpha8_contract(unsigned fmt, uint32_t word) {
+    return fmt == 0x1du && ((word >> 7) & 0xfffu) == 0x492u &&
+           ((word >> 19) & 0xfffu) == 0x5ffu;
+}
+
 unsigned vp_texture_upload_format(unsigned fmt,uint32_t word) {
     unsigned swizzle=(word>>19)&0xfffu;
     if (fmt==0x01u) return VP_TEXTURE_UPLOAD_RGBA16F;
+    if (vp_texture_alpha8_contract(fmt, word)) return VP_TEXTURE_UPLOAD_ALPHA8;
+    if (fmt==0x1du && ((word>>7)&0xfffu)==0x492u && swizzle==0xe02u)
+        return VP_TEXTURE_UPLOAD_R8;
     if ((fmt==0x24u || fmt==0x26u) && (swizzle==0xb1au || swizzle==0xf1au))
         return fmt|(swizzle==0xf1au?0x100u:0u);
     if (fmt==0x27u || fmt==0x28u) {
@@ -91,11 +106,25 @@ size_t vp_texture_upload_bytes(unsigned w,unsigned h,unsigned fmt) {
             h>VP_TEXTURE_RG32F_MAX_HEIGHT) return 0;
         return (size_t)w*h*16u;
     }
+    if (vp_texture_mask8_upload(fmt)) return (size_t)((w+7u)&~7u)*h;
     base=fmt&0xffu;
     if (base==0x24u || base==0x27u) bpp=8u;
     else if (base==0x26u || base==0x28u) bpp=16u;
     else return 0u;
     return (size_t)((w+3u)/4u)*((h+3u)/4u)*bpp;
+}
+
+int vp_texture_alpha8_pad_rows(uint8_t *data, size_t bytes,
+                               unsigned width, unsigned height) {
+    size_t needed=vp_texture_upload_bytes(width,height,VP_TEXTURE_UPLOAD_ALPHA8);
+    size_t stride=(width+7u)&~7u;
+    if (!data || !needed || bytes<needed) return -1;
+    for (unsigned y=height;y>0u;--y) {
+        uint8_t *row=data+(y-1u)*stride;
+        memmove(row,data+(size_t)(y-1u)*width,width);
+        memset(row+width,0,stride-width);
+    }
+    return 0;
 }
 
 static uint16_t float_bits_to_half(uint32_t bits) {
@@ -599,6 +628,71 @@ int vp_texture_rgba8_linear_swizzle(const uint8_t *src, size_t bytes,
     for (unsigned y = 0; y < h; ++y)
         rgba8_copy_pixels(dst + (size_t)y * w * 4u,
                           src + (size_t)y * pitch, w, identity, sel);
+    return 0;
+}
+
+/* Native one-byte Maxwell R8. A GOB row holds 64 pixels as four contiguous
+ * 16-byte spans at +0/+32/+256/+288, exactly like the RGBA8 traversal but with
+ * 16 pixels per span instead of 4. Narrow tails stay on the per-16-pixel
+ * tiled_offset path, which is contiguous within one span. */
+int vp_texture_alpha8_untile(const uint8_t *src, size_t src_bytes,
+    uint8_t *dst, size_t dst_bytes, unsigned w, unsigned h, unsigned fmt,
+    unsigned bh) {
+    static const size_t row_offsets[8] = {0u,16u,64u,80u,
+                                          128u,144u,192u,208u};
+    size_t required, pixels, gob_stride;
+
+    if (!src || !dst || fmt != 0x1du || !w || !h || w > 4096u ||
+        h > 4096u || bh > 5u)
+        return -1;
+    required = vp_texture_storage(w, h, fmt, bh);
+    if (!required || (size_t)w > SIZE_MAX / h) return -1;
+    pixels = (size_t)w * h;
+    if (src_bytes < required || dst_bytes < pixels) return -1;
+    gob_stride = (size_t)512u << bh;
+
+    for (unsigned gob_y = 0; gob_y < h; gob_y += 8u) {
+        const unsigned rows = h - gob_y < 8u ? h - gob_y : 8u;
+        const size_t base = tiled_offset(0, gob_y, w, 1u, bh);
+        unsigned gob_x = 0;
+        for (; gob_x + 64u <= w; gob_x += 64u) {
+            for (unsigned row = 0; row < rows; ++row) {
+                uint8_t *out = dst + (size_t)(gob_y + row) * w + gob_x;
+                const uint8_t *in = src + base +
+                    (size_t)(gob_x / 64u) * gob_stride + row_offsets[row];
+                memcpy(out, in, 16u);
+                memcpy(out + 16u, in + 32u, 16u);
+                memcpy(out + 32u, in + 256u, 16u);
+                memcpy(out + 48u, in + 288u, 16u);
+            }
+        }
+        for (unsigned row = 0; row < rows; ++row) {
+            uint8_t *out = dst + (size_t)(gob_y + row) * w;
+            unsigned x = gob_x;
+            for (; x + 16u <= w; x += 16u)
+                memcpy(out + x, src + tiled_offset(x, gob_y + row, w, 1u, bh),
+                       16u);
+            if (x < w)
+                memcpy(out + x, src + tiled_offset(x, gob_y + row, w, 1u, bh),
+                       w - x);
+        }
+    }
+    return 0;
+}
+
+int vp_texture_alpha8_linear(const uint8_t *src, size_t src_bytes,
+    uint8_t *dst, size_t dst_bytes, unsigned w, unsigned h, size_t pitch) {
+    size_t required, pixels;
+
+    if (!src || !dst || !w || !h || w > 4096u || h > 4096u ||
+        pitch < (size_t)w || (size_t)h > SIZE_MAX / pitch)
+        return -1;
+    required = pitch * h;
+    if (src_bytes < required || (size_t)w > SIZE_MAX / h) return -1;
+    pixels = (size_t)w * h;
+    if (dst_bytes < pixels) return -1;
+    for (unsigned y = 0; y < h; ++y)
+        memcpy(dst + (size_t)y * w, src + (size_t)y * pitch, w);
     return 0;
 }
 

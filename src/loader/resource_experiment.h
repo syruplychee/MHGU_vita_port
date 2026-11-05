@@ -29,5 +29,9 @@ static const VPResourceProbeSite vp_resource_probe_sites[] = {
      "f02b9fa54dec8dd87834f00763de8c5c2373c7b319d415aacf49eeac0068d7c3"},
     {0xb513fcu, 0xe92d4010u, 0xe1a04000u, 0x25cu, "destroy-delete",
      "de25ad4dcaadb19912791f29b9b786343baed9823e01a9d8cb8962f7953ed9aa"},
+    {0xb82684u, 0xe92d4010u, 0xe1a02000u, 0x25du, "font-glyph",
+     "5bbbaf50dbe0e63e5ea0e3bb85970b743e269c57f7c0033153d95b80d6b06f48"},
+    {0xb82c78u, 0xe5d020c4u, 0xe3120001u, 0x25eu, "font-page",
+     "d3633506c2cdf79dcf4c78752e76f340c1bd6cee4f15399a1e67f739c7f466e5"},
 };
 #endif

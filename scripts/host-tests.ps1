@@ -33,7 +33,7 @@ New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 $env:TMP = $tmp
 $env:TEMP = $tmp
 
-& $CMake -S (Join-Path $Root "tests") -B $BuildDir
+& $CMake -S (Join-Path $Root "tests") -B $BuildDir "-DPython3_EXECUTABLE=$Python"
 if ($LASTEXITCODE -ne 0) { throw "Host test configure failed." }
 & $CMake --build $BuildDir --config $Config
 if ($LASTEXITCODE -ne 0) { throw "Host test build failed." }

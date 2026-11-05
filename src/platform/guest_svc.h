@@ -1002,4 +1002,7 @@ int vp_guest_svc_queue_applet_message(VPGuestSvc *, uint32_t message, const char
 int vp_guest_svc_process_exit_requested(VPGuestSvc *);
 /* Returns 0 when the original veneer may resume, or VP_BRIDGE_UNSUPPORTED. */
 int vp_guest_svc_dispatch(VPGuestSvc *, VPBridgeFrame *);
+/* Original rTexture lifecycle hooks also identify the private R8 font pack. */
+int vp_guest_pixel_font_enabled(void);
+int vp_guest_pixel_font_event(VPGuestSvc *, unsigned event, uint32_t object);
 #endif

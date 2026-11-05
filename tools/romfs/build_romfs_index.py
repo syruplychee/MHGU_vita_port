@@ -138,8 +138,20 @@ def walk_tree(root: Path) -> tuple[list[Dir], list[File]]:
     return dirs, files
 
 
-def build(root: Path, output: Path, buckets: int) -> dict:
+def build(root: Path, output: Path, buckets: int, *, overlay: Path | None = None,
+          base_prefix: bytes = b"", overlay_prefix: bytes = b"") -> dict:
     dirs, files = walk_tree(root)
+    backings = {}
+    mapped_paths = {}
+    for entry in files:
+        rel = entry.rel_path
+        replacement = overlay / os.fsdecode(rel) if overlay else None
+        host = replacement if replacement and replacement.is_file() else root / os.fsdecode(rel)
+        prefix = overlay_prefix if replacement and replacement.is_file() else base_prefix
+        mapped = prefix + rel
+        entry.size = host.stat().st_size
+        mapped_paths[rel] = mapped
+        backings[mapped] = host
 
     # Metadata offsets, in a deterministic order.  The root is entry 0, which
     # is what FindPathRecursive and CreateRootDirectory assume.
@@ -255,7 +267,7 @@ def build(root: Path, output: Path, buckets: int) -> dict:
     record_structs = []
     for image_offset, size, entry in records:
         path_offset = len(path_blob)
-        path_blob += entry.rel_path + b"\0"
+        path_blob += mapped_paths[entry.rel_path] + b"\0"
         record_structs.append(MAP_RECORD.pack(image_offset, size, path_offset, 0))
 
     map_data = bytearray()
@@ -302,12 +314,12 @@ def build(root: Path, output: Path, buckets: int) -> dict:
         "map_sha256": hashlib.sha256(map_data).hexdigest(),
     }
     (output / "romfs.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    verify(prefix, map_data, dirs, files, root, buckets)
+    verify(prefix, map_data, dirs, files, root, buckets, backings=backings)
     return manifest
 
 
 def verify(prefix: bytes, map_data: bytes, dirs: list[Dir], files: list[File],
-           root: Path, buckets: int) -> None:
+           root: Path, buckets: int, *, backings: dict | None = None) -> None:
     header = struct.unpack("<10Q", prefix[:HEADER_SIZE])
     (header_size, dir_hash_offset, dir_hash_size, dir_meta_offset, dir_meta_size,
      file_hash_offset, file_hash_size, file_meta_offset, file_meta_size, data_offset) = header
@@ -407,7 +419,7 @@ def verify(prefix: bytes, map_data: bytes, dirs: list[Dir], files: list[File],
         total += size
         end = map_data.index(b"\0", paths_start + path_off)
         rel = bytes(map_data[paths_start + path_off:end])
-        host = root / os.fsdecode(rel)
+        host = backings[rel] if backings is not None else root / os.fsdecode(rel)
         if not host.is_file():
             raise SystemExit(f"verify: mapped file missing from tree: {host}")
         if host.stat().st_size != size:
@@ -421,12 +433,23 @@ def main() -> int:
     parser.add_argument("--tree", required=True, type=Path, help="extracted RomFS tree root")
     parser.add_argument("--output", required=True, type=Path, help="output directory for romfs.index/romfs.map")
     parser.add_argument("--buckets", type=int, default=0x10000, help="hash buckets per table (default 65536)")
+    parser.add_argument("--overlay", type=Path, help="replacement tree; virtual names stay unchanged")
+    parser.add_argument("--base-prefix", default="", help="physical base path relative to runtime tree root")
+    parser.add_argument("--overlay-prefix", default="", help="physical replacement path relative to runtime tree root")
     args = parser.parse_args()
     if args.buckets <= 0 or args.buckets & 1:
         parser.error("--buckets must be a positive even number")
     if not args.tree.is_dir():
         parser.error(f"--tree is not a directory: {args.tree}")
-    manifest = build(args.tree, args.output, args.buckets)
+    def physical_prefix(value):
+        if value.startswith(("/", "\\")) or ":" in value or ".." in value.split("/"):
+            parser.error("physical prefixes must be relative paths without parent traversal")
+        return (value.rstrip("/")+"/").encode("utf-8") if value else b""
+    if args.overlay and not args.overlay.is_dir():
+        parser.error("--overlay is not a directory")
+    manifest = build(args.tree, args.output, args.buckets, overlay=args.overlay,
+                     base_prefix=physical_prefix(args.base_prefix),
+                     overlay_prefix=physical_prefix(args.overlay_prefix))
     print(json.dumps(manifest, indent=2))
     return 0
 

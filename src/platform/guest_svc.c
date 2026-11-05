@@ -6,6 +6,7 @@
 #include "engine_layout.h"
 #include "engine_full.h"
 #include "gpu_texture.h"
+#include "pixel_font.h"
 #include "texture_pool.h"
 #include "texture_pipeline.h"
 #include "work_log.h"
@@ -31,6 +32,55 @@
 #include <time.h>
 
 #define VP_GUEST_TRACE_PATH "ux0:data/mhgu-vita-port/sdk-svc.log"
+
+static VPPixelFontResource pixel_fonts[VP_PIXEL_FONT_SLOTS];
+
+int vp_guest_pixel_font_enabled(void) {
+    static int enabled=-1;
+    if (enabled<0) {
+        FILE *marker=fopen("ux0:data/mhgu-vita-port/pixel-font.enable","rb");
+        enabled=marker!=NULL;
+        if (marker) fclose(marker);
+    }
+    return enabled;
+}
+
+int vp_guest_pixel_font_event(VPGuestSvc *svc, unsigned event, uint32_t object) {
+    if (!vp_guest_pixel_font_enabled()) return 0;
+    for (unsigned i=0;i<VP_PIXEL_FONT_SLOTS;++i)
+        if (pixel_fonts[i].object==object && svc->log)
+            fprintf(svc->log,"PIXEL_FONT_RETIRE event=%u object=0x%x va=0x%llx\n",
+                event,object,(unsigned long long)pixel_fonts[i].va);
+    vp_pixel_font_retire(pixel_fonts,object);
+    if (event!=1u) return 0;
+    if (!vp_guest_svc_readable(svc,object,0xd4u)) return -1;
+    const uint8_t *resource=(const uint8_t *)(uintptr_t)object;
+    char name[65];
+    memcpy(name,resource+8u,64u);
+    name[64]=0;
+    if (!vp_pixel_font_name(name)) return 0;
+    uint32_t gpu;
+    memcpy(&gpu,resource+0xd0u,4u);
+    if (!gpu || !vp_guest_svc_readable(svc,gpu,0xc0u)) return -1;
+    const uint8_t *native=(const uint8_t *)(uintptr_t)gpu;
+    uint32_t format;
+    uint64_t va;
+    uint16_t width,height;
+    memcpy(&format,native+0x28u,4u);
+    memcpy(&va,native+0xb8u,8u);
+    memcpy(&width,native+0x1eu,2u);
+    memcpy(&height,native+0x20u,2u);
+    height&=0x3fffu;
+    int system=vp_pixel_font_name(name)==2;
+    int rc=system ?
+        (format==0x12u ? vp_pixel_font_register(pixel_fonts,object,va,width,height):-1) :
+        (format==0x2cu && width==1024u && height==1024u ?
+         vp_pixel_font_register(pixel_fonts,object,va,width,height):-1);
+    if (svc->log) fprintf(svc->log,"PIXEL_FONT_RESOURCE name=%s object=0x%x "
+        "gpu=0x%x va=0x%llx format=0x%x size=%ux%u rc=%d\n",name,object,gpu,
+        (unsigned long long)va,format,width,height,rc);
+    return rc;
+}
 
 static int svc_play_perf_enabled(void) {
     static int enabled = -1;
@@ -1528,8 +1578,9 @@ static unsigned texture_cache_hint_index(const VPGpuTextureInfo *t,unsigned mips
 
 /* Vertex-only upload selection. RGBA32F uses the lossless RG32F split; the
  * measured contract is checked here so no unsupported sampler or layout falls
- * back to the lossy fragment representation. Other formats keep the existing
- * shared decode identity. */
+ * back to the lossy fragment representation. Other formats, including the
+ * native Alpha8 identity, keep the shared decode identity and must never be
+ * routed into the RGBA32F split below. */
 static unsigned texture_vertex_upload_format(const VPGpuTextureInfo *t,
                                              const char **reason) {
     VPTextureVertexRg32fView view;
@@ -1804,6 +1855,7 @@ retry_texture_storage:
     if (cube) family=3u;
     else if (upload==VP_TEXTURE_UPLOAD_RGBA16F) family=1u;
     else if (upload==VP_TEXTURE_UPLOAD_RGBA32F_RG32F) family=4u;
+    else if (vp_texture_mask8_upload(upload)) family=4u;
     else if (upload) family=2u;
     else if (t->format==8u) family=0u;
     else family=4u;
@@ -1822,6 +1874,13 @@ retry_texture_storage:
             if (t->header==2u && t->format==0x01u)
                 rc=vp_texture_rgba32f_pitch_to_rgba16f(source,t->storage,rgba,
                     t->width,t->height,t->pitch,t->swizzle);
+        } else if (vp_texture_mask8_upload(upload)) {
+            rc=t->header==2u ?
+                vp_texture_alpha8_linear(source,t->storage,rgba,rgba_bytes,
+                    t->width,t->height,t->pitch) :
+                vp_texture_alpha8_untile(source,t->storage,rgba,rgba_bytes,
+                    t->width,t->height,t->format,t->block_height);
+            if (!rc) rc=vp_texture_alpha8_pad_rows(rgba,rgba_bytes,t->width,t->height);
         } else if (upload) rc=vp_texture_blocks_linear(source,t->storage,rgba,t->width,t->height,t->format,t->block_height);
         else if (t->header==2u && t->format==8u) {
             for (unsigned y=0;y<t->height;y++)
@@ -2416,6 +2475,7 @@ static uint8_t *texture_pool_decode(VPGuestSvc *svc, const VPGpuTextureInfo *t,
     if (cube) family = 3u;
     else if (upload == VP_TEXTURE_UPLOAD_RGBA16F) family = 1u;
     else if (upload == VP_TEXTURE_UPLOAD_RGBA32F_RG32F) family = 4u;
+    else if (vp_texture_mask8_upload(upload)) family = 4u;
     else if (upload) family = 2u;
     else if (t->format == 8u) family = 0u;
     if (svc_play_perf_enabled()) started = sceKernelGetProcessTimeWide();
@@ -2435,6 +2495,15 @@ static uint8_t *texture_pool_decode(VPGuestSvc *svc, const VPGpuTextureInfo *t,
                 decode_rc = vp_texture_rgba32f_pitch_to_rgba16f(
                     source, t->storage, rgba, t->width, t->height, t->pitch,
                     t->swizzle);
+        } else if (vp_texture_mask8_upload(upload)) {
+            decode_rc = t->header == 2u
+                ? vp_texture_alpha8_linear(source, t->storage, rgba, rgba_bytes,
+                                           t->width, t->height, t->pitch)
+                : vp_texture_alpha8_untile(source, t->storage, rgba,
+                                           rgba_bytes, t->width, t->height,
+                                           t->format, t->block_height);
+            if (!decode_rc) decode_rc=vp_texture_alpha8_pad_rows(
+                rgba,rgba_bytes,t->width,t->height);
         } else if (upload) {
             decode_rc = vp_texture_blocks_linear(source, t->storage, rgba,
                                                  t->width, t->height, t->format,
@@ -2656,6 +2725,8 @@ static void parse_texture_layout(const uint32_t hw[8], VPGpuTextureInfo *out) {
             out->storage=out->pitch*out->height;
         else if (out->format==0x01u && out->pitch>=out->width*16u)
             out->storage=out->pitch*out->height;
+        else if (out->format==0x1du && out->pitch>=out->width)
+            out->storage=(size_t)out->pitch*out->height;
     }
     out->ok = 1;
 }
@@ -2737,6 +2808,40 @@ static int resolve_draw_texture_at_stage(const VPGpuSendContext *ctx,
                    sizeof(out->tsc));
             memcpy(out->sampler, out->tsc, sizeof(out->sampler));
         }
+    }
+    if (vp_guest_pixel_font_enabled() &&
+        ((out->width==1024u && out->height==1024u) ||
+         vp_pixel_font_lookup(pixel_fonts,out->va,out->width,out->height))) {
+        static unsigned font_view_logs;
+        if (font_view_logs++<32u)
+            slog(ctx->svc,"PIXEL_FONT_VIEW va=0x%llx registered=%u word0=%08x "
+                "type=%u depth=%u mips=%u storage=%u sampler=%08x,%08x\n",
+                (unsigned long long)out->va,
+                vp_pixel_font_lookup(pixel_fonts,out->va,out->width,out->height),
+                out->swizzle,out->texture_type,out->depth,out->max_mip_level,
+                (unsigned)out->storage,out->sampler[0],out->sampler[1]);
+    }
+    if (vp_guest_pixel_font_enabled() &&
+        vp_pixel_font_lookup(pixel_fonts,out->va,out->width,out->height)) {
+        if (out->format!=0x1du || ((out->swizzle>>7)&0xfffu)!=0x492u ||
+            out->texture_type!=1u || out->depth!=1u || out->max_mip_level ||
+            out->block_depth || !out->storage) {
+            slog(ctx->svc,"PIXEL_FONT_VIEW_REJECT va=0x%llx fmt=%u type=%u depth=%u mips=%u\n",
+                (unsigned long long)out->va,out->format,out->texture_type,out->depth,out->max_mip_level);
+            return -5;
+        }
+        /* Keep raw TIC/TSC evidence intact. Only the effective sampling view
+         * of a registered, native R8 font becomes (1,1,1,R), point, no mips. */
+        if (out->width==1024u && out->height==1024u)
+            out->swizzle=(out->swizzle&~(0xfffu<<19))|(0x5ffu<<19);
+        static unsigned font_bind_logs;
+        if (font_bind_logs++<16u)
+            slog(ctx->svc,"PIXEL_FONT_BIND va=0x%llx raw=%08x effective=%08x upload=0x%x bytes=%u\n",
+                (unsigned long long)out->va,out->tic[0],out->swizzle,
+                vp_texture_upload_format(out->format,out->swizzle),
+                (unsigned)vp_texture_upload_bytes(out->width,out->height,
+                    vp_texture_upload_format(out->format,out->swizzle)));
+        out->sampler[1]=(out->sampler[1]&~0xf3u)|0x11u;
     }
     if (!out->storage) {
         static unsigned texture_layout_logs;
@@ -3736,6 +3841,8 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
         if (req.texture_source != VP_GXM_EXTRA_SOURCE_DEPTH &&
             !frame_target_seen(tex.va) && tex.storage != 0u) {
             uint32_t source = 0;
+            unsigned primary_upload =
+                vp_texture_upload_format(tex.format, tex.swizzle);
             VPTextureDecodeOutcome decode_outcome = VP_TEX_DECODE_UNSUPPORTED;
             if (bridge_quiet && gpu_va_to_cpu(ctx->session,tex.va,tex.storage,&source)) {
                 linear=texture_decode_any(ctx->svc,&tex,
@@ -3743,7 +3850,7 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
                     VP_TEXTURE_DECODE_FRAGMENT,&decode_outcome);
                 linear_borrowed=linear!=NULL;
                 if (linear_borrowed) {
-                    req.tex_format=vp_texture_upload_format(tex.format,tex.swizzle);
+                    req.tex_format=primary_upload;
                     req.texels_owned=1u;
                 }
             }
@@ -3757,6 +3864,20 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
                          "idx=%u va=0x%llx detail=primary-draw-fail n=%u\n",
                          ctx->fd,ctx->submission,draw->index,
                          (unsigned long long)tex.va,primary_pool_fail_logs);
+                return -1;
+            }
+            if (!linear && vp_texture_mask8_upload(primary_upload)) {
+                /* Alpha8 has no RGBA fallback: decoding the one-byte source
+                 * into the legacy 4-byte buffer would silently change the
+                 * upload identity and sampled channel. The owned decode above
+                 * is the only accepted producer. */
+                static unsigned alpha8_fallback_logs;
+                if (alpha8_fallback_logs++ < 16u)
+                    slog(ctx->svc,"VP_TEX_ALPHA8_FALLBACK_REJECT fd=%u "
+                         "submission=%u idx=%u va=0x%llx %ux%u "
+                         "detail=no-owned-one-byte-decode\n",ctx->fd,
+                         ctx->submission,draw->index,
+                         (unsigned long long)tex.va,tex.width,tex.height);
                 return -1;
             }
             if (!linear) linear = malloc((size_t)tex.width * tex.height * 4u);
@@ -6202,11 +6323,13 @@ static uint8_t root_interface(const char *name) {
  * fail with a logged reason instead of pretending the image is empty. */
 static int ensure_storage(VPGuestSvc *svc) {
     if (svc->storage.open) return 0;
-    if (vp_guest_storage_open(&svc->storage, VP_GUEST_STORAGE_INDEX_PATH,
-                              VP_GUEST_STORAGE_MAP_PATH, VP_GUEST_STORAGE_TREE_PATH) != 0) {
+    int font=vp_guest_pixel_font_enabled();
+    const char *index=font?"ux0:data/mhgu-vita-port/font-pixel/romfs.index":VP_GUEST_STORAGE_INDEX_PATH;
+    const char *map=font?"ux0:data/mhgu-vita-port/font-pixel/romfs.map":VP_GUEST_STORAGE_MAP_PATH;
+    const char *tree=font?"ux0:data/mhgu-vita-port":VP_GUEST_STORAGE_TREE_PATH;
+    if (vp_guest_storage_open(&svc->storage,index,map,tree) != 0) {
         slog(svc, "SVC_STORAGE_OPEN result=failed index=%s map=%s tree=%s error=%s\n",
-             VP_GUEST_STORAGE_INDEX_PATH, VP_GUEST_STORAGE_MAP_PATH,
-             VP_GUEST_STORAGE_TREE_PATH, svc->storage.error);
+             index,map,tree,svc->storage.error);
         return -1;
     }
     slog(svc, "SVC_STORAGE_OPEN result=ok image_size=%llu data_offset=%llu files=%u tree_bytes=%llu index=%s map=%s tree=%s\n",
@@ -6214,8 +6337,7 @@ static int ensure_storage(VPGuestSvc *svc) {
          (unsigned long long)svc->storage.data_offset,
          svc->storage.file_count,
          (unsigned long long)svc->storage.tree_bytes,
-         VP_GUEST_STORAGE_INDEX_PATH, VP_GUEST_STORAGE_MAP_PATH,
-         VP_GUEST_STORAGE_TREE_PATH);
+         index,map,tree);
     return 0;
 }
 

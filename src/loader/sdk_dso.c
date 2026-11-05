@@ -844,11 +844,15 @@ static int title_heap_experiment_patch(FILE *log, VPNativeModule *m) {
 
 static int resource_lifecycle_patch(FILE *log, VPNativeModule modules[4]) {
     FILE *marker=fopen("ux0:data/mhgu-vita-port/resource-lifecycle.enable","rb");
-    fprintf(log,"RESOURCE_LIFECYCLE_MODE enabled=%u\n",marker?1u:0u);
-    if (!marker) return 0;
-    fclose(marker);
+    unsigned trace=marker!=NULL;
+    if (marker) fclose(marker);
+    unsigned font=vp_guest_pixel_font_enabled();
+    fprintf(log,"RESOURCE_LIFECYCLE_MODE enabled=%u pixel_font=%u\n",trace,font);
+    if (!trace && !font) return 0;
     VPNativeModule *game=&modules[1],*sdk=&modules[3];
-    const unsigned count=sizeof(vp_resource_probe_sites)/sizeof(vp_resource_probe_sites[0]);
+    FILE *font_trace=fopen("ux0:data/mhgu-vita-port/pixel-font-trace.enable","rb");
+    const unsigned count=font && font_trace ? sizeof(vp_resource_probe_sites)/sizeof(vp_resource_probe_sites[0]) : 6u;
+    if (font_trace) fclose(font_trace);
     const uint32_t bytes=(uint32_t)(vp_sdk_svc_site_end-vp_sdk_svc_site_template);
     const uint32_t service_at=(uint32_t)(vp_sdk_svc_site_service_value-vp_sdk_svc_site_template);
     const uint32_t return_at=(uint32_t)(vp_sdk_svc_site_continuation_value-vp_sdk_svc_site_template);
@@ -1602,10 +1606,36 @@ static int dispatch_locked(VPExecutor *e, VPBridgeFrame *f) {
 
 static int dispatch_locked_body(VPExecutor *e,VPBridgeFrame *f) {
     Session *s=e->user;
+    if (f->service==0x25du || f->service==0x25eu) {
+        static unsigned calls[2];
+        unsigned kind=f->service-0x25du;
+        if (calls[kind]++<48u) {
+            uint32_t font=f->regs[0];
+            if (!vp_guest_svc_readable(&s->svc,font,0xd8u)) return VP_BRIDGE_ARGUMENT;
+            const uint8_t *p=(const uint8_t *)(uintptr_t)font;
+            fprintf(s->log,"PIXEL_FONT_ORIGINAL kind=%u font=0x%x arg=0x%x "
+                "pages=%u glyphs=%u records=0x%x textures=0x%x flags=0x%x lr=0x%x\n",
+                kind,font,f->regs[1],word(p+0x98u),word(p+0x9cu),word(p+0xacu),
+                word(p+0xb8u),word(p+0xc4u),f->lr);
+        }
+        return 0;
+    }
     if (f->service>=0x257u && f->service<=0x25cu) {
         static uint32_t sequence;
         unsigned id=f->service-0x257u;
         uint32_t object=id==1u?f->regs[4]:f->regs[0];
+        if (vp_guest_pixel_font_event(&s->svc,id,object)<0) {
+            fprintf(s->log,"PIXEL_FONT_RESOURCE_REJECT event=%u object=0x%x\n",id,object);
+            return VP_BRIDGE_ARGUMENT;
+        }
+        /* The production font hook needs identity, not full resource dumps. */
+        static int resource_trace=-1;
+        if (resource_trace<0) {
+            FILE *marker=fopen("ux0:data/mhgu-vita-port/resource-lifecycle.enable","rb");
+            resource_trace=marker!=NULL;
+            if (marker) fclose(marker);
+        }
+        if (!resource_trace) return 0;
         uint32_t gpu=0u;
         uint32_t event=++sequence;
         char event_line[512];

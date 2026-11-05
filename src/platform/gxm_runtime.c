@@ -4352,7 +4352,7 @@ static void gxm_model_probe_draw(const VPGxmDrawRequest *req) {
     }
     for (unsigned i=0;i<VP_GXM_FRAGMENT_SAMPLER_LIMIT-1u;i++) if (req->extra_textures[i].texels) {
         const VPGxmExtraTexture *t=&req->extra_textures[i];
-        size_t bytes=(size_t)t->width*t->height*4u;
+        size_t bytes=vp_texture_upload_bytes(t->width,t->height,t->tex_format);
         char name[24];
         snprintf(name,sizeof(name),"fragment_tex%u",i+1u);
         gxm_model_probe_bytes(name,t->texels,bytes);
@@ -6680,11 +6680,48 @@ static void gxm_extra_consume_log(unsigned draw_index, unsigned slot,
              gxm_extra_rejects);
 }
 
+/* Native Alpha8 is a U8 linear texture with rows aligned to eight texels.
+ * The payload includes that padding and the source pointer must
+ * satisfy SCE_GXM_TEXTURE_ALIGNMENT. Every copy destination used here is at
+ * least as aligned by construction: gpu_alloc/upload pages are page-aligned
+ * and gxm_batch_entry_alloc advances in 16-byte steps, so checking the decoded
+ * payload covers both the direct binding and the bytes that are copied. Cube
+ * views and every other byte count are explicit refusals rather than a
+ * fallback to a four-byte representation. */
+static int gxm_alpha8_linear_check(unsigned format, unsigned cube,
+                                   unsigned width, unsigned height,
+                                   size_t bytes, const void *backing,
+                                   unsigned draw_index, const char *stage) {
+    static unsigned reject_logs;
+    if (!vp_texture_mask8_upload(format)) return 0;
+    if (cube || width == 0u || height == 0u || width > 4096u ||
+        height > 4096u || (size_t)width > SIZE_MAX / height ||
+        bytes != vp_texture_upload_bytes(width,height,format) || backing == NULL ||
+        (((uintptr_t)backing & (SCE_GXM_TEXTURE_ALIGNMENT - 1u)) != 0u)) {
+        if (reject_logs++ < 16u)
+            glog("VP_GXM_ALPHA8_LAYOUT_REJECT idx=%u stage=%s %ux%u bytes=%u "
+                 "backing=%p detail=cube-size-stride-or-alignment\n",
+                 draw_index, stage, width, height, (unsigned)bytes, backing);
+        return -1;
+    }
+    static unsigned bind_logs[2];
+    if (bind_logs[format==VP_TEXTURE_UPLOAD_ALPHA8]++<8u)
+        glog("VP_GXM_MASK8_BIND stage=%s format=0x%x size=%ux%u bytes=%u backing=%p\n",
+            stage,format,width,height,(unsigned)bytes,backing);
+    return 0;
+}
+
 /* Single mapping from the checked upload identity to GXM. The enum semantics
  * were confirmed in the actual VitaSDK gxm.h: SWIZZLE1_R is (R,0,0,1),
  * SWIZZLE2_GR is (R,G,0,1), and UBC4/SBC4/UBC5/SBC5 select unsigned/signed
- * block formats. Unknown bits, signedness and swizzle combinations are
- * refusals rather than channel-replication guesses. */
+ * block formats. SCE_GXM_TEXTURE_FORMAT_U8_R111 is BASE_FORMAT_U8 |
+ * SWIZZLE1_R111 = (1,1,1,R), exactly the reviewed (7,7,7,2) selector tuple
+ * already mapped to BC4 variant code 7. Unknown bits, signedness and swizzle
+ * combinations are refusals rather than channel-replication guesses. */
+/* VP_HOST_TEST_EXTRACT:frame_texture_format_begin */
+_Static_assert((SCE_GXM_TEXTURE_SWIZZLE1_R111 >> 12) ==
+               (unsigned)VP_TEXTURE_BC4_SWIZZLE_R111,
+               "U8_R111 must match the reviewed (7,7,7,2) selector mapping");
 static int frame_gxm_texture_format(unsigned upload,SceGxmTextureFormat *out) {
     static const SceGxmTextureFormat ubc4[8]={
         SCE_GXM_TEXTURE_FORMAT_UBC4_R,
@@ -6732,6 +6769,14 @@ static int frame_gxm_texture_format(unsigned upload,SceGxmTextureFormat *out) {
         *out=SCE_GXM_TEXTURE_FORMAT_F32F32_GR;
         return 0;
     }
+    if (upload==VP_TEXTURE_UPLOAD_ALPHA8) {
+        *out=SCE_GXM_TEXTURE_FORMAT_U8_R111;
+        return 0;
+    }
+    if (upload==VP_TEXTURE_UPLOAD_R8) {
+        *out=SCE_GXM_TEXTURE_FORMAT_U8_R;
+        return 0;
+    }
     if (upload==0x24u) { *out=SCE_GXM_TEXTURE_FORMAT_UBC1_ABGR; return 0; }
     if (upload==0x124u) { *out=SCE_GXM_TEXTURE_FORMAT_UBC1_1BGR; return 0; }
     if (upload==0x26u) { *out=SCE_GXM_TEXTURE_FORMAT_UBC3_ABGR; return 0; }
@@ -6754,6 +6799,7 @@ static int frame_gxm_texture_format(unsigned upload,SceGxmTextureFormat *out) {
     }
     return -1;
 }
+/* VP_HOST_TEST_EXTRACT:frame_texture_format_end */
 
 /* Maxwell TSC address modes 0..4 map onto GXM sampler modes. Mode 3 is
  * clamp-to-border. The VitaSDK exposes no GXM border-colour setter, so the
@@ -10499,6 +10545,13 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
             frame_release_fs(frame_fs, frame_fs_owned);
             return -2;
         }
+        if (gxm_alpha8_linear_check(req->tex_format, 0u, req->tex_width,
+                req->tex_height, texture_bytes, req->texels,
+                req->draw_index, "fragment-primary") < 0) {
+            gxm_stage9_note(VP_GXM_S9_PRIMARY_BYTES, req->draw_index);
+            frame_release_fs(frame_fs, frame_fs_owned);
+            return -2;
+        }
         if (batch_entry != NULL) {
             VPTextureSnapshotKey key = gxm_snapshot_key(req->texture_va,
                 req->tex_width, req->tex_height, req->tex_format, 0u, 1u);
@@ -10794,6 +10847,14 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
             frame_release_fs(frame_fs, frame_fs_owned);
             return rc;
         }
+        if (gxm_alpha8_linear_check(extra->tex_format, extra->cube,
+                extra->width, extra->height, texture_bytes, extra->texels,
+                req->draw_index, "fragment-extra") < 0) {
+            rc=gxm_extra_reject(req->draw_index,e+1u,"alpha8-layout",extra,
+                                req->target_va);
+            frame_release_fs(frame_fs, frame_fs_owned);
+            return rc;
+        }
         {
             SceGxmTextureFormat fmt;
             if (frame_gxm_texture_format(extra->tex_format,&fmt)<0) {
@@ -10937,6 +10998,13 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
                      req->draw_index,req->hash,(unsigned long long)extra->va,
                      extra->width,extra->height,extra->tex_format,
                      extra->cube,extra->mip_count);
+                gxm_stage9_note(VP_GXM_S9_VERTEX_TEX, req->draw_index);
+                frame_release_fs(frame_fs, frame_fs_owned);
+                return -2;
+            }
+            if (gxm_alpha8_linear_check(extra->tex_format, extra->cube,
+                    extra->width, extra->height, texture_bytes, extra->texels,
+                    req->draw_index, "vertex") < 0) {
                 gxm_stage9_note(VP_GXM_S9_VERTEX_TEX, req->draw_index);
                 frame_release_fs(frame_fs, frame_fs_owned);
                 return -2;

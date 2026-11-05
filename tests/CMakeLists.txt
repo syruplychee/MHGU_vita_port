@@ -7,6 +7,8 @@ set(CMAKE_C_EXTENSIONS ON)
 
 enable_testing()
 find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
+add_test(NAME pixel_font_tools
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_pixel_fonts.py")
 add_test(NAME vertex_rg32f_lowering
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_vertex_rg32f.py")
 add_test(NAME frame_window_metrics
@@ -95,6 +97,15 @@ file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/clear_defer_production.inc"
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
              "${VP_SRC}/platform/gxm_runtime.c")
 
+# Upload-identity -> GXM format mapping: the host fixture supplies VitaSDK
+# enum values and the extracted function is compiled unchanged.
+vp_extract_marked("${VP_GXM_RUNTIME_SOURCE}"
+    "/* VP_HOST_TEST_EXTRACT:frame_texture_format_begin */"
+    "/* VP_HOST_TEST_EXTRACT:frame_texture_format_end */"
+    vp_frame_texture_format_section)
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/frame_texture_format_production.inc"
+     "${vp_frame_texture_format_section}")
+
 function(vp_host_test name)
     add_executable(${name} "${CMAKE_CURRENT_SOURCE_DIR}/${name}.c" ${ARGN})
     target_include_directories(${name} PRIVATE ${VP_INCLUDES})
@@ -135,11 +146,15 @@ vp_host_test(gpu_effective_rt "${VP_SRC}/platform/gpu_stream.c")
 vp_host_test(gpu_indices)
 vp_host_test(gpu_stream "${VP_SRC}/platform/gpu_stream.c")
 vp_host_test(gpu_texture_decode "${VP_SRC}/platform/gpu_texture.c")
+vp_host_test(pixel_font)
 vp_host_test(gpu_uniform_state "${VP_SRC}/platform/gpu_stream.c")
 vp_host_test(gpu_wait_profile)
 vp_host_test(gxm_depth "${VP_SRC}/platform/gxm_depth.c")
 vp_host_test(gxm_render_pipeline)
 target_include_directories(gxm_render_pipeline PRIVATE
+                           "${CMAKE_CURRENT_BINARY_DIR}")
+vp_host_test(gxm_texture_format)
+target_include_directories(gxm_texture_format PRIVATE
                            "${CMAKE_CURRENT_BINARY_DIR}")
 vp_host_test(gxm_depth_view
     "${VP_SRC}/platform/gxm_depth_view.c"

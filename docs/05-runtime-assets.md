@@ -5,6 +5,9 @@ VPK 中；其余资源不进入 VPK，也不进入 Git。
 
 ## 1. 目录总览
 
+可选点阵字体包独立放在 `font-pixel/`，配套 `pixel-font.enable`；不要覆盖原始树。
+完整生成、启用和回滚说明见 [点阵字体结果](19-pixel-fonts.md)。
+
 ```text
 ux0:data/mhgu-vita-port/
 ├─ romfs.index              RomFS 头 + 名称哈希 + 元数据

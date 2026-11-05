@@ -9,6 +9,21 @@
  * and the physical texture is twice as wide. The identity is distinct from
  * RGBA16F (0x101), signed BC4/BC5 (0x227/0x228) and their swizzle variants. */
 #define VP_TEXTURE_UPLOAD_RGBA32F_RG32F 0x201u
+/* Native one-byte Alpha8 upload. The low byte is the evidenced Maxwell U8 TIC
+ * format 0x1d; bit 10 keeps the identity distinct from RGBA16F (0x101), the
+ * RG32F split (0x201) and every BC1/BC3/BC4/BC5 identity (low bytes
+ * 0x24/0x26/0x27/0x28 plus their signed/swizzle high bits). Only the exact
+ * descriptor contract checked by vp_texture_upload_format() selects it. TIC
+ * format 0x1c is deliberately not mapped: the reviewed offline Maxwell table
+ * documents only 0x1d as R8, and the C decoder's shared byte->R branch is not
+ * evidence that 0x1c has the same channel meaning. The CPU, decoded pool and
+ * GXM backing stay at one byte per logical pixel; no RGBA cache is created. */
+#define VP_TEXTURE_UPLOAD_ALPHA8 0x41du
+/* Same one-byte payload, preserving the canonical (R,0,0,1) sampling view. */
+#define VP_TEXTURE_UPLOAD_R8 0x51du
+static inline int vp_texture_mask8_upload(unsigned format) {
+    return format==VP_TEXTURE_UPLOAD_ALPHA8 || format==VP_TEXTURE_UPLOAD_R8;
+}
 #define VP_TEXTURE_RG32F_LOGICAL_MAX_WIDTH 2048u
 #define VP_TEXTURE_RG32F_MAX_HEIGHT 4096u
 
@@ -17,6 +32,7 @@
  * would otherwise all collapse to the same low byte:
  *   bit 8       BC1/BC3 constant-alpha-one swizzle (legacy encoding)
  *   bit 9       BC4/BC5 SNORM (GXM SBC4/SBC5 instead of UBC4/UBC5)
+ *   bit 10      native one-byte Alpha8 upload (see VP_TEXTURE_UPLOAD_ALPHA8)
  *   bits 12..15 swizzle variant code, validated against the exact GXM enum
  * See gpu_texture.c for the accepted BC4/BC5 selector combinations. */
 #define VP_TEXTURE_UPLOAD_SIGNED 0x00000200u
@@ -61,7 +77,23 @@ int vp_texture_rgba8_untile_swizzle(const uint8_t *src, size_t bytes,
 int vp_texture_rgba8_linear_swizzle(const uint8_t *src, size_t bytes,
     uint8_t *dst, unsigned width, unsigned height, size_t pitch,
     uint32_t tic_word0);
+/* Native Maxwell R8 (TIC format 0x1d) decode. The block-linear form uses the
+ * same GOB offset function as the RGBA8 decoder; the pitch-linear form skips
+ * per-row padding. Both write exactly one byte per logical pixel with a tight
+ * destination stride and never build an RGBA intermediate. Source length,
+ * pitch, block height and destination length are validated before any write.
+ * The block-linear decoder refuses every format other than the evidenced
+ * 0x1d. */
+int vp_texture_alpha8_untile(const uint8_t *src, size_t src_bytes,
+    uint8_t *dst, size_t dst_bytes, unsigned width, unsigned height,
+    unsigned format, unsigned block_h);
+int vp_texture_alpha8_linear(const uint8_t *src, size_t src_bytes,
+    uint8_t *dst, size_t dst_bytes, unsigned width, unsigned height,
+    size_t pitch);
 unsigned vp_texture_upload_format(unsigned format, uint32_t tic_word0);
+/* Expand a tight decoded mask in place to GXM's eight-texel row alignment. */
+int vp_texture_alpha8_pad_rows(uint8_t *data, size_t bytes,
+    unsigned width, unsigned height);
 size_t vp_texture_upload_bytes(unsigned w,unsigned h,unsigned format);
 int vp_texture_blocks_linear(const uint8_t *src,size_t bytes,uint8_t *dst,
     unsigned w,unsigned h,unsigned format,unsigned block_h);

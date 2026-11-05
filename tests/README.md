@@ -12,8 +12,10 @@ cmake --build build/host-tests -j
 ctest --test-dir build/host-tests --output-on-failure
 ```
 
-- Windows：50 项 CTest（48 项跨平台，含 7 项 Python 工具回归；另加
+- Windows：56 项 CTest（54 项跨平台，含 Python 工具回归；另加
   `session_gate`、`runtime_main_window` 两项 Windows 专用）。
+- `pixel_font_tools`：5 组 GFD/ARC/R8/overlay 合成检查，需要 Pillow；`pixel_font`
+  检查资源名、完整 64 位地址、失效/复用和容量，Release 也保留断言。
 - Linux/WSL：额外 4 项 POSIX 测试（`audio_auto_catchup`、`audio_wave_progress`、
   `guest_storage`、`log_sink`）。
 - Python 工具回归：`test_movie_timing.py`、`test_movie_color_timing.py`（unittest）。

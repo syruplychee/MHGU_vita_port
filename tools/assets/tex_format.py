@@ -93,6 +93,14 @@ class TexFormat:
 
 FORMATS: dict[int, TexFormat] = {
     0x07: TexFormat(0x07, "RGBA8_UNORM", 1, 1, 4, "rgba8", True),
+    # Engine format entry 18 (0x12) maps to NVN format 1 (R8_UNORM); verified
+    # statically from main+B0AE10.  The canonical host decoder expands it to
+    # (R, 0, 0, 255); the runtime TIC swizzle is sampling state and is not
+    # part of the TEX payload.
+    0x12: TexFormat(0x12, "R8_UNORM", 1, 1, 1, "r8", True),
+    # Same NVN physical format as 0x12, without its engine channel-remap flag.
+    # The mapped text-font experiment requires this native constructor path.
+    0x2C: TexFormat(0x2C, "R8_UNORM_FONT", 1, 1, 1, "r8", True),
     0x13: TexFormat(0x13, "BC1_UNORM", 4, 4, 8, "bc1", True),
     0x15: TexFormat(0x15, "BC2_UNORM", 4, 4, 16, "bc2", True),
     0x17: TexFormat(0x17, "BC3_UNORM", 4, 4, 16, "bc3", True),
@@ -549,6 +557,14 @@ def decode_level_rgba(linear: bytes, level: LevelLayout, fmt: TexFormat) -> byte
         if len(linear) < width * height * 4:
             raise TexFormatError("linear-size", "RGBA8")
         out[:] = linear[:width * height * 4]
+        return bytes(out)
+    if fmt.family == "r8":
+        if len(linear) < width * height:
+            raise TexFormatError("linear-size", "R8")
+        for i in range(width * height):
+            o = i * 4
+            out[o] = linear[i]
+            out[o + 3] = 255
         return bytes(out)
     bw = (width + 3) // 4
     bh = (height + 3) // 4
