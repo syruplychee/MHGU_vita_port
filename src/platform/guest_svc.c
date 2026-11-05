@@ -8,6 +8,7 @@
 #include "gpu_texture.h"
 #include "texture_pool.h"
 #include "texture_pipeline.h"
+#include "work_log.h"
 #include "texture_regions.h"
 #include "texture_snapshot.h"
 #include "gpu_indices.h"
@@ -114,6 +115,17 @@ static void slog(VPGuestSvc *svc, const char *format, ...) {
         va_end(args);
     }
     vp_gxm_frame_cost_category_end(VP_FRAME_COST_LOG, fc);
+}
+
+static VPWorkLogStats svc_work_log_stats;
+#define slog_work_success(svc, success, ...) do { \
+    if (!(success) || vp_work_log_emit(&svc_work_log_stats, \
+            __atomic_load_n(&vp_engine_work_log_reduce_enabled, __ATOMIC_ACQUIRE))) \
+        slog(svc, __VA_ARGS__); \
+} while (0)
+
+void vp_guest_work_log_stats(VPWorkLogStats *out) {
+    vp_work_log_snapshot(&svc_work_log_stats, out);
 }
 
 /* Closing is the only portable flush of the emulated file layer, so the
@@ -4180,7 +4192,7 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
      * not (the surface was never created, see frame_submit_clear). */
     if (rc == 0 && req.color_mask != 0u) frame_note_target(req.target_va);
     if (!bridge_quiet || (ctx->submission % 128u) == 0u || rc != 0)
-        slog(ctx->svc, "%s fd=%u submission=%u idx=%u hash=0x%x rc=%d "
+        slog_work_success(ctx->svc, rc == 0, "%s fd=%u submission=%u idx=%u hash=0x%x rc=%d "
              "target=0x%llx tex=0x%llx count=%u indexed=%u icount=%u mask=0x%x\n",
              frame_auto && !frame_done ? "VP_GXM_FRAME_RECORD" : "VP_GXM_FRAME_SUBMIT",
              ctx->fd, ctx->submission, draw->index, req.hash, rc,
@@ -12900,7 +12912,7 @@ swkbd_queue_full:
                     sflush(svc);
                     return VP_BRIDGE_UNSUPPORTED;
                 }
-                slog(svc, "VP_GXM_BATCH_SUBMIT_FLUSH fd=%u submission=%u "
+                slog_work_success(svc, 1, "VP_GXM_BATCH_SUBMIT_FLUSH fd=%u submission=%u "
                      "rc=0 action=fence-eligible\n",
                      fd, channel->submit_count);
             }

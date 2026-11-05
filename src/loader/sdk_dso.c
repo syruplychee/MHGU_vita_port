@@ -603,6 +603,8 @@ static int engine_texture_pipeline_marker(void) {
  * first and the memory mode returns to the ordinary 64 MiB unified value. */
 static void engine_publish_texture_mode(uint32_t mode) {
     uint32_t memory_mode=vp_engine_ab_mode_texture_memory(mode);
+    __atomic_store_n(&vp_engine_work_log_reduce_enabled,
+        vp_engine_ab_mode_reduces_work_log(mode)?1u:0u,__ATOMIC_RELEASE);
     if (!vp_engine_ab_mode_uses_deep_texture(mode)) {
         __atomic_store_n(&vp_engine_texture_pipeline_enabled,0u,__ATOMIC_RELEASE);
         __atomic_store_n(&vp_engine_texture_memory_mode,0u,__ATOMIC_RELEASE);
@@ -630,6 +632,7 @@ static int engine_full_patch(FILE *log,VPNativeModule *m) {
     __atomic_store_n(&vp_engine_shared_prepare_enabled,0u,__ATOMIC_RELEASE);
     __atomic_store_n(&vp_engine_texture_idle_resize_enabled,0u,__ATOMIC_RELEASE);
     __atomic_store_n(&vp_engine_clear_defer_enabled,0u,__ATOMIC_RELEASE);
+    __atomic_store_n(&vp_engine_work_log_reduce_enabled,0u,__ATOMIC_RELEASE);
     if (!ab) {
         int texture_pipeline=engine_texture_pipeline_marker();
         /* Ordinary startup never reads the mode experiment file and keeps the
@@ -1281,6 +1284,7 @@ static int engine_prepare_ab_poll(Session *s,uint64_t now) {
     int rc=engine_ab_read_control(&mode);
     if (rc) {
         __atomic_store_n(&vp_engine_shared_prepare_enabled,0u,__ATOMIC_RELEASE);
+        __atomic_store_n(&vp_engine_work_log_reduce_enabled,0u,__ATOMIC_RELEASE);
         __atomic_store_n(&vp_engine_texture_pipeline_enabled,0u,__ATOMIC_RELEASE);
         __atomic_store_n(&vp_engine_texture_memory_mode,0u,__ATOMIC_RELEASE);
         __atomic_store_n(&vp_engine_texture_idle_resize_enabled,0u,__ATOMIC_RELEASE);

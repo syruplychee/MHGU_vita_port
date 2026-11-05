@@ -124,6 +124,7 @@ target_include_directories(clear_defer PRIVATE
                            "${CMAKE_CURRENT_BINARY_DIR}")
 vp_host_test(clear_fusion "${VP_SRC}/platform/gxm_depth.c")
 vp_host_test(engine_mode)
+vp_host_test(work_log)
 vp_host_test(float_bits_numeric)
 vp_host_test(frame_cost_profile "${VP_SRC}/platform/frame_cost_profile.c")
 vp_host_test(gpu_command_buffer "${VP_SRC}/platform/gpu_stream.c")

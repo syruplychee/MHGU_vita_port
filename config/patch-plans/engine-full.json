@@ -52,7 +52,7 @@
         "enter": "0x253",
         "leave": "0x254"
       },
-      "control": "engine-full-mode.txt contains exactly one digit 0 through 8 plus optional trailing whitespace; polled at most every 500000 us before the root entry timestamp. Missing/invalid fails explicitly in A/B mode. Modes 0, 3, 4, 5, 6, 7 and 8 execute the same original trampoline; only 3 publishes shared preparation; 4/5/6/7/8 publish deep texture; only 5 and 6 permit resizing idle page regions before a GPU drain; only 6 admits the deferred full-colour clear boundary. Mode 7 publishes deep-large (128 MiB shared budget); mode 8 publishes deep-split (64 MiB total, CPU-only cached raw class and uncached GXM-mapped decoded class). Modes 7 and 8 never enable idle-resize or clear-defer. Default idle-resize and clear-defer remain off.",
+      "control": "engine-full-mode.txt contains exactly one digit 0 through 9 plus optional trailing whitespace; polled at most every 500000 us before the root entry timestamp. Missing/invalid fails explicitly in A/B mode. Modes 0, 3, 4, 5, 6, 7 and 8 execute the same original trampoline; only 3 publishes shared preparation; 4/5/6/7/8 publish deep texture; only 5 and 6 permit resizing idle page regions before a GPU drain; only 6 admits the deferred full-colour clear boundary. Mode 7 publishes deep-large (128 MiB shared budget); mode 8 publishes deep-split (64 MiB total, CPU-only cached raw class and uncached GXM-mapped decoded class). Modes 7 and 8 never enable idle-resize or clear-defer. Default idle-resize and clear-defer remain off. Mode 9 keeps the mode-4 memory/render path and suppresses only audited normal work records before formatting; errors, refusals and measurement records remain active.",
       "control_poll_us": 500000,
       "modes": {
         "0": "original",
@@ -63,7 +63,8 @@
         "5": "deep-recycle",
         "6": "deep-clear",
         "7": "deep-large",
-        "8": "deep-split"
+        "8": "deep-split",
+        "9": "deep-quiet"
       },
       "wrapper": "push {r4,lr}; bl enter (r0=context preserved, target written to ip); blx ip; bl leave; pop {r4,lr}; bx lr. Only the native C targets (modes 1 and 2) have a declared r0; modes 0, 3, 4, 5, 6, 7 and 8 execute the original root, whose callers do not consume r0."
     },

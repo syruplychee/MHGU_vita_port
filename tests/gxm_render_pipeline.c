@@ -8,6 +8,7 @@
 #include "texture_pipeline.h"
 #include "gpu_wait_profile.h"
 #include "frame_cost_profile.h"
+#define glog_work glog
 
 #include <assert.h>
 #include <stdint.h>

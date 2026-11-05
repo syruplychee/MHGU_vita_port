@@ -24,6 +24,9 @@ extern volatile uint32_t vp_engine_texture_pipeline_enabled;
  * never GXM-mapped; decoded class 0 uncached and GXM READ-mapped). Publishing
  * one value avoids a half-updated budget/class pair. */
 extern volatile uint32_t vp_engine_texture_memory_mode;
+/* Mode 9 only: omit explicitly selected normal work records before formatting.
+ * Error/refusal/evidence logging and all rendering operations remain active. */
+extern volatile uint32_t vp_engine_work_log_reduce_enabled;
 /* A/B-only modes 5/6: page-backed idle texture resize before GPU drain. */
 extern volatile uint32_t vp_engine_texture_idle_resize_enabled;
 /* A/B-only mode 6: record an admitted full-colour clear and defer its
@@ -31,10 +34,10 @@ extern volatile uint32_t vp_engine_texture_idle_resize_enabled;
 extern volatile uint32_t vp_engine_clear_defer_enabled;
 
 /* A/B control file contract: exactly one ASCII digit selects the mode. The
- * valid range is 0 through 8; any other first byte or trailing non-whitespace
+ * valid range is 0 through 9; any other first byte or trailing non-whitespace
  * is invalid. These helpers are pure so the host tests execute the same
  * decision the loader uses. */
-#define VP_ENGINE_AB_MODE_MAX 8u
+#define VP_ENGINE_AB_MODE_MAX 9u
 
 static inline int vp_engine_ab_control_digit_valid(int ch) {
     return ch >= '0' && ch <= (int)('0' + VP_ENGINE_AB_MODE_MAX);
@@ -55,6 +58,7 @@ static inline const char *vp_engine_ab_mode_name(unsigned mode) {
     case 6u: return "deep-clear";
     case 7u: return "deep-large";
     case 8u: return "deep-split";
+    case 9u: return "deep-quiet";
     default: return "unknown";
     }
 }
@@ -67,7 +71,7 @@ static inline const char *vp_engine_ab_mode_name(unsigned mode) {
  * resize or clear defer, so the two memory changes are never combined with
  * either mode-5/6 behavior. */
 static inline int vp_engine_ab_mode_uses_deep_texture(unsigned mode) {
-    return mode >= 4u && mode <= 8u;
+    return mode >= 4u && mode <= 9u;
 }
 static inline int vp_engine_ab_mode_uses_idle_resize(unsigned mode) {
     return mode == 5u || mode == 6u;
@@ -81,6 +85,9 @@ static inline unsigned vp_engine_ab_mode_texture_memory(unsigned mode) {
     case 8u: return 2u;
     default: return 0u;
     }
+}
+static inline int vp_engine_ab_mode_reduces_work_log(unsigned mode) {
+    return mode == 9u;
 }
 
 int vp_engine_full_init(uint32_t main_base);

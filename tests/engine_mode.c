@@ -9,10 +9,10 @@
 #include <string.h>
 
 int main(void) {
-    /* Exactly one digit 0..8 plus trailing whitespace is valid. */
-    for (int ch = '0'; ch <= '8'; ++ch)
+    /* Exactly one digit 0..9 plus trailing whitespace is valid. */
+    for (int ch = '0'; ch <= '9'; ++ch)
         assert(vp_engine_ab_control_digit_valid(ch));
-    assert(!vp_engine_ab_control_digit_valid('9'));
+    assert(!vp_engine_ab_control_digit_valid(';'));
     assert(!vp_engine_ab_control_digit_valid('/'));
     assert(!vp_engine_ab_control_digit_valid(':'));
     assert(!vp_engine_ab_control_digit_valid(' '));
@@ -32,11 +32,11 @@ int main(void) {
     assert(strcmp(vp_engine_ab_mode_name(6u), "deep-clear") == 0);
     assert(strcmp(vp_engine_ab_mode_name(7u), "deep-large") == 0);
     assert(strcmp(vp_engine_ab_mode_name(8u), "deep-split") == 0);
-    assert(strcmp(vp_engine_ab_mode_name(9u), "unknown") == 0);
+    assert(strcmp(vp_engine_ab_mode_name(9u), "deep-quiet") == 0);
 
     /* Modes 5/6 add idle resize; only 6 defers clear. Modes 7/8 are deep but
      * do not combine either of those changes. */
-    for (unsigned mode = 0u; mode <= 8u; ++mode) {
+    for (unsigned mode = 0u; mode <= 9u; ++mode) {
         int deep = vp_engine_ab_mode_uses_deep_texture(mode);
         int idle = vp_engine_ab_mode_uses_idle_resize(mode);
         int defer = vp_engine_ab_mode_uses_clear_defer(mode);
@@ -50,7 +50,7 @@ int main(void) {
         assert(mode != 7u || (!idle && !defer));
         assert(mode != 8u || (!idle && !defer));
     }
-    assert(!vp_engine_ab_mode_uses_deep_texture(9u));
+    assert(!vp_engine_ab_mode_uses_deep_texture(10u));
     assert(!vp_engine_ab_mode_uses_idle_resize(7u));
     assert(!vp_engine_ab_mode_uses_idle_resize(8u));
     assert(!vp_engine_ab_mode_uses_clear_defer(7u));

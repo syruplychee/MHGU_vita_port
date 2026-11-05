@@ -24,6 +24,7 @@
 #include "gpu_indices.h"
 #include "gpu_wait_profile.h"
 #include "frame_cost_profile.h"
+#include "work_log.h"
 
 #include <psp2/display.h>
 #include <psp2/gxm.h>
@@ -432,6 +433,13 @@ static void glog(const char *format, ...) {
         gxm_log_report_failure(rc, 1u);
     vp_gxm_frame_cost_category_end(VP_FRAME_COST_LOG, fc);
 }
+
+static VPWorkLogStats gxm_work_log_stats;
+#define glog_work(...) do { \
+    if (vp_work_log_emit(&gxm_work_log_stats, \
+            __atomic_load_n(&vp_engine_work_log_reduce_enabled, __ATOMIC_ACQUIRE))) \
+        glog(__VA_ARGS__); \
+} while (0)
 
 int vp_gxm_log_get_stats(VPLogSinkStats *out) {
     if (out == NULL) return -1;
@@ -2105,6 +2113,19 @@ static void gxm_perf_present(uint64_t fn_us, uint64_t now) {
          * profile must be closed here; otherwise the snapshot is refused. */
         gxm_frame_cost_log_snapshot(now, gxm_perf_present_frames, "periodic");
         gxm_texture_memory_log(now, gxm_perf_present_frames);
+        {
+            VPWorkLogStats svc_stats;
+            VPWorkLogStats gxm_stats;
+            vp_guest_work_log_stats(&svc_stats);
+            vp_work_log_snapshot(&gxm_work_log_stats, &gxm_stats);
+            glog("VP_WORK_LOG_STATS frames=%llu t_us=%llu reduce=%u "
+                 "gxm_emitted=%u gxm_suppressed=%u svc_emitted=%u svc_suppressed=%u\n",
+                 (unsigned long long)gxm_perf_present_frames,
+                 (unsigned long long)now,
+                 __atomic_load_n(&vp_engine_work_log_reduce_enabled, __ATOMIC_ACQUIRE),
+                 gxm_stats.emitted, gxm_stats.suppressed,
+                 svc_stats.emitted, svc_stats.suppressed);
+        }
         glog("VP_GXM_FRAME_INTERVALS t_us=%llu count=%llu sum_us=%llu width_us=1000\n",
             (unsigned long long)now,(unsigned long long)gxm_perf_present_interval_count,
             (unsigned long long)gxm_perf_present_interval_sum);
@@ -5230,7 +5251,7 @@ static void static_log_stats(void) {
          (unsigned long long)gxm_pipeline_age_us,
          (unsigned long long)gxm_pipeline_age_max);
     for (unsigned class_id = 0u; class_id < VP_SCENE_CLASS_COUNT; ++class_id)
-        glog("VP_GXM_SCENE_CLASS class=%s flushes=%llu draws=%llu "
+        glog_work("VP_GXM_SCENE_CLASS class=%s flushes=%llu draws=%llu "
              "notify_us=%llu finish_us=%llu total_us=%llu max_us=%llu\n",
              gxm_scene_class_names[class_id],
              (unsigned long long)gxm_scene_classes[class_id].flushes,
@@ -5239,12 +5260,12 @@ static void static_log_stats(void) {
              (unsigned long long)gxm_scene_classes[class_id].finish_us,
              (unsigned long long)gxm_scene_classes[class_id].total_us,
              (unsigned long long)gxm_scene_classes[class_id].total_max);
-    glog("VP_GXM_BLEND_CENSUS opaque=%llu blended=%llu\n",
+    glog_work("VP_GXM_BLEND_CENSUS opaque=%llu blended=%llu\n",
          (unsigned long long)gxm_draws_opaque,
          (unsigned long long)gxm_draws_blended);
     uint64_t encode_profile_us = sceKernelGetProcessTimeWide();
     for (unsigned kind = 0u; kind < 2u; ++kind)
-        glog("VP_GXM_BATCH_ENCODE_PERF kind=%s t_us=%llu draws=%llu prep_us=%llu "
+        glog_work("VP_GXM_BATCH_ENCODE_PERF kind=%s t_us=%llu draws=%llu prep_us=%llu "
              "begin_us=%llu encode_us=%llu draw_us=%llu setup_us=%llu "
              "vertex_us=%llu index_us=%llu texture_us=%llu nested_flush_us=%llu "
              "nested_pending_us=%llu nested_notify_us=%llu "
@@ -5278,7 +5299,7 @@ static void static_log_stats(void) {
              (unsigned long long)gxm_batch_encode_perf[kind].reserve_us,
              (unsigned long long)gxm_batch_encode_perf[kind].uniform_us,
              (unsigned long long)gxm_batch_encode_perf[kind].policy_us);
-    glog("VP_GXM_API_PERF submits=%llu notify_sum_us=%llu notify_max_us=%llu "
+    glog_work("VP_GXM_API_PERF submits=%llu notify_sum_us=%llu notify_max_us=%llu "
          "wait_sum_us=%llu wait_max_us=%llu direct_draws=%llu stream_entries=%llu\n",
          (unsigned long long)gxm_api_perf.submits,
          (unsigned long long)gxm_api_perf.notify_sum,
@@ -5287,13 +5308,13 @@ static void static_log_stats(void) {
          (unsigned long long)gxm_api_perf.wait_max,
          (unsigned long long)gxm_api_perf.direct_draws,
          (unsigned long long)gxm_api_perf.stream_entries);
-    glog("VP_GXM_XFER vertex_bytes=%llu vertex_us=%llu "
+    glog_work("VP_GXM_XFER vertex_bytes=%llu vertex_us=%llu "
          "texture_bytes=%llu texture_us=%llu\n",
          (unsigned long long)gxm_xfer_bytes, (unsigned long long)gxm_xfer_us,
          (unsigned long long)gxm_tex_bytes, (unsigned long long)gxm_tex_us);
-    glog("VP_GXM_STRIP_JOIN draws=%llu segments=%llu\n",
+    glog_work("VP_GXM_STRIP_JOIN draws=%llu segments=%llu\n",
          (unsigned long long)gxm_strip_draws, (unsigned long long)gxm_strip_segments);
-    glog("VP_GXM_INDEX_FAST no_restart=%llu remap_copy=%llu ramp_copy=%llu "
+    glog_work("VP_GXM_INDEX_FAST no_restart=%llu remap_copy=%llu ramp_copy=%llu "
          "ramp_bind=%llu desc_hits=%llu desc_misses=%llu\n",
          (unsigned long long)gxm_index_norestart,
          (unsigned long long)gxm_index_remap_copy,
@@ -5301,7 +5322,7 @@ static void static_log_stats(void) {
          (unsigned long long)gxm_index_ramp_bind,
          (unsigned long long)gxm_texture_desc_hits,
          (unsigned long long)gxm_texture_desc_misses);
-    glog("VP_GXM_UPLOAD_CACHE hits=%llu copies=%llu reused_bytes=%llu capacity=%u "
+    glog_work("VP_GXM_UPLOAD_CACHE hits=%llu copies=%llu reused_bytes=%llu capacity=%u "
          "owned_hits=%llu owned_bytes=%llu memo_hits=%llu skip_hits=%llu\n",
          (unsigned long long)gxm_upload_hits, (unsigned long long)gxm_upload_copies,
          (unsigned long long)gxm_upload_saved_bytes, gxm_upload_capacity,
@@ -7275,7 +7296,7 @@ static const char *gxm_batch_reason_name(unsigned reason) {
  * counters are the authoritative histogram for the whole run. */
 static void static_log_batch_hist(void) {
     unsigned i;
-    glog("VP_GXM_STATE_CACHE sets=%llu skipped=%llu\n",
+    glog_work("VP_GXM_STATE_CACHE sets=%llu skipped=%llu\n",
          (unsigned long long)gxm_state_sets,
          (unsigned long long)gxm_state_skips);
     glog("VP_GXM_BATCH_HIST size=");
@@ -8223,7 +8244,7 @@ static void gxm_batch_publish_entry(VPGxmBatchEntry *entry) {
                  gxm_depth_view_consumes, gxm_depth_view_binds);
     }
     if (commit_logs < 48u || (commit_logs % 256u) == 0u)
-        glog("VP_GXM_BATCH_COMMIT idx=%u hash=0x%x depth_only=%d target=0x%llx "
+        glog_work("VP_GXM_BATCH_COMMIT idx=%u hash=0x%x depth_only=%d target=0x%llx "
              "mask=0x%x commit=0x%x n=%u\n", req->draw_index, req->hash,
              entry->depth_only ? 1 : 0,
              (unsigned long long)(entry->target != NULL ? entry->target->va : 0u),
@@ -11704,7 +11725,7 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
             gxm_finish_us - nested_finish_before;
         req->batch_encoded = 1u;
         if (gxm_batch.flush_logs < 48u || (gxm_batch.policy.draws % 16u) == 0u)
-            glog("VP_GXM_BATCH_ENCODE idx=%u hash=0x%x slot=%u draws=%u "
+            glog_work("VP_GXM_BATCH_ENCODE idx=%u hash=0x%x slot=%u draws=%u "
                  "reserve=%u depth_only=%d scope=%llu\n",
                  req->draw_index, req->hash, gxm_batch.count - 1u,
                  gxm_batch.count, (unsigned)batch_reserve, depth_only,

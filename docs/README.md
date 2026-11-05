@@ -76,3 +76,4 @@
 - [0027 GXM worker 有界嵌套帧成本分解计时](decisions/0027-frame-cost-profile.md)
 - [0028 原游戏渲染函数计时与深层接管调查](decisions/0028-original-game-cost-probe.md)
 - [0029 纹理内存容量与 raw/decoded 分离实验](decisions/0029-texture-memory-experiments.md)
+- [0030 仅减少正常工作日志的对照](decisions/0030-work-log-experiment.md)

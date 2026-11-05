@@ -18,7 +18,8 @@ from measure_frame_window import measure, quantile
 FIELDS = re.compile(r"([a-z_0-9]+)=([^\s]+)")
 MODES = {4: ("deep", 0, 64 * 1024 * 1024),
          7: ("deep-large", 1, 128 * 1024 * 1024),
-         8: ("deep-split", 2, 64 * 1024 * 1024)}
+         8: ("deep-split", 2, 64 * 1024 * 1024),
+         9: ("deep-quiet", 0, 64 * 1024 * 1024)}
 COUNTERS = ("region_kernel_allocs", "region_kernel_frees", "pool_evictions",
             "pool_alloc_map", "pool_free_map", "pressure", "nomem")
 
@@ -129,7 +130,7 @@ def analyze(run, plan):
         candidates = set(modes) - {4}
         if (len(selected) != 4 or len(candidates) != 1 or
                 modes[0] != modes[2] or modes[1] != modes[3] or
-                4 not in modes or not candidates <= {7, 8}):
+                4 not in modes or not candidates <= {7, 8, 9}):
             raise ValueError("each experiment must alternate baseline and one candidate twice")
         candidate = candidates.pop()
         aggregate = {}

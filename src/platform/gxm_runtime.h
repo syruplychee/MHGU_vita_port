@@ -11,6 +11,7 @@
 #define VP_GXM_RUNTIME_H
 
 #include "log_sink.h"
+#include "work_log.h"
 #include "gxm_sampler_slots.h"
 #include "gxm_resource_layout.h"
 #include "gxm_shader_plan.h"
@@ -156,6 +157,8 @@ typedef struct {
     uint64_t tex_compare_bytes, tex_compare_calls;
 } VPGuestFramePerf;
 void vp_guest_frame_perf(VPGuestFramePerf *out);
+/* The selected work logs and this snapshot are owned by the GXM worker. */
+void vp_guest_work_log_stats(VPWorkLogStats *out);
 
 typedef struct {
     int applied;
