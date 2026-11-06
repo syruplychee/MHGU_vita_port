@@ -62,9 +62,24 @@ static unsigned vp_texture_bc5_swizzle_code(const unsigned sel[4]) {
     return ~0u;
 }
 
+/* Native Alpha8 contract. The repository's reviewed Maxwell layout table
+ * (tools/shader/maxwell_surface.py, FORMATS) names only 0x1d as R8. The C
+ * decoder below also reads 0x1c with the same byte->R rule, but that shared
+ * branch is not evidence that 0x1c has the same channel meaning, so selecting
+ * it for the (7,7,7,2) contract would guess. Four UNORM component fields and
+ * the exact selector tuple (1,1,1,R) are required; every other descriptor
+ * keeps the previous RGBA path. */
+static int vp_texture_alpha8_contract(unsigned fmt, uint32_t word) {
+    return fmt == 0x1du && ((word >> 7) & 0xfffu) == 0x492u &&
+           ((word >> 19) & 0xfffu) == 0x5ffu;
+}
+
 unsigned vp_texture_upload_format(unsigned fmt,uint32_t word) {
     unsigned swizzle=(word>>19)&0xfffu;
     if (fmt==0x01u) return VP_TEXTURE_UPLOAD_RGBA16F;
+    if (vp_texture_alpha8_contract(fmt, word)) return VP_TEXTURE_UPLOAD_ALPHA8;
+    if (fmt==0x1du && ((word>>7)&0xfffu)==0x492u && swizzle==0xe02u)
+        return VP_TEXTURE_UPLOAD_R8;
     if ((fmt==0x24u || fmt==0x26u) && (swizzle==0xb1au || swizzle==0xf1au))
         return fmt|(swizzle==0xf1au?0x100u:0u);
     if (fmt==0x27u || fmt==0x28u) {
@@ -86,11 +101,30 @@ size_t vp_texture_upload_bytes(unsigned w,unsigned h,unsigned fmt) {
     if (!w || !h || w>4096u || h>4096u) return 0;
     if (!fmt) return (size_t)w*h*4u;
     if (fmt==VP_TEXTURE_UPLOAD_RGBA16F) return (size_t)w*h*8u;
+    if (fmt==VP_TEXTURE_UPLOAD_RGBA32F_RG32F) {
+        if (w>VP_TEXTURE_RG32F_LOGICAL_MAX_WIDTH ||
+            h>VP_TEXTURE_RG32F_MAX_HEIGHT) return 0;
+        return (size_t)w*h*16u;
+    }
+    if (vp_texture_mask8_upload(fmt)) return (size_t)((w+7u)&~7u)*h;
     base=fmt&0xffu;
     if (base==0x24u || base==0x27u) bpp=8u;
     else if (base==0x26u || base==0x28u) bpp=16u;
     else return 0u;
     return (size_t)((w+3u)/4u)*((h+3u)/4u)*bpp;
+}
+
+int vp_texture_alpha8_pad_rows(uint8_t *data, size_t bytes,
+                               unsigned width, unsigned height) {
+    size_t needed=vp_texture_upload_bytes(width,height,VP_TEXTURE_UPLOAD_ALPHA8);
+    size_t stride=(width+7u)&~7u;
+    if (!data || !needed || bytes<needed) return -1;
+    for (unsigned y=height;y>0u;--y) {
+        uint8_t *row=data+(y-1u)*stride;
+        memmove(row,data+(size_t)(y-1u)*width,width);
+        memset(row+width,0,stride-width);
+    }
+    return 0;
 }
 
 static uint16_t float_bits_to_half(uint32_t bits) {
@@ -154,6 +188,96 @@ int vp_texture_rgba32f_pitch_to_rgba16f(const uint8_t *src,size_t src_bytes,
     return 0;
 }
 
+/* Selector values follow the reviewed Maxwell mapping already used by the
+ * BC4/BC5 swizzle tables: zero, channels R..A and float one. Selectors 1 and 6
+ * have no established numeric meaning here and are refused, not guessed. */
+static int rgba32f_select_bits(uint32_t word,const uint32_t input[4],
+                               uint32_t output[4]) {
+    for (unsigned c=0;c<4u;c++) {
+        unsigned s=(word>>(19u+3u*c))&7u;
+        if (s==0u) output[c]=0u;
+        else if (s>=2u && s<=5u) output[c]=input[s-2u];
+        else if (s==7u) output[c]=0x3f800000u;
+        else return -1;
+    }
+    return 0;
+}
+
+int vp_texture_rgba32f_pitch_to_rg32f(const uint8_t *src,size_t src_bytes,
+    uint8_t *dst,size_t dst_bytes,unsigned width,unsigned height,size_t pitch,
+    uint32_t word) {
+    size_t required,produced;
+    int identity;
+    if (!src || !dst || !width || !height ||
+        width>VP_TEXTURE_RG32F_LOGICAL_MAX_WIDTH ||
+        height>VP_TEXTURE_RG32F_MAX_HEIGHT ||
+        pitch<(size_t)width*16u || (size_t)height>SIZE_MAX/pitch) return -1;
+    required=pitch*height;
+    if (src_bytes<required || (size_t)width>SIZE_MAX/(height*16u)) return -1;
+    produced=(size_t)width*height*16u;
+    if (dst_bytes<produced) return -1;
+    /* Identity selectors leave every 32-bit channel pattern in place (NaN,
+     * -0 and subnormals included), so whole rows are copied without any float
+     * interpretation. */
+    identity = ((word>>19)&7u)==2u && ((word>>22)&7u)==3u &&
+               ((word>>25)&7u)==4u && ((word>>28)&7u)==5u;
+    if (identity) {
+        if (pitch==(size_t)width*16u) {
+            memcpy(dst,src,produced);
+        } else {
+            for (unsigned y=0;y<height;y++)
+                memcpy(dst+(size_t)y*width*16u,src+(size_t)y*pitch,
+                       (size_t)width*16u);
+        }
+        return 0;
+    }
+    for (unsigned y=0;y<height;y++) for (unsigned x=0;x<width;x++) {
+        uint32_t input[4],output[4];
+        const uint8_t *pixel=src+(size_t)y*pitch+(size_t)x*16u;
+        memcpy(input,pixel,sizeof(input));
+        if (rgba32f_select_bits(word,input,output)<0) return -1;
+        /* Physical texel 2x is RG, physical texel 2x+1 is BA. */
+        memcpy(dst+((size_t)y*width+x)*16u,output,sizeof(output));
+    }
+    return 0;
+}
+
+const char *vp_texture_vertex_rg32f_check(const VPTextureVertexRg32fView *view) {
+    unsigned u_mode,v_mode;
+    if (view==NULL) return "missing";
+    if (view->width==0u || view->height==0u) return "zero-size";
+    if (view->width>VP_TEXTURE_RG32F_LOGICAL_MAX_WIDTH) return "logical-width";
+    if (view->height>VP_TEXTURE_RG32F_MAX_HEIGHT) return "height";
+    if (view->tic_format!=0x01u) return "format";
+    if (view->tic_header!=2u) return "header";
+    /* Maxwell 7 is 2DNoMipmap, used by the captured pitch-linear palettes. */
+    if (view->texture_type!=1u && view->texture_type!=7u) return "type";
+    if (view->depth!=1u) return "depth";
+    if (view->block_depth!=0u) return "block-depth";
+    if (view->max_mip_level!=0u) return "mip";
+    /* The observed descriptor has all four component fields marked FLOAT.
+     * Treating other bits as F32F32 would reinterpret the source numbers. */
+    if (((view->tic_word0>>7)&0xfffu)!=0xfffu) return "component-type";
+    for (unsigned c=0;c<4u;c++) {
+        unsigned s=(view->tic_word0>>(19u+3u*c))&7u;
+        if (s!=0u && (s<2u || s>5u) && s!=7u) return "swizzle-selector";
+    }
+    if (view->pitch<(size_t)view->width*16u ||
+        (size_t)view->height>SIZE_MAX/view->pitch) return "pitch";
+    if (view->storage<(size_t)view->pitch*view->height) return "storage";
+    /* Point min/mag. The one-level TIC view makes a valid TSC mip-filter field
+     * ineffective; the native split descriptor explicitly disables mips. */
+    if ((view->sampler[1]&3u)!=1u || ((view->sampler[1]>>4)&3u)!=1u)
+        return "filter";
+    if (((view->sampler[1]>>6)&3u)==3u) return "mip-filter";
+    u_mode=view->sampler[0]&7u;
+    v_mode=(view->sampler[0]>>3)&7u;
+    if (u_mode>4u || v_mode>4u) return "addr-mode";
+    if (u_mode==3u || v_mode==3u) return "border";
+    if (u_mode!=0u && u_mode!=2u) return "packed-u-mode";
+    if (view->width%4u) return "row-alignment";
+    return NULL;
+}
 static size_t cube_mip_bytes(unsigned w,unsigned h,unsigned mip_count) {
     size_t bytes=0;
     unsigned mip=0;
@@ -371,6 +495,205 @@ static void rgb565(unsigned c, uint8_t out[4]) {
     out[1] = (uint8_t)((g << 2) | (g >> 4));
     out[2] = (uint8_t)((b << 3) | (b >> 2));
     out[3] = 255u;
+}
+
+/* Apply the four Maxwell TIC selector fields while copying. Selector 1 has no
+ * established channel meaning here and stays zero, exactly as the reviewed
+ * vp_texture_swizzle mapping; selectors 6 and 7 both produce 255. */
+static void rgba8_selector_map(const uint8_t in[4], uint8_t out[4],
+                               const unsigned sel[4]) {
+    for (unsigned i = 0; i < 4u; ++i) {
+        unsigned s = sel[i];
+        out[i] = s >= 2u && s <= 5u ? in[s - 2u] : s >= 6u ? 255u : 0u;
+    }
+}
+
+static int rgba8_identity_selectors(uint32_t word) {
+    return ((word >> 19) & 7u) == 2u && ((word >> 22) & 7u) == 3u &&
+           ((word >> 25) & 7u) == 4u && ((word >> 28) & 7u) == 5u;
+}
+
+static void rgba8_copy_pixels(uint8_t *dst, const uint8_t *src,
+                              unsigned pixels, int identity,
+                              const unsigned sel[4]) {
+    if (identity) {
+        memcpy(dst, src, (size_t)pixels * 4u);
+        return;
+    }
+    for (unsigned p = 0; p < pixels; ++p)
+        rgba8_selector_map(src + p * 4u, dst + p * 4u, sel);
+}
+
+int vp_texture_rgba8_untile_swizzle(const uint8_t *src, size_t bytes,
+    uint8_t *dst, unsigned w, unsigned h, unsigned bh, uint32_t word) {
+    static const size_t row_offsets[8] = {0u,16u,64u,80u,
+                                          128u,144u,192u,208u};
+    unsigned sel[4];
+    size_t gob_stride;
+    int identity;
+
+    if (!src || !dst || !w || !h || w > 4096u || h > 4096u || bh > 5u)
+        return -1;
+    if (bytes < vp_texture_storage(w, h, 8u, bh)) return -1;
+    gob_stride = (size_t)512u << bh;
+    for (unsigned i = 0; i < 4u; ++i) sel[i] = (word >> (19u + 3u * i)) & 7u;
+    identity = rgba8_identity_selectors(word);
+
+    if ((w & 15u) == 0u) {
+        /* Same GOB row-group traversal as the reviewed decoder: complete four
+         * GOBs (64 pixels) for all rows first, then one GOB at a time. */
+        for (unsigned gob_y = 0; gob_y < h; gob_y += 8u) {
+            const unsigned rows = h - gob_y < 8u ? h - gob_y : 8u;
+            const size_t base = tiled_offset(0, gob_y, w, 4u, bh);
+            unsigned gob_x = 0;
+            for (; gob_x + 64u <= w; gob_x += 64u) {
+                for (unsigned row = 0; row < rows; ++row) {
+                    uint8_t *out = dst +
+                        ((size_t)(gob_y + row) * w + gob_x) * 4u;
+                    const uint8_t *in = src + base +
+                        (size_t)(gob_x / 16u) * gob_stride +
+                        row_offsets[row];
+                    for (unsigned gob = 0; gob < 4u; ++gob) {
+                        const uint8_t *row_in = in + (size_t)gob * gob_stride;
+                        uint8_t *gob_out = out + (size_t)gob * 64u;
+                        rgba8_copy_pixels(gob_out, row_in, 4u, identity, sel);
+                        rgba8_copy_pixels(gob_out + 16u, row_in + 32u, 4u,
+                                          identity, sel);
+                        rgba8_copy_pixels(gob_out + 32u, row_in + 256u, 4u,
+                                          identity, sel);
+                        rgba8_copy_pixels(gob_out + 48u, row_in + 288u, 4u,
+                                          identity, sel);
+                    }
+                }
+            }
+            for (; gob_x < w; gob_x += 16u) {
+                const uint8_t *in = src + base +
+                    (size_t)(gob_x / 16u) * gob_stride;
+                for (unsigned row = 0; row < rows; ++row) {
+                    uint8_t *out = dst +
+                        ((size_t)(gob_y + row) * w + gob_x) * 4u;
+                    const uint8_t *row_in = in + row_offsets[row];
+                    rgba8_copy_pixels(out, row_in, 4u, identity, sel);
+                    rgba8_copy_pixels(out + 16u, row_in + 32u, 4u,
+                                      identity, sel);
+                    rgba8_copy_pixels(out + 32u, row_in + 256u, 4u,
+                                      identity, sel);
+                    rgba8_copy_pixels(out + 48u, row_in + 288u, 4u,
+                                      identity, sel);
+                }
+            }
+        }
+        return 0;
+    }
+
+    /* Narrow/unaligned widths keep the original per-row order. */
+    for (unsigned y = 0; y < h; ++y) {
+        const size_t row_base = tiled_offset(0, y, w, 4u, bh);
+        uint8_t *out = dst + (size_t)y * w * 4u;
+        unsigned x = 0;
+        for (; x + 16u <= w; x += 16u) {
+            const uint8_t *in = src + row_base +
+                (size_t)(x / 16u) * gob_stride;
+            rgba8_copy_pixels(out + (size_t)x * 4u, in, 4u, identity, sel);
+            rgba8_copy_pixels(out + (size_t)x * 4u + 16u, in + 32u, 4u,
+                              identity, sel);
+            rgba8_copy_pixels(out + (size_t)x * 4u + 32u, in + 256u, 4u,
+                              identity, sel);
+            rgba8_copy_pixels(out + (size_t)x * 4u + 48u, in + 288u, 4u,
+                              identity, sel);
+        }
+        for (; x + 4u <= w; x += 4u)
+            rgba8_copy_pixels(out + (size_t)x * 4u,
+                              src + tiled_offset(x, y, w, 4u, bh), 4u,
+                              identity, sel);
+        if (x < w)
+            rgba8_copy_pixels(out + (size_t)x * 4u,
+                              src + tiled_offset(x, y, w, 4u, bh), w - x,
+                              identity, sel);
+    }
+    return 0;
+}
+
+int vp_texture_rgba8_linear_swizzle(const uint8_t *src, size_t bytes,
+    uint8_t *dst, unsigned w, unsigned h, size_t pitch, uint32_t word) {
+    unsigned sel[4];
+    int identity;
+
+    if (!src || !dst || !w || !h || w > 4096u || h > 4096u ||
+        pitch < (size_t)w * 4u || (size_t)h > SIZE_MAX / pitch)
+        return -1;
+    if (bytes < pitch * h) return -1;
+    for (unsigned i = 0; i < 4u; ++i) sel[i] = (word >> (19u + 3u * i)) & 7u;
+    identity = rgba8_identity_selectors(word);
+    for (unsigned y = 0; y < h; ++y)
+        rgba8_copy_pixels(dst + (size_t)y * w * 4u,
+                          src + (size_t)y * pitch, w, identity, sel);
+    return 0;
+}
+
+/* Native one-byte Maxwell R8. A GOB row holds 64 pixels as four contiguous
+ * 16-byte spans at +0/+32/+256/+288, exactly like the RGBA8 traversal but with
+ * 16 pixels per span instead of 4. Narrow tails stay on the per-16-pixel
+ * tiled_offset path, which is contiguous within one span. */
+int vp_texture_alpha8_untile(const uint8_t *src, size_t src_bytes,
+    uint8_t *dst, size_t dst_bytes, unsigned w, unsigned h, unsigned fmt,
+    unsigned bh) {
+    static const size_t row_offsets[8] = {0u,16u,64u,80u,
+                                          128u,144u,192u,208u};
+    size_t required, pixels, gob_stride;
+
+    if (!src || !dst || fmt != 0x1du || !w || !h || w > 4096u ||
+        h > 4096u || bh > 5u)
+        return -1;
+    required = vp_texture_storage(w, h, fmt, bh);
+    if (!required || (size_t)w > SIZE_MAX / h) return -1;
+    pixels = (size_t)w * h;
+    if (src_bytes < required || dst_bytes < pixels) return -1;
+    gob_stride = (size_t)512u << bh;
+
+    for (unsigned gob_y = 0; gob_y < h; gob_y += 8u) {
+        const unsigned rows = h - gob_y < 8u ? h - gob_y : 8u;
+        const size_t base = tiled_offset(0, gob_y, w, 1u, bh);
+        unsigned gob_x = 0;
+        for (; gob_x + 64u <= w; gob_x += 64u) {
+            for (unsigned row = 0; row < rows; ++row) {
+                uint8_t *out = dst + (size_t)(gob_y + row) * w + gob_x;
+                const uint8_t *in = src + base +
+                    (size_t)(gob_x / 64u) * gob_stride + row_offsets[row];
+                memcpy(out, in, 16u);
+                memcpy(out + 16u, in + 32u, 16u);
+                memcpy(out + 32u, in + 256u, 16u);
+                memcpy(out + 48u, in + 288u, 16u);
+            }
+        }
+        for (unsigned row = 0; row < rows; ++row) {
+            uint8_t *out = dst + (size_t)(gob_y + row) * w;
+            unsigned x = gob_x;
+            for (; x + 16u <= w; x += 16u)
+                memcpy(out + x, src + tiled_offset(x, gob_y + row, w, 1u, bh),
+                       16u);
+            if (x < w)
+                memcpy(out + x, src + tiled_offset(x, gob_y + row, w, 1u, bh),
+                       w - x);
+        }
+    }
+    return 0;
+}
+
+int vp_texture_alpha8_linear(const uint8_t *src, size_t src_bytes,
+    uint8_t *dst, size_t dst_bytes, unsigned w, unsigned h, size_t pitch) {
+    size_t required, pixels;
+
+    if (!src || !dst || !w || !h || w > 4096u || h > 4096u ||
+        pitch < (size_t)w || (size_t)h > SIZE_MAX / pitch)
+        return -1;
+    required = pitch * h;
+    if (src_bytes < required || (size_t)w > SIZE_MAX / h) return -1;
+    pixels = (size_t)w * h;
+    if (dst_bytes < pixels) return -1;
+    for (unsigned y = 0; y < h; ++y)
+        memcpy(dst + (size_t)y * w, src + (size_t)y * pitch, w);
+    return 0;
 }
 
 int vp_texture_rgba(const uint8_t *src, size_t bytes, uint8_t *dst,

@@ -45,21 +45,28 @@ CI 使用 Ubuntu + GCC。
 
 ### 2.2 覆盖范围
 
-跨平台测试（27 项）：
+跨平台测试（47 项，需要 Python 3.10+；完整清单见 `tests/README.md`），主要覆盖：
 
 - `audio_downmix`、`audio_ipc`
 - `batch_policy`
+- `engine_submit_probe`、`engine_layout`：原调用点归类、完整布局内容匹配、不可变记录重放，
+  与原命令的 GPU/MME 状态逐字节比较
+- `frame_window_metrics`（Python）：整帧直方图完整性、正常退出/存档保护、同进程交替对照边界
+- `frame_cost_profile`、`frame_cost_metrics`（Python）：GXM worker 有界嵌套 span
+  的 self/root 记账、提前返回、错误计数、严格控制文件解析，以及完整快照端点差、
+  同 epoch/帧步进、负 residual 保留和证据门槛
 - `clear_fusion`
 - `float_bits_numeric`
 - `gpu_command_buffer`、`gpu_effective_rt`、`gpu_indices`、`gpu_stream`、
   `gpu_texture_decode`、`gpu_uniform_state`
-- `gxm_depth`、`gxm_depth_view`、`gxm_depth_view_shadow`、`gxm_resource_layout`、
-  `gxm_sampler_slots`、`gxm_shadow_sampler`
+- `gxm_depth`、`gxm_depth_view`、`gxm_depth_view_shadow`、`gxm_render_pipeline`、
+  `gxm_resource_layout`、`gxm_sampler_slots`、`gxm_shadow_sampler`
 - `memory_attributes`、`nvmap_table`
 - `media_strided_copy`
 - `pair_cache_policy`、`render_resolution`
 - `static_shader_index`、`texture_snapshot`、`time_calendar`
 - `vertex_format`、`vertex_window`
+- `vertex_rg32f_lowering`（Python）：顶点浮点纹理展开、逻辑尺寸与片元路径边界
 
 仅 POSIX/Linux（4 项）：
 
@@ -68,10 +75,13 @@ CI 使用 Ubuntu + GCC。
 - `guest_storage`（32 位 guest 地址 + POSIX mmap）
 - `log_sink`（pthread）
 
-这些测试直接编译生产源文件或包含生产实现，不是复制品。
+这些测试直接编译生产源文件或包含生产实现，不是复制品。`gxm_render_pipeline`
+由 `tests/CMakeLists.txt` 用标记从 `src/platform/gxm_runtime.c` 截取实际函数体生成
+测试 include；标记缺失会在 configure 阶段失败，避免静默测试一份复制实现。
 
 仅 Windows 另有 `session_gate`：使用真实 Win32 信号量和八线程，检查共享门锁的
-互斥、递归、先释放后等待、过期唤醒 token 与错误传播。当前 Windows 共 28 项。
+互斥、递归、先释放后等待、过期唤醒 token 与错误传播。`runtime_main_window` 直接提取
+运行器的窗口选择函数，检查最小化 Qt 启动器和 SDL 游戏窗口的选择。当前 Windows 共 34 项。
 
 附加的播片计时工具测试：
 
@@ -84,6 +94,21 @@ python tools/runtime/measure_movie.py --log <sdk-dso.log> --start 45 --end 100 -
 明确标记。Y/UV 两次读回只是两份平面复制，不能算两帧。这个结果不单独证明显示或音频。
 测正常游玩性能时不要添加 `-SurfaceReadback`；该参数会开启额外 GPU 表面同步，
 适合检查 CPU 读回数据，应与正常配置分别报告。
+
+帧成本分解（仅 `frame-cost.enable` 存在时有效；`frame-cost-mode.txt` 为 0/1）：
+
+```powershell
+python -m unittest discover -s tests -p test_frame_cost_metrics.py -v
+python tools/engine/analyze_frame_cost.py --gxm-log <gxm-runtime.log> `
+  --window <start_us>:<end_us> [--window ...] --output <report-dir>
+```
+
+分析器只接受同一 mode-1 epoch 的完整快照端点差，要求帧号/时间/累计计数不倒退、
+errors=0、span depth=0，不跨切换；输出每帧 inclusive/self、root 占墙钟比例和带符号
+residual。负数 residual 原样保留并标记窗口无效。`VP_FRAME_BUDGET`/`ENCODE`/`WAIT`
+行使用各自端点，只作为未对齐证据列出，不能与本快照相加。通知/Finish 阻塞是 API
+墙钟，不是 GPU 执行时间。没有过程/存档保护证据时 `performance_pass=false`；
+`speedup_claim` 恒为 false。
 
 颜色转换探针（仅 `media-color-probe.enable` 存在时有效）：
 

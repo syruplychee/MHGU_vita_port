@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "module": "main",
+  "source_sha256": "b3935415499549adaf4c0e89822831daa175cfd456a7990791c79be3997645ef",
+  "build_id": "fb08f1d20fd1204fe7070672777f869b00000000000000000000000000000000",
+  "marker": "ux0:data/mhgu-vita-port/engine-layout.enable",
+  "default_enabled": false,
+  "function": {
+    "offset": "0xbc1764",
+    "bytes": 3192,
+    "sha256": "e71e66bba88c89c18ad8d2e4651dd3188ccb3aedf53484af9b30d210c8b4657e"
+  },
+  "patch": {
+    "offset": "0xbc17d8",
+    "expected_original_bytes": "000c9fe5",
+    "state": "ARM",
+    "continuation": "0xbc1814",
+    "replaced_range": "[0xbc17d8,0xbc1814)",
+    "abi": "r4 points at engine layout metadata, r5 is the NVN command buffer. Preserve r4-r11 and SP; replace fixed BindVertexAttribState(16,*(r4+0x3c)) and BindVertexStreamState(4,*(r4+0x3c)+64) calls. Program binding before the patch and subsequent material/resource preparation continue unchanged."
+  },
+  "original_sdk_functions": [
+    {"offset": "0x33f8b0", "bytes": 436, "sha256": "4c2237d6aa39c89a075de1c80d919cdbaebbe814f04a9f4d969edbb661c2c672"},
+    {"offset": "0x33fa64", "bytes": 340, "sha256": "8170476fe05b4483c79530be827ba159f60065e27231de98cedf4dbac9e4cb53"}
+  ],
+  "island": {
+    "owner": "main",
+    "append_bytes": 20,
+    "encoding": "ldr pc,[pc,#-4]; shim address; ldr r0,[pc,#0]; branch main+0xbc17dc; original literal",
+    "literal_source": "0xbc23e0",
+    "expected_literal": "0x00c7ffbc",
+    "fallback": "Replay the displaced literal load, then resume the original main instruction sequence at 0xbc17dc. The reserve/growth/error paths retain their original stack and SDK calls."
+  },
+  "private_record": {
+    "method": "0xdff",
+    "header": "0x20010dff",
+    "token_prefix": "0x564c0000",
+    "subchannel": 0,
+    "input_bytes": 96,
+    "slots": 64,
+    "max_writes": 64,
+    "lifetime": "immutable process-owned CPU records; never evicted, so reusable command buffers remain valid",
+    "identity": "all input words compared exactly; signature and lookup hint do not establish identity"
+  },
+  "miss_policy": "Capture by executing both original SDK functions only when at least 452 bytes remain, so neither conservative reserve check can grow the buffer. Other threads, recursion, full pools and insufficient capacity return through the original main instruction sequence. Admit only stable identical source contents and reviewed layout methods. Immutable old records remain valid."
+}

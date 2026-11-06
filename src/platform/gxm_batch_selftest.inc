@@ -317,7 +317,7 @@ static int gxm_batch_selftest(void) {
                     /* The positive control uses the canonical Vulkan surface
                      * orientation (unswapped); the negative control flips V to
                      * prove the check is not trivially satisfied. */
-                    rc = frame_blit_gpu(output,present_pixels,0,0,64,32,64,32,64,control!=0u);
+                    rc = frame_blit_gpu(output,present_pixels,0,0,64,32,64,32,64,control!=0u,0);
                     snprintf(path,sizeof(path),
                         "ux0:data/mhgu-vita-port/batch-selftest-present-m%u-n%u.rgba",mode,control);
                     dump = rc==0 ? fopen(path,"wb") : NULL;

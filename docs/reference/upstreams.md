@@ -6,7 +6,7 @@
 | 项目 | 用途 | 许可证/注意 |
 |---|---|---|
 | [VitaSDK](https://github.com/vitasdk) | ARMv7 交叉编译、SELF/VPK | MIT（以仓库为准）；工具链二进制由开发者自行安装 |
-| [Vita3K](https://github.com/Vita3K/Vita3K) | PC 模拟器 | GPL-2.0；本项目不修改/分发 Vita3K |
+| [Vita3K](https://github.com/Vita3K/Vita3K) | PC 模拟器 | GPL-2.0；本项目不分发 Vita3K；私有兼容候选单独构建，见 [ADR 0016](../decisions/0016-local-vertex-dot-order.md) |
 | [vitaGL](https://github.com/Rinnegatamante/vitaGL) | 只读参考（GPU 组织） | MIT；未复制实现 |
 | [libvita2d](https://github.com/xerpi/libvita2d) | 只读参考 | MIT；未复制实现 |
 | [kubridge](https://github.com/bythos14/kubridge) | 真机内存映射/权限 | MIT（以仓库为准）；插件不随项目分发 |
@@ -18,6 +18,10 @@
 | [nut](https://github.com/blawar/nut) | 游戏文件管理 | 上游许可；不随项目分发 |
 
 ## 关键边界
+
+点阵字体使用 [GNU Unifont 18.0.01](https://unifoundry.com/unifont/index.html)。
+本项目的派生遮罩采用其 OFL-1.1 选项，附原 copyright 与许可；下载工具固定 HEX、
+BDF 和 OFL 身份，字体本体及游戏字库包不进入 Git。实现和证据见 ADR 0033。
 
 - **SceShaccCg / libshacccg.suprx**：公开可下载不等于允许再分发。不要提交、打包或
   上传到 release；只在本地合法获取和使用。

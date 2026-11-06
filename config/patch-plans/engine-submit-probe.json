@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "module": "main",
+  "source_sha256": "b3935415499549adaf4c0e89822831daa175cfd456a7990791c79be3997645ef",
+  "build_id": "fb08f1d20fd1204fe7070672777f869b00000000000000000000000000000000",
+  "marker": "ux0:data/mhgu-vita-port/engine-submit-probe.enable",
+  "default_enabled": false,
+  "function": {
+    "offset": "0xbc1764",
+    "bytes": 3192,
+    "sha256": "e71e66bba88c89c18ad8d2e4651dd3188ccb3aedf53484af9b30d210c8b4657e"
+  },
+  "patches": [
+    {
+      "offset": "0xbc1764",
+      "expected_original_bytes": "f04f2de9",
+      "state": "ARM",
+      "service": "0x250",
+      "abi": "Restore the full bridge frame first, then execute PUSH r4-r11,lr in the main replay island and branch to main+0xbc1768; C must not write over its active saved bridge frame"
+    },
+    {
+      "offset": "0xbc23d4",
+      "expected_original_bytes": "4cd08de2",
+      "state": "ARM",
+      "service": "0x251",
+      "abi": "Restore the bridge frame, execute ADD sp,sp,#0x4c in the main replay island, then branch to main+0xbc23d8; the bridge epilogue restores SP structurally, not from f->sp"
+    }
+  ],
+  "island": {"owner": "main", "append_bytes": 32, "veneer_bytes": 8, "replay_bytes": 16},
+  "limits": "Diagnostic bridge overhead; inclusive timing; no GPU timing or performance-improvement claim; command-buffer growth byte deltas excluded"
+}

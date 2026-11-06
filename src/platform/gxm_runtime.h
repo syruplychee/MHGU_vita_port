@@ -11,8 +11,10 @@
 #define VP_GXM_RUNTIME_H
 
 #include "log_sink.h"
+#include "work_log.h"
 #include "gxm_sampler_slots.h"
 #include "gxm_resource_layout.h"
+#include "gxm_shader_plan.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -150,8 +152,39 @@ typedef struct {
      * after tex_decode_us and not folded into it; both are nested in
      * draw_prepare_us. */
     uint64_t tex_update_tail_us;
+    uint64_t tex_family_us[5], tex_family_bytes[5];
+    uint64_t tex_miss_changed, tex_miss_absent, tex_miss_gpu_only;
+    uint64_t tex_compare_bytes, tex_compare_calls;
 } VPGuestFramePerf;
 void vp_guest_frame_perf(VPGuestFramePerf *out);
+/* The selected work logs and this snapshot are owned by the GXM worker. */
+void vp_guest_work_log_stats(VPWorkLogStats *out);
+
+typedef struct {
+    int applied;
+    unsigned memory_mode;      /* 0 = 64 MiB unified, 1 = 128 MiB unified, 2 = split */
+    unsigned raw_class;
+    size_t budget_bytes, used_bytes, peak_used_bytes;
+    unsigned live_slots, peak_live_slots, gpu_refs, cpu_pins;
+    uint64_t evictions, pressure_events, nomem_events;
+    uint64_t alloc_map_calls, free_map_calls;
+} VPGuestTextureMemoryPerf;
+/* Snapshot of the applied deep texture memory configuration. Reads only
+ * published atomics and counter fields; it never switches mode or allocates. */
+void vp_guest_texture_memory_perf(VPGuestTextureMemoryPerf *out);
+
+/* Bounded nested frame-cost profile. All entry points must run on the GXM
+ * worker; other threads do not record spans and must not read the control
+ * file. The boundary poll applies a mode change only while no span is open.
+ * begin/end return the timestamp they captured (0 when profiling is off), so
+ * an inactive run performs no clock call. */
+void vp_gxm_frame_cost_worker_boundary(void);
+int vp_gxm_frame_cost_active(void);
+uint64_t vp_gxm_frame_cost_now(void);
+uint64_t vp_gxm_frame_cost_category_begin(unsigned category);
+void vp_gxm_frame_cost_category_end(unsigned category, uint64_t started_us);
+uint64_t vp_gxm_frame_cost_log_begin(void);
+int vp_gxm_frame_cost_resource_audit(uint64_t *frame);
 
 /* Register every GXP listed in <dir>/index.txt. Returns 0 when all registered. */
 int vp_gxm_shader_register_all(const char *dir, unsigned *files,
@@ -170,6 +203,14 @@ int vp_gxm_static_resources_active(void);
 int vp_gxm_shader_resource(unsigned token, unsigned gpu_stage,
                            unsigned viewport_transform, unsigned slot,
                            VPResourceTexture *out);
+/* One bounded plan for a whole stage: all tex0..tex4 declarations, the current
+ * resources-active state and each declared slot's original shader_resource
+ * return. Returns 0 on success; -1 for bad arguments; -3 when no static index
+ * is active (the caller must use the legacy per-slot path). The plan contains
+ * value copies only and is invalidated by resident/index generation changes. */
+int vp_gxm_shader_resource_plan(unsigned token, unsigned gpu_stage,
+                                unsigned viewport_transform,
+                                VPGxmShaderResourcePlan *out);
 
 typedef struct {
     const void *vertices;
@@ -345,6 +386,7 @@ typedef struct {
 /* Start the GXM worker thread and run the bring-up on it. Returns 0 when the
  * bring-up succeeded. All GXM calls happen on this one thread. */
 int vp_gxm_worker_start(void);
+float vp_gxm_native_font_scale(void);
 /* Execute one command-stream entry synchronously on the context-owning worker.
  * Nested GXM requests execute directly there, without another thread handoff. */
 int vp_gxm_worker_execute(void (*execute)(void *), void *user);
@@ -361,7 +403,10 @@ int vp_gxm_log_get_stats(VPLogSinkStats *out);
 int vp_gxm_worker_submit(VPGxmDrawRequest *request);
 
 /* Full-frame clear: create/lookup the surface named by target_va and apply the
- * Maxwell clear mask. Synchronous on the GXM worker. */
+ * Maxwell clear mask. Synchronous on the GXM worker. The A/B mode-6
+ * experiment may instead record an admitted full-colour clear and materialize
+ * it at a later consumption point; depth/stencil and every unadmitted request
+ * keep the original synchronous path. */
 int vp_gxm_frame_clear(VPGxmClearRequest *request);
 
 /* Present and dump the surface written by the last full-frame draw. Called when
@@ -380,6 +425,30 @@ int vp_gxm_batch_flush(const char *reason);
  * draw-local memo; snapshot/upload bytes and GPU backing lifetime are not
  * changed, so an earlier scene keeps its immutable copies until completion. */
 void vp_gxm_texture_owned_retire(const void *source);
+
+/* Deep texture-pipeline support. Reusable regions back the pool. Decoded
+ * regions use class 0 (uncached, GXM-mapped for read); split raw snapshots use
+ * class 1 (existing cached C heap, never GXM-mapped). Reclaim
+ * flushes the open scene and waits for every deferred notification so all
+ * direct-texture leases are provably released before the pool is reused,
+ * torn down or retried. */
+int vp_gxm_texture_regions_init(size_t budget_bytes);
+void *vp_gxm_texture_region_create(void *user, size_t bytes,
+                                   unsigned allocation_class);
+int vp_gxm_texture_region_release(void *user, void *base);
+int vp_gxm_texture_regions_reset(void);
+typedef struct {
+    size_t budget_bytes, physical_bytes, peak_bytes;
+    size_t mapped_physical_bytes, cached_physical_bytes;
+    size_t mapped_allocated_bytes, cached_allocated_bytes;
+    uint64_t kernel_allocs, kernel_frees, suballocs, subfrees;
+    unsigned live, failed;
+} VPGxmTextureRegionStats;
+void vp_gxm_texture_region_stats(VPGxmTextureRegionStats *out);
+int vp_gxm_texture_copy_cache_reset(void);
+int vp_gxm_texture_pipeline_reclaim(void);
+/* Invalidates CPU descriptors that may name a torn-down pool address. */
+void vp_gxm_texture_descriptor_cache_reset(void);
 
 /* Experiment switch for the texture-identity question. When
  * ux0:data/mhgu-vita-port/texture-identity-skip-bytes.enable exists, cache

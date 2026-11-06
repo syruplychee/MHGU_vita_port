@@ -3,13 +3,22 @@
 #include "audio_render.h"
 #include "audio_sink.h"
 #include "gpu_stream.h"
+#include "engine_layout.h"
+#include "engine_full.h"
 #include "gpu_texture.h"
+#include "pixel_font.h"
+#include "pixel_font_draw.h"
+#include "texture_pool.h"
+#include "texture_pipeline.h"
+#include "work_log.h"
+#include "texture_regions.h"
 #include "texture_snapshot.h"
 #include "gpu_indices.h"
 #include "vertex_window.h"
 #include "gxm_depth.h"
 #include "gxm_depth_view.h"
 #include "gxm_runtime.h"
+#include "frame_cost_profile.h"
 #include "media_decode.h"
 #include "media_video.h"
 #include "native_movie.h"
@@ -25,6 +34,67 @@
 
 #define VP_GUEST_TRACE_PATH "ux0:data/mhgu-vita-port/sdk-svc.log"
 
+static VPPixelFontResource pixel_fonts[VP_PIXEL_FONT_SLOTS];
+
+/* The native font mode keeps the modeled handheld UI and VI buffers on the
+ * same 720-line logical grid. A 1080-line VI buffer with a 720-line viewport
+ * otherwise shrinks the 960x540 UI to 640x360 before scanout enlarges it. */
+static unsigned pixel_display_width(void) {
+    return vp_guest_pixel_font_native_enabled()?1280u:1920u;
+}
+static unsigned pixel_display_height(void) {
+    return vp_guest_pixel_font_native_enabled()?720u:1080u;
+}
+
+int vp_guest_pixel_font_enabled(void) {
+    static int enabled=-1;
+    if (enabled<0) {
+        FILE *marker=fopen("ux0:data/mhgu-vita-port/pixel-font.enable","rb");
+        enabled=marker!=NULL;
+        if (marker) fclose(marker);
+    }
+    return enabled;
+}
+
+int vp_guest_pixel_font_event(VPGuestSvc *svc, unsigned event, uint32_t object) {
+    if (!vp_guest_pixel_font_enabled()) return 0;
+    for (unsigned i=0;i<VP_PIXEL_FONT_SLOTS;++i)
+        if (pixel_fonts[i].object==object && svc->log)
+            fprintf(svc->log,"PIXEL_FONT_RETIRE event=%u object=0x%x va=0x%llx\n",
+                event,object,(unsigned long long)pixel_fonts[i].va);
+    vp_pixel_font_retire(pixel_fonts,object);
+    if (event!=1u) return 0;
+    if (!vp_guest_svc_readable(svc,object,0xd4u)) return -1;
+    const uint8_t *resource=(const uint8_t *)(uintptr_t)object;
+    char name[65];
+    memcpy(name,resource+8u,64u);
+    name[64]=0;
+    if (!vp_pixel_font_name(name)) return 0;
+    uint32_t gpu;
+    memcpy(&gpu,resource+0xd0u,4u);
+    if (!gpu || !vp_guest_svc_readable(svc,gpu,0xc0u)) return -1;
+    const uint8_t *native=(const uint8_t *)(uintptr_t)gpu;
+    uint32_t format;
+    uint64_t va;
+    uint16_t width,height;
+    memcpy(&format,native+0x28u,4u);
+    memcpy(&va,native+0xb8u,8u);
+    memcpy(&width,native+0x1eu,2u);
+    memcpy(&height,native+0x20u,2u);
+    height&=0x3fffu;
+    int system=vp_pixel_font_name(name)==2;
+    int rc=system ?
+        (format==0x12u ? vp_pixel_font_register(pixel_fonts,object,va,width,height):-1) :
+        (format==0x2cu && width==1024u && height==1024u ?
+         vp_pixel_font_register(pixel_fonts,object,va,width,height):-1);
+    if (svc->log) fprintf(svc->log,"PIXEL_FONT_RESOURCE name=%s object=0x%x "
+        "gpu=0x%x va=0x%llx format=0x%x size=%ux%u rc=%d\n",name,object,gpu,
+        (unsigned long long)va,format,width,height,rc);
+    return rc;
+}
+
+#include "pixel_font_draw.inc"
+
 static int svc_play_perf_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -33,6 +103,14 @@ static int svc_play_perf_enabled(void) {
         if (marker) fclose(marker);
     }
     return enabled;
+}
+
+/* Published by the host-side A/B control poll before the root timestamp.
+ * Draw preparation reads only this atomic flag; it never opens the control
+ * file. */
+static int shared_prepare_enabled(void) {
+    return __atomic_load_n(&vp_engine_shared_prepare_enabled,
+                           __ATOMIC_ACQUIRE) != 0u;
 }
 
 /* Only request headers are sampled. Result/error records, GPU rejects,
@@ -71,6 +149,7 @@ static int svc_play_success_sample(const char *line) {
 static void slog(VPGuestSvc *svc, const char *format, ...) {
     va_list args;
     if (!svc_play_trace_sample(format)) return;
+    uint64_t fc = vp_gxm_frame_cost_log_begin();
     if (svc_play_perf_enabled()) {
         /* Unbuffered vfprintf emits many emulated writes for one format.
          * Format once and issue one write per sink, preserving the full line.
@@ -80,9 +159,13 @@ static void slog(VPGuestSvc *svc, const char *format, ...) {
         int length = vsnprintf(line, sizeof(line), format, args);
         va_end(args);
         if (length >= 0 && (size_t)length < sizeof(line)) {
-            if (!svc_play_success_sample(line)) return;
+            if (!svc_play_success_sample(line)) {
+                vp_gxm_frame_cost_category_end(VP_FRAME_COST_LOG, fc);
+                return;
+            }
             fwrite(line, 1u, (size_t)length, svc->log);
             if (svc->trace) fwrite(line, 1u, (size_t)length, svc->trace);
+            vp_gxm_frame_cost_category_end(VP_FRAME_COST_LOG, fc);
             return;
         }
     }
@@ -94,6 +177,18 @@ static void slog(VPGuestSvc *svc, const char *format, ...) {
         vfprintf(svc->trace, format, args);
         va_end(args);
     }
+    vp_gxm_frame_cost_category_end(VP_FRAME_COST_LOG, fc);
+}
+
+static VPWorkLogStats svc_work_log_stats;
+#define slog_work_success(svc, success, ...) do { \
+    if (!(success) || vp_work_log_emit(&svc_work_log_stats, \
+            __atomic_load_n(&vp_engine_work_log_reduce_enabled, __ATOMIC_ACQUIRE))) \
+        slog(svc, __VA_ARGS__); \
+} while (0)
+
+void vp_guest_work_log_stats(VPWorkLogStats *out) {
+    vp_work_log_snapshot(&svc_work_log_stats, out);
 }
 
 /* Closing is the only portable flush of the emulated file layer, so the
@@ -193,7 +288,7 @@ static int gpu_gate_enter(VPGuestSvc *svc) {
  * decoder entry's Session lock and thread/TLS identity and keeps both, so only
  * the actual vp_gxm_* call is timed; the former per-request release/reacquire
  * no longer advances those counters. */
-static int guest_gxm_request(VPGuestSvc *svc,int kind,void *request,uint64_t va) {
+static int guest_gxm_request_impl(VPGuestSvc *svc,int kind,void *request,uint64_t va) {
     uint32_t token[2]={0};
     int on_worker = vp_gxm_worker_is_current();
     int perf = svc_play_perf_enabled();
@@ -239,6 +334,13 @@ static int guest_gxm_request(VPGuestSvc *svc,int kind,void *request,uint64_t va)
     return rc;
 }
 
+static int guest_gxm_request(VPGuestSvc *svc, int kind, void *request, uint64_t va) {
+    uint64_t fc = vp_gxm_frame_cost_category_begin(VP_FRAME_COST_GXM_REQUEST);
+    int rc = guest_gxm_request_impl(svc, kind, request, va);
+    vp_gxm_frame_cost_category_end(VP_FRAME_COST_GXM_REQUEST, fc);
+    return rc;
+}
+
 /* Observation-only command-stream decode state for one GPU channel. The words
  * come from the GPFIFO entries the guest already handed to the loader; nothing
  * here executes a command or touches the GPU. */
@@ -254,6 +356,7 @@ typedef struct {
     uint32_t cbuf_high[VP_GPU_SUBCHANNELS];
     uint32_t cbuf_size[VP_GPU_SUBCHANNELS];
     uint32_t draw_count;
+    unsigned layout_report_entries;
 } VPGpuDecode;
 
 static void vp_gpu_decode_release(void *opaque) {
@@ -1365,6 +1468,10 @@ typedef struct {
     uint64_t va;
     unsigned width,height,format,header,pitch,bh,stamp,swizzle,pins;
     unsigned texture_type,mip_count;
+    /* Upload identity, not just the guest TIC format: RGBA32F is decoded as
+     * either RGBA16F (fragment/legacy) or lossless RG32F (vertex). A cache
+     * hit must never mix those two buffers for the same guest descriptor. */
+    unsigned upload;
     size_t bytes,rgba_bytes;
     uint8_t *raw,*rgba;
     SceUID raw_uid,rgba_uid;
@@ -1461,21 +1568,55 @@ static void texture_asset_dump_maybe(VPGuestSvc *svc, const VPGpuTextureInfo *t,
 }
 
 static int texture_cache_key_matches(const VPTextureCache *c,
-                                     const VPGpuTextureInfo *t,unsigned mips) {
+                                     const VPGpuTextureInfo *t,unsigned mips,
+                                     unsigned upload) {
     return c->raw && c->va==t->va && c->width==t->width && c->height==t->height &&
         c->format==t->format && c->header==t->header && c->pitch==t->pitch &&
         c->bh==t->block_height && c->swizzle==t->swizzle && c->bytes==t->storage &&
-        c->texture_type==t->texture_type && c->mip_count==mips;
+        c->texture_type==t->texture_type && c->mip_count==mips &&
+        c->upload==upload;
 }
 
-static unsigned texture_cache_hint_index(const VPGpuTextureInfo *t,unsigned mips) {
+static unsigned texture_cache_hint_index(const VPGpuTextureInfo *t,unsigned mips,
+                                         unsigned upload) {
     uint64_t k=t->va;
     k^=(uint64_t)t->width<<17;k^=(uint64_t)t->height<<34;
     k^=(uint64_t)t->format<<7;k^=(uint64_t)t->header<<3;
     k^=(uint64_t)t->pitch<<45;k^=(uint64_t)t->block_height<<24;
     k^=(uint64_t)t->swizzle<<11;k^=(uint64_t)t->storage<<28;
     k^=(uint64_t)t->texture_type<<55;k^=(uint64_t)mips<<38;
+    k^=(uint64_t)upload<<3;
     return (unsigned)((k^(k>>32)^(k>>17))&(VP_TEXTURE_CACHE_HINTS-1u));
+}
+
+/* Vertex-only upload selection. RGBA32F uses the lossless RG32F split; the
+ * measured contract is checked here so no unsupported sampler or layout falls
+ * back to the lossy fragment representation. Other formats, including the
+ * native Alpha8 identity, keep the shared decode identity and must never be
+ * routed into the RGBA32F split below. */
+static unsigned texture_vertex_upload_format(const VPGpuTextureInfo *t,
+                                             const char **reason) {
+    VPTextureVertexRg32fView view;
+    *reason=NULL;
+    if (t->texture_type==3u) return 0u;
+    if (t->format!=0x01u)
+        return vp_texture_upload_format(t->format,t->swizzle);
+    memset(&view,0,sizeof(view));
+    view.width=t->width;
+    view.height=t->height;
+    view.tic_word0=t->swizzle;
+    view.tic_format=t->format;
+    view.tic_header=t->header;
+    view.texture_type=t->texture_type;
+    view.depth=t->depth;
+    view.block_depth=t->block_depth;
+    view.max_mip_level=t->max_mip_level;
+    view.pitch=t->pitch;
+    view.storage=t->storage;
+    view.sampler[0]=t->sampler[0];
+    view.sampler[1]=t->sampler[1];
+    *reason=vp_texture_vertex_rg32f_check(&view);
+    return *reason != NULL ? 0u : VP_TEXTURE_UPLOAD_RGBA32F_RG32F;
 }
 
 /* Bounded hint probe followed by the original full scan. Return 0 on miss,
@@ -1485,16 +1626,16 @@ static unsigned texture_cache_hint_index(const VPGpuTextureInfo *t,unsigned mips
  * compare is not repeated during the scan, but its position still takes part
  * in that ordering. */
 static int texture_cache_lookup(const VPGpuTextureInfo *t,unsigned mips,
-                                const uint8_t *source,unsigned *hit_index,
-                                unsigned *reuse_index) {
-    unsigned hint=texture_cache_hint[texture_cache_hint_index(t,mips)];
+                                unsigned upload,const uint8_t *source,
+                                unsigned *hit_index,unsigned *reuse_index) {
+    unsigned hint=texture_cache_hint[texture_cache_hint_index(t,mips,upload)];
     unsigned hint_index=hint?hint-1u:~0u;
     int hint_key_match=0;
     int skip_bytes=vp_gxm_texture_skip_bytes_enabled();
     *hit_index=~0u;*reuse_index=~0u;
     if (hint_index<VP_TEXTURE_CACHE_SLOTS) {
         const VPTextureCache *c=&texture_cache[hint_index];
-        if (texture_cache_key_matches(c,t,mips)) {
+        if (texture_cache_key_matches(c,t,mips,upload)) {
             hint_key_match=1;
             if (skip_bytes || vp_texture_bytes_equal(c->raw,source,t->storage)) {
                 if (skip_bytes) texture_skip_hits++;
@@ -1509,7 +1650,7 @@ static int texture_cache_lookup(const VPGpuTextureInfo *t,unsigned mips,
             if (!c->pins && *reuse_index==~0u) *reuse_index=i;
             continue;
         }
-        if (!texture_cache_key_matches(c,t,mips)) continue;
+        if (!texture_cache_key_matches(c,t,mips,upload)) continue;
         if (skip_bytes || vp_texture_bytes_equal(c->raw,source,t->storage)) {
             if (skip_bytes) texture_skip_hits++;
             *hit_index=i;
@@ -1520,7 +1661,26 @@ static int texture_cache_lookup(const VPGpuTextureInfo *t,unsigned mips,
     return 0;
 }
 
-static uint8_t *texture_cached_decode(VPGuestSvc *svc,const VPGpuTextureInfo *t,const uint8_t *source) {
+/* Outer wrapper: the lookup has several early returns, but the span always
+ * closes exactly once around the exact production search. */
+static int texture_cache_lookup_profiled(const VPGpuTextureInfo *t,unsigned mips,
+                                         unsigned upload,const uint8_t *source,
+                                         unsigned *hit_index,
+                                         unsigned *reuse_index) {
+    uint64_t fc = vp_gxm_frame_cost_category_begin(VP_FRAME_COST_TEX_LOOKUP);
+    int found = texture_cache_lookup(t, mips, upload, source, hit_index,
+                                     reuse_index);
+    vp_gxm_frame_cost_category_end(VP_FRAME_COST_TEX_LOOKUP, fc);
+    return found;
+}
+
+enum {
+    VP_TEXTURE_DECODE_FRAGMENT = 0u,
+    VP_TEXTURE_DECODE_VERTEX = 1u
+};
+
+static uint8_t *texture_cached_decode(VPGuestSvc *svc,const VPGpuTextureInfo *t,
+    const uint8_t *source,unsigned decode_kind) {
     VPTextureCache *slot=NULL, *reuse=NULL;
     unsigned hit_index=~0u,reuse_index=~0u;
     uint64_t lookup_started = svc_play_perf_enabled() ? sceKernelGetProcessTimeWide() : 0u;
@@ -1549,6 +1709,24 @@ static uint8_t *texture_cached_decode(VPGuestSvc *svc,const VPGpuTextureInfo *t,
     unsigned mips=t->max_mip_level+1u;
     unsigned upload=cube?0u:vp_texture_upload_format(t->format,t->swizzle);
     int native_bc=t->format==0x27u || t->format==0x28u;
+    if (!cube && decode_kind==VP_TEXTURE_DECODE_VERTEX) {
+        const char *vertex_reason=NULL;
+        unsigned vertex_upload=texture_vertex_upload_format(t,&vertex_reason);
+        if (vertex_reason!=NULL) {
+            static unsigned vertex_format_logs;
+            if (vertex_format_logs++<32u)
+                slog(svc,"VP_TEX_VERTEX_RG32F_REJECT va=0x%llx fmt=%u "
+                     "word0=%08x size=%ux%u header=%u type=%u depth=%u "
+                     "block_d=%u mips=%u pitch=%u storage=%u tsc=%08x,%08x "
+                     "reason=%s\n",(unsigned long long)t->va,t->format,
+                     t->swizzle,t->width,t->height,t->header,t->texture_type,
+                     t->depth,t->block_depth,t->max_mip_level,t->pitch,
+                     (unsigned)t->storage,t->sampler[0],t->sampler[1],
+                     vertex_reason);
+            return NULL;
+        }
+        upload=vertex_upload;
+    }
     if (native_bc && !upload) {
         static unsigned format_refusal_logs;
         if (format_refusal_logs++<32u)
@@ -1562,7 +1740,7 @@ static uint8_t *texture_cached_decode(VPGuestSvc *svc,const VPGpuTextureInfo *t,
         vp_texture_upload_bytes(t->width,t->height,upload);
     if (!t->storage || t->storage+rgba_bytes>VP_TEXTURE_CACHE_BYTES) return NULL;
     {
-        int found=texture_cache_lookup(t,mips,source,&hit_index,&reuse_index);
+        int found=texture_cache_lookup_profiled(t,mips,upload,source,&hit_index,&reuse_index);
         if (found) {
             VPTextureCache *c=&texture_cache[hit_index];
             c->stamp=++texture_cache_stamp;
@@ -1571,7 +1749,7 @@ static uint8_t *texture_cached_decode(VPGuestSvc *svc,const VPGpuTextureInfo *t,
             if (found==1u) texture_hint_hits++;
             /* Only an actual hit establishes a hint; the stored value is a
              * slot index, never a content identity. */
-            texture_cache_hint[texture_cache_hint_index(t,mips)]=(uint8_t)(hit_index+1u);
+            texture_cache_hint[texture_cache_hint_index(t,mips,upload)]=(uint8_t)(hit_index+1u);
             if (lookup_started) texture_lookup_us += sceKernelGetProcessTimeWide()-lookup_started;
             return c->rgba;
         }
@@ -1589,6 +1767,9 @@ static uint8_t *texture_cached_decode(VPGuestSvc *svc,const VPGpuTextureInfo *t,
                  "size=%ux%u detail=base-level-native-blocks\n",
                  (unsigned long long)t->va,t->format,mips,t->width,t->height);
     }
+    uint64_t store_fc = vp_gxm_frame_cost_category_begin(
+        VP_FRAME_COST_TEX_STORE);
+retry_texture_storage:
     if (!reuse) for (;;) {
         slot=NULL;
         for (unsigned i=0;i<VP_TEXTURE_CACHE_SLOTS;i++) {
@@ -1601,12 +1782,16 @@ static uint8_t *texture_cached_decode(VPGuestSvc *svc,const VPGpuTextureInfo *t,
             VPTextureCache *c=&texture_cache[i];
             if (!c->raw || c->pins) continue;
             if (!old || c->stamp<old->stamp) old=c;
-            if (c->bytes==t->storage && c->rgba_bytes==rgba_bytes &&
+            if (c->upload==upload && c->bytes==t->storage &&
+                c->rgba_bytes==rgba_bytes &&
                 (!fit || c->stamp<fit->stamp)) fit=c;
         }
         /* Reuse an existing allocation pair before freeing a different size. */
         if (fit && fit!=old) { old=fit; texture_size_reuses++; }
-        if (!old) return NULL;
+        if (!old) {
+            vp_gxm_frame_cost_category_end(VP_FRAME_COST_TEX_STORE, store_fc);
+            return NULL;
+        }
         texture_evictions++;
         if (old->bytes == t->storage && old->rgba_bytes == rgba_bytes) {
             reuse = old;
@@ -1640,6 +1825,34 @@ static uint8_t *texture_cached_decode(VPGuestSvc *svc,const VPGpuTextureInfo *t,
                     (unsigned)raw_uid,(unsigned)rgba_uid,(unsigned)t->storage,(unsigned)rgba_bytes,(unsigned)texture_cache_bytes);
             if (raw_uid>=0) sceKernelFreeMemBlock(raw_uid);
             if (rgba_uid>=0) sceKernelFreeMemBlock(rgba_uid);
+            /* Kernel pressure can precede the logical cache budget. Retire
+             * one idle allocation before retrying instead of losing a real
+             * texture on a mode switch. Each retry removes one occupied slot
+             * or reuses a fitting pair, so the retry count is bounded. */
+            VPTextureCache *old = NULL, *fit = NULL;
+            for (unsigned i = 0; i < VP_TEXTURE_CACHE_SLOTS; ++i) {
+                VPTextureCache *c = &texture_cache[i];
+                if (!c->raw || c->pins) continue;
+                if (!old || c->stamp < old->stamp) old = c;
+                if (c->bytes == t->storage && c->rgba_bytes == rgba_bytes &&
+                    (!fit || c->stamp < fit->stamp)) fit = c;
+            }
+            if (fit) {
+                reuse = fit;
+                texture_evictions++;
+                texture_size_reuses++;
+                goto retry_texture_storage;
+            }
+            if (old) {
+                texture_cache_bytes -= old->bytes + old->rgba_bytes;
+                vp_gxm_texture_owned_retire(old->rgba);
+                sceKernelFreeMemBlock(old->raw_uid);
+                sceKernelFreeMemBlock(old->rgba_uid);
+                memset(old, 0, sizeof(*old));
+                texture_evictions++;
+                goto retry_texture_storage;
+            }
+            vp_gxm_frame_cost_category_end(VP_FRAME_COST_TEX_STORE, store_fc);
             return NULL;
         }
         texture_allocations++;
@@ -1648,29 +1861,47 @@ static uint8_t *texture_cached_decode(VPGuestSvc *svc,const VPGpuTextureInfo *t,
      * A fresh block has no association; an LRU/same-key reuse must not let the
      * next draw inherit the previous byte proof. */
     if (reuse) vp_gxm_texture_owned_retire(rgba);
+    vp_gxm_frame_cost_category_end(VP_FRAME_COST_TEX_STORE, store_fc);
     /* Decode-family attribution reuses the one existing decode timer; it adds
      * no timer endpoint and no per-draw log. */
     unsigned family;
     if (cube) family=3u;
     else if (upload==VP_TEXTURE_UPLOAD_RGBA16F) family=1u;
+    else if (upload==VP_TEXTURE_UPLOAD_RGBA32F_RG32F) family=4u;
+    else if (vp_texture_mask8_upload(upload)) family=4u;
     else if (upload) family=2u;
     else if (t->format==8u) family=0u;
     else family=4u;
     uint64_t decoded_started = svc_play_perf_enabled() ? sceKernelGetProcessTimeWide() : 0u;
     int rc=-1;
-    if (cube) {
-        rc=vp_texture_cube_rgba(source,t->storage,rgba,rgba_bytes,t->width,t->height,
-                               t->format,t->block_height,mips,t->swizzle);
-    } else if (upload==VP_TEXTURE_UPLOAD_RGBA16F) {
-        if (t->header==2u && t->format==0x01u)
-            rc=vp_texture_rgba32f_pitch_to_rgba16f(source,t->storage,rgba,
+    {
+        uint64_t fc = vp_gxm_frame_cost_category_begin(
+            VP_FRAME_COST_TEX_DECODE);
+        if (cube) {
+            rc=vp_texture_cube_rgba(source,t->storage,rgba,rgba_bytes,t->width,t->height,
+                                   t->format,t->block_height,mips,t->swizzle);
+        } else if (upload==VP_TEXTURE_UPLOAD_RGBA32F_RG32F) {
+            rc=vp_texture_rgba32f_pitch_to_rg32f(source,t->storage,rgba,rgba_bytes,
                 t->width,t->height,t->pitch,t->swizzle);
-    } else if (upload) rc=vp_texture_blocks_linear(source,t->storage,rgba,t->width,t->height,t->format,t->block_height);
-    else if (t->header==2u && t->format==8u) {
-        for (unsigned y=0;y<t->height;y++)
-            memcpy(rgba+(size_t)y*t->width*4u,source+(size_t)y*t->pitch,t->width*4u);
-        rc=0;
-    } else rc=vp_texture_rgba(source,t->storage,rgba,t->width,t->height,t->format,t->block_height);
+        } else if (upload==VP_TEXTURE_UPLOAD_RGBA16F) {
+            if (t->header==2u && t->format==0x01u)
+                rc=vp_texture_rgba32f_pitch_to_rgba16f(source,t->storage,rgba,
+                    t->width,t->height,t->pitch,t->swizzle);
+        } else if (vp_texture_mask8_upload(upload)) {
+            rc=t->header==2u ?
+                vp_texture_alpha8_linear(source,t->storage,rgba,rgba_bytes,
+                    t->width,t->height,t->pitch) :
+                vp_texture_alpha8_untile(source,t->storage,rgba,rgba_bytes,
+                    t->width,t->height,t->format,t->block_height);
+            if (!rc) rc=vp_texture_alpha8_pad_rows(rgba,rgba_bytes,t->width,t->height);
+        } else if (upload) rc=vp_texture_blocks_linear(source,t->storage,rgba,t->width,t->height,t->format,t->block_height);
+        else if (t->header==2u && t->format==8u) {
+            for (unsigned y=0;y<t->height;y++)
+                memcpy(rgba+(size_t)y*t->width*4u,source+(size_t)y*t->pitch,t->width*4u);
+            rc=0;
+        } else rc=vp_texture_rgba(source,t->storage,rgba,t->width,t->height,t->format,t->block_height);
+        vp_gxm_frame_cost_category_end(VP_FRAME_COST_TEX_DECODE, fc);
+    }
     if (decoded_started) {
         uint64_t elapsed=sceKernelGetProcessTimeWide()-decoded_started;
         texture_decoded_us+=elapsed;
@@ -1685,17 +1916,709 @@ static uint8_t *texture_cached_decode(VPGuestSvc *svc,const VPGpuTextureInfo *t,
         sceKernelFreeMemBlock(raw_uid);sceKernelFreeMemBlock(rgba_uid);return NULL;
     }
     uint64_t tail_started = svc_play_perf_enabled() ? sceKernelGetProcessTimeWide() : 0u;
-    if (!upload && !cube) vp_texture_swizzle(rgba,(size_t)t->width*t->height,t->swizzle);
-    memcpy(raw,source,t->storage);
+    {
+        uint64_t fc = vp_gxm_frame_cost_category_begin(VP_FRAME_COST_TEX_TAIL);
+        if (!upload && !cube) vp_texture_swizzle(rgba,(size_t)t->width*t->height,t->swizzle);
+        memcpy(raw,source,t->storage);
+        vp_gxm_frame_cost_category_end(VP_FRAME_COST_TEX_TAIL, fc);
+    }
     if (tail_started) texture_update_tail_us += sceKernelGetProcessTimeWide()-tail_started;
     texture_asset_dump_maybe(svc,t,source);
-    *slot=(VPTextureCache){t->va,t->width,t->height,t->format,t->header,t->pitch,
-        t->block_height,++texture_cache_stamp,t->swizzle,1u,t->texture_type,mips,
-        t->storage,rgba_bytes,raw,rgba,raw_uid,rgba_uid};
+    *slot=(VPTextureCache){.va=t->va,.width=t->width,.height=t->height,
+        .format=t->format,.header=t->header,.pitch=t->pitch,
+        .bh=t->block_height,.stamp=++texture_cache_stamp,.swizzle=t->swizzle,
+        .pins=1u,.texture_type=t->texture_type,.mip_count=mips,.upload=upload,
+        .bytes=t->storage,.rgba_bytes=rgba_bytes,.raw=raw,.rgba=rgba,
+        .raw_uid=raw_uid,.rgba_uid=rgba_uid};
     /* Admitted decode: now the hint may name this slot. */
-    texture_cache_hint[texture_cache_hint_index(t,mips)]=(uint8_t)((unsigned)(slot-texture_cache)+1u);
+    texture_cache_hint[texture_cache_hint_index(t,mips,upload)]=(uint8_t)((unsigned)(slot-texture_cache)+1u);
     if (!reuse) texture_cache_bytes+=t->storage+rgba_bytes;
     return rgba;
+}
+
+/* ---- Deep decoder-owned texture pipeline ---------------------------------
+ *
+ * One bounded 64 MiB region pool replaces the legacy 48 MiB decoder cache plus
+ * its 16 MiB upload cache. The legacy memblock cache
+ * above stays untouched for mode 0 and for non-cache payloads. A pool switch
+ * happens only at a guest submission boundary, after the GXM worker drained
+ * every deferred scene and every direct lease was retired.
+ *
+ * Content identity is still the complete key plus every raw source byte. The
+ * decoded RGBA pointer becomes a GXM backing only through
+ * vp_texture_pool_retain_gpu, which resolves a live slot and returns its
+ * generation; no address range is interpreted as a texture identity. */
+typedef enum {
+    VP_TEX_DECODE_OK = 0,
+    /* The old cache contract does not cover this payload; the legacy malloc
+     * decode (primary slot only) may still try it. */
+    VP_TEX_DECODE_UNSUPPORTED = 1,
+    /* The contract was accepted but decode or pool memory failed. Callers must
+     * not hide this with a second allocation attempt. */
+    VP_TEX_DECODE_FAILED = 2
+} VPTextureDecodeOutcome;
+
+static VPTexturePool deep_texture_pool;
+/* The pool and the single region arena must agree on both the default and the
+ * deep-large experiment ceiling; otherwise one of them would silently become
+ * the effective limit. */
+_Static_assert(VP_TEXTURE_POOL_DEFAULT_BYTES == VP_TEXTURE_REGION_BUDGET,
+               "default texture memory budget mismatch");
+_Static_assert(VP_TEXTURE_POOL_MAX_BYTES == VP_TEXTURE_REGION_MAX_BUDGET,
+               "maximum texture memory budget mismatch");
+/* 0 = not created, 1 = ready, 2 = creation failed and stays failed. */
+static int deep_pool_state;
+static int deep_pipeline_applied;
+/* Applied memory configuration, 0/1/2 as published by the atomic above. */
+static unsigned deep_pipeline_memory_mode;
+static unsigned deep_pipeline_transitions;
+static int deep_decode_error;
+static uint64_t deep_transition_us_total, deep_transition_us_max;
+static uint64_t deep_requests, deep_hits, deep_misses, deep_updates;
+static uint64_t deep_pressure_waits, deep_pressure_failures;
+static uint64_t deep_decode_us_family[5];
+static uint64_t deep_decode_bytes_family[5];
+static uint64_t texture_profile_miss_changed, texture_profile_miss_absent;
+static uint64_t texture_profile_miss_gpu_only, texture_profile_compare_bytes;
+static uint64_t texture_profile_compare_calls;
+static uint64_t deep_direct_retains, deep_direct_releases;
+static uint64_t deep_direct_stale_releases;
+static uint64_t deep_retire_calls;
+
+void vp_texture_direct_fail_submission(void) {
+    deep_decode_error = 1;
+}
+
+static int texture_pipeline_desired(void) {
+    return __atomic_load_n(&vp_engine_texture_pipeline_enabled,
+                           __ATOMIC_ACQUIRE) != 0u;
+}
+
+/* One atomic value selects both the budget and the raw allocation class, so
+ * the worker never applies half of a mode-4/7/8 transition. */
+static unsigned texture_memory_desired(void) {
+    return __atomic_load_n(&vp_engine_texture_memory_mode, __ATOMIC_ACQUIRE);
+}
+
+int vp_texture_direct_active(void) {
+    return deep_pipeline_applied && deep_pool_state == 1;
+}
+
+int vp_texture_direct_compatible(const void *rgba, size_t bytes) {
+    return vp_texture_direct_active() &&
+           vp_texture_pool_owns(&deep_texture_pool, rgba, bytes);
+}
+
+int vp_texture_direct_retain_gpu(const void *rgba, VPTexturePoolToken *token) {
+    if (!vp_texture_direct_active() || rgba == NULL || token == NULL)
+        return 0;
+    if (!vp_texture_pool_retain_gpu(&deep_texture_pool, rgba, token))
+        return 0;
+    deep_direct_retains++;
+    return 1;
+}
+
+void vp_texture_direct_release_gpu(VPTexturePoolToken token) {
+    if (!deep_pipeline_applied) return;
+    if (vp_texture_pool_release_gpu(&deep_texture_pool, token) == 0)
+        deep_direct_releases++;
+    else
+        deep_direct_stale_releases++;
+}
+
+unsigned vp_texture_direct_live_refs(void) {
+    return vp_texture_pool_gpu_refs(&deep_texture_pool);
+}
+
+static void texture_pool_retire(void *user, const void *rgba) {
+    (void)user;
+    deep_retire_calls++;
+    /* The decoder update event must precede any reuse of this allocation. */
+    vp_gxm_texture_owned_retire(rgba);
+}
+
+/* One bounded line with the actual region accounting. The byte values are
+ * allocator/mapped bytes, never the requested experiment budget repeated as
+ * occupancy. Used at both sides of a mode switch; the periodic equivalent is
+ * VP_TEX_MEMORY_METRICS at the 32-present frame-cost endpoint. */
+static void texture_memory_log_config(VPGuestSvc *svc, const char *why,
+                                      int applied, unsigned memory_mode,
+                                      size_t budget, unsigned raw_class) {
+    VPGxmTextureRegionStats regions;
+    SceKernelFreeMemorySizeInfo memory;
+    int memory_rc;
+
+    memset(&regions, 0, sizeof(regions));
+    vp_gxm_texture_region_stats(&regions);
+    memset(&memory, 0, sizeof(memory));
+    memory.size = sizeof(memory);
+    memory_rc = sceKernelGetFreeMemorySize(&memory);
+    slog(svc, "VP_TEX_MEMORY_CONFIG why=%s applied=%d memory_mode=%u "
+         "budget=%u split=%d raw_class=%u decoded_class=%u "
+         "raw_cached=%d raw_mapped=%d decoded_mapped=%d "
+         "raw_cached_bytes=%u raw_cached_alloc_bytes=%u "
+         "decoded_mapped_bytes=%u decoded_mapped_alloc_bytes=%u "
+         "physical_bytes=%u peak_bytes=%u kernel_allocs=%llu kernel_frees=%llu "
+         "live=%u failed=%u user_free_rc=%d user_free=%u cdram_free=%u\n",
+         why, applied, memory_mode, (unsigned)budget,
+         memory_mode == 2u ? 1 : 0, raw_class,
+         VP_TEXTURE_REGION_CLASS_MAPPED,
+         applied && memory_mode == 2u ? 1 : 0,
+         applied && memory_mode != 2u ? 1 : 0,
+         applied ? 1 : 0,
+         (unsigned)regions.cached_physical_bytes,
+         (unsigned)regions.cached_allocated_bytes,
+         (unsigned)regions.mapped_physical_bytes,
+         (unsigned)regions.mapped_allocated_bytes,
+         (unsigned)regions.physical_bytes, (unsigned)regions.peak_bytes,
+         (unsigned long long)regions.kernel_allocs,
+         (unsigned long long)regions.kernel_frees, regions.live, regions.failed,
+         memory_rc, (unsigned)memory.size_user, (unsigned)memory.size_cdram);
+}
+
+/* Deep cache counters all live at the existing statistics cadence; no per-draw
+ * log or timer is added. Decode timing is only sampled when play-perf asks for
+ * timers, matching the legacy cache. */
+static void texture_pool_log_stats(VPGuestSvc *svc, const char *why) {
+    VPTexturePoolStats stats;
+    memset(&stats, 0, sizeof(stats));
+    if (deep_pool_state == 1)
+        vp_texture_pool_stats(&deep_texture_pool, &stats);
+    slog(svc, "VP_TEX_POOL_STATS why=%s applied=%d state=%d transitions=%u "
+         "memory_mode=%u raw_class=%u budget=%u split=%d "
+         "transition_us=%llu transition_max_us=%llu requests=%llu hits=%llu "
+         "misses=%llu updates=%llu pressure_waits=%llu pressure_fail=%llu "
+         "decode_us_rgba8=%llu decode_us_fp16=%llu decode_us_blocks=%llu decode_us_cube=%llu decode_us_other=%llu "
+         "decode_bytes_rgba8=%llu decode_bytes_fp16=%llu decode_bytes_blocks=%llu decode_bytes_cube=%llu decode_bytes_other=%llu "
+         "pool_alloc_map=%llu pool_free_map=%llu evictions=%llu "
+         "size_reuses=%llu live=%u peak=%u used_bytes=%u peak_bytes=%u "
+         "free_runs=%u largest_free=%u gpu_refs=%u cpu_pins=%u "
+         "retire_calls=%llu pressure_events=%llu nomem_events=%llu "
+         "direct_retains=%llu direct_releases=%llu direct_stale=%llu "
+         "refs_live=%u raw_reclaims=%llu raw_reclaimed_bytes=%llu\n",
+         why, deep_pipeline_applied, deep_pool_state, deep_pipeline_transitions,
+         deep_pipeline_memory_mode, stats.raw_class,
+         (unsigned)stats.budget_bytes, deep_pipeline_memory_mode == 2u ? 1 : 0,
+         (unsigned long long)deep_transition_us_total,
+         (unsigned long long)deep_transition_us_max,
+         (unsigned long long)deep_requests, (unsigned long long)deep_hits,
+         (unsigned long long)deep_misses, (unsigned long long)deep_updates,
+         (unsigned long long)deep_pressure_waits,
+         (unsigned long long)deep_pressure_failures,
+         (unsigned long long)deep_decode_us_family[0],
+         (unsigned long long)deep_decode_us_family[1],
+         (unsigned long long)deep_decode_us_family[2],
+         (unsigned long long)deep_decode_us_family[3],
+         (unsigned long long)deep_decode_us_family[4],
+         (unsigned long long)deep_decode_bytes_family[0],
+         (unsigned long long)deep_decode_bytes_family[1],
+         (unsigned long long)deep_decode_bytes_family[2],
+         (unsigned long long)deep_decode_bytes_family[3],
+         (unsigned long long)deep_decode_bytes_family[4],
+         (unsigned long long)stats.alloc_map_calls,
+         (unsigned long long)stats.free_map_calls,
+         (unsigned long long)stats.evictions,
+         (unsigned long long)stats.size_reuses, stats.live_slots,
+         stats.peak_live_slots, (unsigned)stats.used_bytes,
+         (unsigned)stats.peak_used_bytes, stats.free_runs,
+         (unsigned)stats.largest_free_run_bytes, stats.gpu_refs,
+         stats.cpu_pins, (unsigned long long)stats.retire_calls,
+         (unsigned long long)stats.pressure_events,
+         (unsigned long long)stats.nomem_events,
+         (unsigned long long)deep_direct_retains,
+         (unsigned long long)deep_direct_releases,
+         (unsigned long long)deep_direct_stale_releases,
+         vp_texture_pool_gpu_refs(&deep_texture_pool),
+         (unsigned long long)stats.raw_reclaims,
+         (unsigned long long)stats.raw_reclaimed_bytes);
+}
+
+/* Free the legacy cache and drop its GXM associations. Safe at a submission
+ * boundary after the worker drained every scene. */
+static void texture_cache_release_all(VPGuestSvc *svc) {
+    unsigned released = 0u;
+    for (unsigned i = 0; i < VP_TEXTURE_CACHE_SLOTS; ++i) {
+        VPTextureCache *c = &texture_cache[i];
+        if (!c->raw && !c->rgba) continue;
+        if (c->rgba != NULL) vp_gxm_texture_owned_retire(c->rgba);
+        if (c->raw_uid >= 0) sceKernelFreeMemBlock(c->raw_uid);
+        if (c->rgba_uid >= 0) sceKernelFreeMemBlock(c->rgba_uid);
+        memset(c, 0, sizeof(*c));
+        released++;
+    }
+    memset(texture_cache_hint, 0, sizeof(texture_cache_hint));
+    texture_cache_bytes = 0u;
+    if (released != 0u)
+        slog(svc, "VP_TEX_CACHE_RELEASE slots=%u detail=mode-switch\n",
+             released);
+}
+
+static void texture_pipeline_switch_cb(void *opaque);
+
+typedef struct {
+    VPGuestSvc *svc;
+    int rc;
+} VPTexturePipelineSwitch;
+
+/* Must run on the GXM worker. The caller is a submission boundary: all scenes
+ * are drained, no draw is being prepared and no direct lease is consumed.
+ * Mode 4/7/8 share this path; a memory-configuration change alone still tears
+ * down every pool page and region before the new budget/class is configured. */
+static int texture_pipeline_switch_worker(VPGuestSvc *svc) {
+    uint64_t started = sceKernelGetProcessTimeWide();
+    unsigned long long transition_us;
+    int target = texture_pipeline_desired();
+    unsigned memory_mode = target ? texture_memory_desired() : 0u;
+    size_t budget = memory_mode == 1u ? VP_TEXTURE_POOL_MAX_BYTES :
+        VP_TEXTURE_POOL_DEFAULT_BYTES;
+    unsigned raw_class = memory_mode == 2u ?
+        VP_TEXTURE_REGION_CLASS_CPU_CACHED : VP_TEXTURE_REGION_CLASS_MAPPED;
+    int rc;
+
+    if (target && memory_mode > 2u) {
+        slog(svc, "VP_TEX_POOL_MODE_FAIL target=deep memory_mode=%u "
+             "reason=invalid-config action=keep-current\n", memory_mode);
+        return -1;
+    }
+    /* Capture the outgoing phase's pool counters before teardown; init on the
+     * next deep activation resets the pool-local peak/live values. */
+    if (deep_pipeline_applied) {
+        texture_memory_log_config(svc, "switch-before", deep_pipeline_applied,
+            deep_pipeline_memory_mode,
+            deep_pool_state == 1 ? deep_texture_pool.bytes : 0u,
+            deep_texture_pool.raw_class);
+        texture_pool_log_stats(svc, "mode-switch-before");
+    }
+    rc = vp_gxm_texture_pipeline_reclaim();
+    if (rc < 0) {
+        slog(svc, "VP_TEX_POOL_MODE_FAIL target=%s memory_mode=%u rc=%d "
+             "action=keep-current\n", target ? "deep" : "normal",
+             memory_mode, rc);
+        return rc;
+    }
+    for (unsigned i = 0; i < VP_TEXTURE_CACHE_SLOTS; ++i)
+        texture_cache[i].pins = 0u;
+    vp_texture_pool_begin_request(&deep_texture_pool);
+    if (deep_pipeline_applied) {
+        if (deep_pool_state == 1) {
+            if (vp_texture_pool_gpu_refs(&deep_texture_pool) != 0u) {
+                slog(svc, "VP_TEX_POOL_MODE_FAIL target=%s memory_mode=%u "
+                     "refs=%u action=keep-current\n", target ? "deep" : "normal",
+                     memory_mode, vp_texture_pool_gpu_refs(&deep_texture_pool));
+                return -1;
+            }
+            if (vp_texture_pool_reset(&deep_texture_pool) < 0) {
+                slog(svc, "VP_TEX_POOL_MODE_FAIL target=%s memory_mode=%u "
+                     "reason=reset\n", target ? "deep" : "normal", memory_mode);
+                return -1;
+            }
+            if (vp_gxm_texture_regions_reset() < 0) return -1;
+        }
+        deep_pool_state = 0;
+    } else {
+        texture_cache_release_all(svc);
+    }
+    if (target && vp_gxm_texture_copy_cache_reset() < 0) return -1;
+    vp_gxm_texture_descriptor_cache_reset();
+    {
+        SceKernelFreeMemorySizeInfo memory;
+        memset(&memory, 0, sizeof(memory));
+        memory.size = sizeof(memory);
+        int memory_rc = sceKernelGetFreeMemorySize(&memory);
+        slog(svc, "VP_TEX_POOL_MEMORY target=%s phase=after-cleanup rc=%d "
+             "memory_mode=%u budget=%u split=%d raw_class=%u "
+             "user_free=%u cdram_free=%u\n", target ? "deep" : "normal",
+             memory_rc, memory_mode, (unsigned)budget,
+             memory_mode == 2u ? 1 : 0, raw_class,
+             (unsigned)memory.size_user, (unsigned)memory.size_cdram);
+    }
+    if (target) {
+        int region_rc = vp_gxm_texture_regions_init(budget);
+        if (region_rc < 0) {
+            slog(svc, "VP_TEX_POOL_MODE_FAIL target=deep memory_mode=%u "
+                 "budget=%u reason=region-init rc=%d\n",
+                 memory_mode, (unsigned)budget, region_rc);
+            return region_rc;
+        }
+        int alloc_rc = vp_texture_pool_init_regions(&deep_texture_pool, budget,
+            raw_class, NULL, vp_gxm_texture_region_create,
+            vp_gxm_texture_region_release);
+        if (alloc_rc < 0) return alloc_rc;
+        vp_texture_pool_set_retire(&deep_texture_pool, texture_pool_retire, NULL);
+        deep_pool_state = 1;
+    }
+
+    deep_pipeline_applied = target;
+    deep_pipeline_memory_mode = target ? memory_mode : 0u;
+    deep_pipeline_transitions++;
+    transition_us = (unsigned long long)(sceKernelGetProcessTimeWide() - started);
+    deep_transition_us_total += transition_us;
+    if (transition_us > deep_transition_us_max)
+        deep_transition_us_max = transition_us;
+    slog(svc, "VP_TEX_POOL_MODE mode=%s transition=%u transition_us=%llu "
+         "pool_state=%d bytes=%u memory_mode=%u budget=%u split=%d "
+         "raw_class=%u refs=%u detail=worker-boundary\n",
+         target ? "deep" : "normal", deep_pipeline_transitions, transition_us,
+         deep_pool_state, target ? (unsigned)budget : 0u,
+         deep_pipeline_memory_mode, target ? (unsigned)budget : 0u,
+         deep_pipeline_memory_mode == 2u ? 1 : 0, raw_class,
+         vp_texture_pool_gpu_refs(&deep_texture_pool));
+    texture_pool_log_stats(svc, "mode-transition");
+    texture_memory_log_config(svc, "switch-after", deep_pipeline_applied,
+        deep_pipeline_memory_mode, target ? budget : 0u, raw_class);
+    return 0;
+}
+
+static void texture_pipeline_switch_cb(void *opaque) {
+    VPTexturePipelineSwitch *work = (VPTexturePipelineSwitch *)opaque;
+    work->rc = texture_pipeline_switch_worker(work->svc);
+}
+
+/* Called once per decoded GPU submission, before any draw of that submission
+ * is prepared. The host-side root poll only publishes the desired atomics; the
+ * actual cache teardown and pool creation happen here on the GXM worker. A
+ * memory-only change (4 <-> 7/8) must switch even when the deep flag itself
+ * did not change. */
+static int texture_pipeline_apply_pending(VPGuestSvc *svc) {
+    int desired = texture_pipeline_desired();
+    unsigned memory_mode = desired ? texture_memory_desired() : 0u;
+    int rc;
+    if (desired && memory_mode > 2u) {
+        slog(svc, "VP_TEX_POOL_MODE_FAIL target=deep memory_mode=%u "
+             "reason=invalid-config action=reject\n", memory_mode);
+        return -1;
+    }
+    if (desired == deep_pipeline_applied &&
+        (!desired || memory_mode == deep_pipeline_memory_mode)) return 0;
+    if (vp_gxm_worker_is_current())
+        return texture_pipeline_switch_worker(svc);
+    {
+        VPTexturePipelineSwitch work = { svc, 0 };
+        rc = vp_gxm_worker_execute(texture_pipeline_switch_cb, &work);
+        if (rc < 0) return rc;
+        return work.rc;
+    }
+}
+
+/* Pool lookup wrapper: one span around the full key plus every raw byte
+ * comparison, regardless of which internal early return is taken. */
+static int texture_pool_lookup_profiled(VPGuestSvc *svc, const VPTexturePoolKey *key,
+                                        const uint8_t *source, size_t bytes,
+                                        VPTexturePoolToken *token,
+                                        uint8_t **rgba, size_t output_bytes) {
+    uint64_t fc = vp_gxm_frame_cost_category_begin(VP_FRAME_COST_TEX_LOOKUP);
+    VPTexturePoolLookupTrace trace;
+    int found = vp_texture_pool_lookup_trace(&deep_texture_pool, key, source, bytes,
+                                            token, rgba, fc ? &trace : NULL);
+    vp_gxm_frame_cost_category_end(VP_FRAME_COST_TEX_LOOKUP, fc);
+    if (fc) {
+        texture_profile_compare_bytes += trace.compare_bytes;
+        texture_profile_compare_calls += trace.comparisons;
+        if (!found) {
+            if (trace.changed) texture_profile_miss_changed++;
+            else if (trace.gpu_only_keys) texture_profile_miss_gpu_only++;
+            else texture_profile_miss_absent++;
+        }
+        uint64_t frame;
+        if (vp_gxm_frame_cost_resource_audit(&frame))
+            slog(svc, "VP_FRAME_RESOURCE frame=%llu key=%llx,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u "
+                "raw_bytes=%u output_bytes=%u hit=%d changed=%llu live_keys=%llu gpu_only=%llu\n",
+                (unsigned long long)frame, (unsigned long long)key->va, key->width, key->height,
+                key->format, key->header, key->pitch, key->block_height, key->swizzle,
+                key->texture_type, key->mip_count, key->upload, (unsigned)bytes,
+                (unsigned)output_bytes, found, (unsigned long long)trace.changed,
+                (unsigned long long)trace.live_keys, (unsigned long long)trace.gpu_only_keys);
+    }
+    return found;
+}
+
+/* Reserve/retry wrapper. The pressure drain and its single retry stay inside
+ * one store span; *reclaim_failed reports the original pressure-drain failure
+ * so the caller keeps its exact error path and logging. */
+static int texture_pool_store_profiled(const VPTexturePoolKey *key,
+                                       size_t raw_bytes, size_t rgba_bytes,
+                                       VPTexturePoolToken *token,
+                                       uint8_t **raw, uint8_t **rgba,
+                                       int *reused, int *pressure_waited,
+                                       int *reclaim_failed) {
+    int rc;
+    uint64_t fc = vp_gxm_frame_cost_category_begin(VP_FRAME_COST_TEX_STORE);
+    *pressure_waited = 0;
+    *reclaim_failed = 0;
+    deep_texture_pool.idle_resize = __atomic_load_n(
+        &vp_engine_texture_idle_resize_enabled, __ATOMIC_ACQUIRE);
+    rc = vp_texture_pool_begin_store(&deep_texture_pool, key, raw_bytes,
+                                     rgba_bytes, token, raw, rgba, reused);
+    if (rc == VP_TEXTURE_POOL_STORE_PRESSURE) {
+        *pressure_waited = 1;
+        deep_pressure_waits++;
+        if (vp_gxm_texture_pipeline_reclaim() < 0) {
+            deep_pressure_failures++;
+            *reclaim_failed = 1;
+        } else {
+            rc = vp_texture_pool_begin_store(&deep_texture_pool, key, raw_bytes,
+                                             rgba_bytes, token, raw, rgba,
+                                             reused);
+        }
+    }
+    vp_gxm_frame_cost_category_end(VP_FRAME_COST_TEX_STORE, fc);
+    return rc;
+}
+
+static uint8_t *texture_pool_decode(VPGuestSvc *svc, const VPGpuTextureInfo *t,
+                                    const uint8_t *source,
+                                    unsigned decode_kind,
+                                    VPTextureDecodeOutcome *outcome) {
+    VPTexturePoolKey key;
+    VPTexturePoolToken token = {0u, 0u};
+    uint8_t *raw = NULL, *rgba = NULL;
+    size_t rgba_bytes;
+    unsigned mips, upload, family = 4u;
+    int cube, native_bc, reused = 0, rc, decode_rc = -1;
+    uint64_t started = 0u;
+    uint64_t lookup_started = svc_play_perf_enabled() ? sceKernelGetProcessTimeWide() : 0u;
+
+    *outcome = VP_TEX_DECODE_UNSUPPORTED;
+    if (deep_pool_state != 1) {
+        static unsigned pool_fail_logs;
+        if (pool_fail_logs++ < 8u)
+            slog(svc, "VP_TEX_POOL_UNAVAILABLE state=%d "
+                 "action=decode-fail-no-fallback\n", deep_pool_state);
+        *outcome = VP_TEX_DECODE_FAILED;
+        return NULL;
+    }
+    cube = t->texture_type == 3u;
+    mips = t->max_mip_level + 1u;
+    upload = cube ? 0u : vp_texture_upload_format(t->format, t->swizzle);
+    native_bc = t->format == 0x27u || t->format == 0x28u;
+    if (!cube && decode_kind == VP_TEXTURE_DECODE_VERTEX) {
+        const char *vertex_reason = NULL;
+        unsigned vertex_upload =
+            texture_vertex_upload_format(t, &vertex_reason);
+        if (vertex_reason != NULL) {
+            static unsigned vertex_format_logs;
+            if (vertex_format_logs++ < 32u)
+                slog(svc, "VP_TEX_VERTEX_RG32F_REJECT va=0x%llx fmt=%u "
+                     "word0=%08x size=%ux%u header=%u type=%u depth=%u "
+                     "block_d=%u mips=%u pitch=%u storage=%u tsc=%08x,%08x "
+                     "reason=%s\n", (unsigned long long)t->va, t->format,
+                     t->swizzle, t->width, t->height, t->header,
+                     t->texture_type, t->depth, t->block_depth,
+                     t->max_mip_level, t->pitch, (unsigned)t->storage,
+                     t->sampler[0], t->sampler[1], vertex_reason);
+            return NULL;
+        }
+        upload = vertex_upload;
+    }
+    if (native_bc && !upload) {
+        static unsigned format_refusal_logs;
+        if (format_refusal_logs++ < 32u)
+            slog(svc, "VP_TEX_FORMAT_UNSUPPORTED va=0x%llx fmt=%u word0=%08x "
+                 "size=%ux%u type=%u depth=%u block_d=%u "
+                 "detail=bc-swizzle-or-type\n", (unsigned long long)t->va,
+                 t->format, t->swizzle, t->width, t->height, t->texture_type,
+                 t->depth, t->block_depth);
+        return NULL;
+    }
+    rgba_bytes = cube ? vp_texture_cube_upload_bytes_mips(t->width, t->height,
+                                                         mips)
+                      : vp_texture_upload_bytes(t->width, t->height, upload);
+    {
+        /* The active pool's own budget is the request ceiling. It is 64 MiB
+         * by default and 128 MiB only after an explicit deep-large switch. */
+        size_t pool_cap = deep_texture_pool.bytes;
+        if (!t->storage || rgba_bytes == 0u ||
+            t->storage > pool_cap ||
+            rgba_bytes > pool_cap - t->storage) {
+            slog(svc, "VP_TEX_POOL_MEMORY_FAIL va=0x%llx raw=%u rgba=%u cap=%u "
+                 "detail=request-exceeds-pool\n", (unsigned long long)t->va,
+                 (unsigned)t->storage, (unsigned)rgba_bytes, (unsigned)pool_cap);
+            *outcome = VP_TEX_DECODE_FAILED;
+            return NULL;
+        }
+    }
+    memset(&key, 0, sizeof(key));
+    key.va = t->va;
+    key.width = t->width;
+    key.height = t->height;
+    key.format = t->format;
+    key.header = t->header;
+    key.pitch = t->pitch;
+    key.block_height = t->block_height;
+    key.swizzle = t->swizzle;
+    key.texture_type = t->texture_type;
+    key.mip_count = mips;
+    key.upload = upload;
+    deep_requests++;
+    texture_requests++;
+    if ((deep_requests & 511u) == 0u)
+        texture_pool_log_stats(svc, "periodic");
+    if (texture_pool_lookup_profiled(svc, &key, source, t->storage, &token, &rgba, rgba_bytes)) {
+        deep_hits++;
+        texture_hits++;
+        if (lookup_started) texture_lookup_us += sceKernelGetProcessTimeWide() - lookup_started;
+        *outcome = VP_TEX_DECODE_OK;
+        return rgba;
+    }
+    deep_misses++;
+    texture_misses++;
+    if (lookup_started) texture_lookup_us += sceKernelGetProcessTimeWide() - lookup_started;
+    {
+        int pressure_waited = 0, reclaim_failed = 0;
+        rc = texture_pool_store_profiled(&key, t->storage, rgba_bytes, &token,
+                                         &raw, &rgba, &reused, &pressure_waited,
+                                         &reclaim_failed);
+        (void)pressure_waited;
+        if (reclaim_failed) {
+            slog(svc, "VP_TEX_POOL_MEMORY_FAIL va=0x%llx raw=%u rgba=%u "
+                 "detail=pressure-drain-failed\n", (unsigned long long)t->va,
+                 (unsigned)t->storage, (unsigned)rgba_bytes);
+            *outcome = VP_TEX_DECODE_FAILED;
+            return NULL;
+        }
+    }
+    if (rc != VP_TEXTURE_POOL_STORE_OK) {
+        deep_pressure_failures++;
+        slog(svc, "VP_TEX_POOL_MEMORY_FAIL va=0x%llx raw=%u rgba=%u rc=%d "
+             "detail=no-safe-slot\n", (unsigned long long)t->va,
+             (unsigned)t->storage, (unsigned)rgba_bytes, rc);
+        *outcome = VP_TEX_DECODE_FAILED;
+        return NULL;
+    }
+    if (cube) family = 3u;
+    else if (upload == VP_TEXTURE_UPLOAD_RGBA16F) family = 1u;
+    else if (upload == VP_TEXTURE_UPLOAD_RGBA32F_RG32F) family = 4u;
+    else if (vp_texture_mask8_upload(upload)) family = 4u;
+    else if (upload) family = 2u;
+    else if (t->format == 8u) family = 0u;
+    if (svc_play_perf_enabled()) started = sceKernelGetProcessTimeWide();
+    {
+        uint64_t fc = vp_gxm_frame_cost_category_begin(
+            VP_FRAME_COST_TEX_DECODE);
+        if (cube) {
+            decode_rc = vp_texture_cube_rgba(source, t->storage, rgba, rgba_bytes,
+                                             t->width, t->height, t->format,
+                                             t->block_height, mips, t->swizzle);
+        } else if (upload == VP_TEXTURE_UPLOAD_RGBA32F_RG32F) {
+            decode_rc = vp_texture_rgba32f_pitch_to_rg32f(
+                source, t->storage, rgba, rgba_bytes, t->width, t->height,
+                t->pitch, t->swizzle);
+        } else if (upload == VP_TEXTURE_UPLOAD_RGBA16F) {
+            if (t->header == 2u && t->format == 0x01u)
+                decode_rc = vp_texture_rgba32f_pitch_to_rgba16f(
+                    source, t->storage, rgba, t->width, t->height, t->pitch,
+                    t->swizzle);
+        } else if (vp_texture_mask8_upload(upload)) {
+            decode_rc = t->header == 2u
+                ? vp_texture_alpha8_linear(source, t->storage, rgba, rgba_bytes,
+                                           t->width, t->height, t->pitch)
+                : vp_texture_alpha8_untile(source, t->storage, rgba,
+                                           rgba_bytes, t->width, t->height,
+                                           t->format, t->block_height);
+            if (!decode_rc) decode_rc=vp_texture_alpha8_pad_rows(
+                rgba,rgba_bytes,t->width,t->height);
+        } else if (upload) {
+            decode_rc = vp_texture_blocks_linear(source, t->storage, rgba,
+                                                 t->width, t->height, t->format,
+                                                 t->block_height);
+        } else if (t->header == 2u && t->format == 8u) {
+            decode_rc = vp_texture_rgba8_linear_swizzle(
+                source, t->storage, rgba, t->width, t->height, t->pitch,
+                t->swizzle);
+        } else if (t->format == 8u) {
+            decode_rc = vp_texture_rgba8_untile_swizzle(
+                source, t->storage, rgba, t->width, t->height, t->block_height,
+                t->swizzle);
+        } else {
+            /* Other CPU layouts (U8/R16) keep the reviewed decoder and its
+             * separate selector pass byte-for-byte. */
+            decode_rc = vp_texture_rgba(source, t->storage, rgba, t->width,
+                                        t->height, t->format, t->block_height);
+            if (decode_rc == 0)
+                vp_texture_swizzle(rgba, (size_t)t->width * t->height,
+                                   t->swizzle);
+        }
+        vp_gxm_frame_cost_category_end(VP_FRAME_COST_TEX_DECODE, fc);
+    }
+    if (started != 0u) {
+        uint64_t elapsed = sceKernelGetProcessTimeWide() - started;
+        deep_decode_us_family[family] += elapsed;
+        texture_decoded_us += elapsed;
+        if (family == 0u) texture_decode_us_rgba8 += elapsed;
+        else if (family == 1u) texture_decode_us_fp16 += elapsed;
+        else if (family == 2u) texture_decode_us_blocks += elapsed;
+        else if (family == 3u) texture_decode_us_cube += elapsed;
+        else texture_decode_us_other += elapsed;
+    }
+    if (decode_rc != 0) {
+        vp_texture_pool_abort_store(&deep_texture_pool, token);
+        {
+            static unsigned decode_fail_logs;
+            if (decode_fail_logs++ < 16u)
+                slog(svc, "VP_TEX_POOL_DECODE_FAIL va=0x%llx fmt=%u "
+                     "header=%u size=%ux%u storage=%u upload=%u rc=%d\n",
+                     (unsigned long long)t->va, t->format, t->header,
+                     t->width, t->height, (unsigned)t->storage, upload,
+                     decode_rc);
+        }
+        *outcome = VP_TEX_DECODE_FAILED;
+        return NULL;
+    }
+    uint64_t tail_started = svc_play_perf_enabled() ? sceKernelGetProcessTimeWide() : 0u;
+    {
+        uint64_t fc = vp_gxm_frame_cost_category_begin(VP_FRAME_COST_TEX_TAIL);
+        int commit_rc = vp_texture_pool_commit_store(&deep_texture_pool, token,
+                                                     &key, source, t->storage);
+        vp_gxm_frame_cost_category_end(VP_FRAME_COST_TEX_TAIL, fc);
+        if (commit_rc != 0) {
+            vp_texture_pool_abort_store(&deep_texture_pool, token);
+            slog(svc, "VP_TEX_POOL_MEMORY_FAIL va=0x%llx detail=commit-failed\n",
+                 (unsigned long long)t->va);
+            *outcome = VP_TEX_DECODE_FAILED;
+            return NULL;
+        }
+    }
+    if (tail_started) texture_update_tail_us += sceKernelGetProcessTimeWide() - tail_started;
+    deep_updates++;
+    texture_updates++;
+    deep_decode_bytes_family[family] += rgba_bytes;
+    texture_asset_dump_maybe(svc, t, source);
+    *outcome = VP_TEX_DECODE_OK;
+    return rgba;
+}
+
+/* Single dispatch point for the three texture consumers. Legacy mode keeps
+ * the exact old function and its fallback semantics; deep mode never falls
+ * back to a second backing allocation on pool/decode failure. */
+static int frame_record_mode_active(void);
+static uint8_t *texture_decode_any(VPGuestSvc *svc, const VPGpuTextureInfo *t,
+                                   const uint8_t *source, unsigned decode_kind,
+                                   VPTextureDecodeOutcome *outcome) {
+    if (deep_pipeline_applied) {
+        /* The one-frame inventory diagnostic executes recorded draws after
+         * the submission completed, so a cached payload could be evicted
+         * between recording and replay. It never used the legacy cache for
+         * primary/extra payloads either; refuse the unguarded vertex borrow
+         * here instead of handing it a payload the pool may already reuse. */
+        if (frame_record_mode_active()) {
+            static unsigned record_bypass_logs;
+            if (record_bypass_logs++ < 8u)
+                slog(svc, "VP_TEX_POOL_RECORD_BYPASS stage=%s "
+                     "action=no-borrow\n",
+                     decode_kind == VP_TEXTURE_DECODE_VERTEX ? "vertex" :
+                                                               "fragment");
+            *outcome = VP_TEX_DECODE_UNSUPPORTED;
+            return NULL;
+        }
+        uint8_t *result = texture_pool_decode(svc, t, source, decode_kind, outcome);
+        if (*outcome == VP_TEX_DECODE_FAILED) deep_decode_error = 1;
+        return result;
+    }
+    {
+        uint8_t *rgba = texture_cached_decode(svc, t, source, decode_kind);
+        *outcome = rgba != NULL ? VP_TEX_DECODE_OK : VP_TEX_DECODE_UNSUPPORTED;
+        return rgba;
+    }
 }
 
 void vp_guest_frame_perf(VPGuestFramePerf *out) {
@@ -1731,6 +2654,39 @@ void vp_guest_frame_perf(VPGuestFramePerf *out) {
     out->tex_decode_us = texture_decoded_us;
     out->tex_lookup_us = texture_lookup_us;
     out->tex_update_tail_us = texture_update_tail_us;
+    out->tex_miss_changed = texture_profile_miss_changed;
+    out->tex_miss_absent = texture_profile_miss_absent;
+    out->tex_miss_gpu_only = texture_profile_miss_gpu_only;
+    out->tex_compare_bytes = texture_profile_compare_bytes;
+    out->tex_compare_calls = texture_profile_compare_calls;
+    for (unsigned i = 0; i < 5u; ++i) {
+        out->tex_family_us[i] = deep_decode_us_family[i];
+        out->tex_family_bytes[i] = deep_decode_bytes_family[i];
+    }
+}
+
+void vp_guest_texture_memory_perf(VPGuestTextureMemoryPerf *out) {
+    VPTexturePoolStats stats;
+    if (out == NULL) return;
+    memset(out, 0, sizeof(*out));
+    memset(&stats, 0, sizeof(stats));
+    if (deep_pool_state == 1)
+        vp_texture_pool_stats(&deep_texture_pool, &stats);
+    out->applied = deep_pipeline_applied;
+    out->memory_mode = deep_pipeline_applied ? deep_pipeline_memory_mode : 0u;
+    out->raw_class = stats.raw_class;
+    out->budget_bytes = stats.budget_bytes;
+    out->used_bytes = stats.used_bytes;
+    out->peak_used_bytes = stats.peak_used_bytes;
+    out->live_slots = stats.live_slots;
+    out->peak_live_slots = stats.peak_live_slots;
+    out->gpu_refs = stats.gpu_refs;
+    out->cpu_pins = stats.cpu_pins;
+    out->evictions = stats.evictions;
+    out->pressure_events = stats.pressure_events;
+    out->nomem_events = stats.nomem_events;
+    out->alloc_map_calls = stats.alloc_map_calls;
+    out->free_map_calls = stats.free_map_calls;
 }
 
 
@@ -1782,6 +2738,8 @@ static void parse_texture_layout(const uint32_t hw[8], VPGpuTextureInfo *out) {
             out->storage=out->pitch*out->height;
         else if (out->format==0x01u && out->pitch>=out->width*16u)
             out->storage=out->pitch*out->height;
+        else if (out->format==0x1du && out->pitch>=out->width)
+            out->storage=(size_t)out->pitch*out->height;
     }
     out->ok = 1;
 }
@@ -1864,6 +2822,40 @@ static int resolve_draw_texture_at_stage(const VPGpuSendContext *ctx,
             memcpy(out->sampler, out->tsc, sizeof(out->sampler));
         }
     }
+    if (vp_guest_pixel_font_enabled() &&
+        ((out->width==1024u && out->height==1024u) ||
+         vp_pixel_font_lookup(pixel_fonts,out->va,out->width,out->height))) {
+        static unsigned font_view_logs;
+        if (font_view_logs++<32u)
+            slog(ctx->svc,"PIXEL_FONT_VIEW va=0x%llx registered=%u word0=%08x "
+                "type=%u depth=%u mips=%u storage=%u sampler=%08x,%08x\n",
+                (unsigned long long)out->va,
+                vp_pixel_font_lookup(pixel_fonts,out->va,out->width,out->height),
+                out->swizzle,out->texture_type,out->depth,out->max_mip_level,
+                (unsigned)out->storage,out->sampler[0],out->sampler[1]);
+    }
+    if (vp_guest_pixel_font_enabled() &&
+        vp_pixel_font_lookup(pixel_fonts,out->va,out->width,out->height)) {
+        if (out->format!=0x1du || ((out->swizzle>>7)&0xfffu)!=0x492u ||
+            out->texture_type!=1u || out->depth!=1u || out->max_mip_level ||
+            out->block_depth || !out->storage) {
+            slog(ctx->svc,"PIXEL_FONT_VIEW_REJECT va=0x%llx fmt=%u type=%u depth=%u mips=%u\n",
+                (unsigned long long)out->va,out->format,out->texture_type,out->depth,out->max_mip_level);
+            return -5;
+        }
+        /* Keep raw TIC/TSC evidence intact. Only the effective sampling view
+         * of a registered, native R8 font becomes (1,1,1,R), point, no mips. */
+        if (out->width==1024u && out->height==1024u)
+            out->swizzle=(out->swizzle&~(0xfffu<<19))|(0x5ffu<<19);
+        static unsigned font_bind_logs;
+        if (font_bind_logs++<16u)
+            slog(ctx->svc,"PIXEL_FONT_BIND va=0x%llx raw=%08x effective=%08x upload=0x%x bytes=%u\n",
+                (unsigned long long)out->va,out->tic[0],out->swizzle,
+                vp_texture_upload_format(out->format,out->swizzle),
+                (unsigned)vp_texture_upload_bytes(out->width,out->height,
+                    vp_texture_upload_format(out->format,out->swizzle)));
+        out->sampler[1]=(out->sampler[1]&~0xf3u)|0x11u;
+    }
     if (!out->storage) {
         static unsigned texture_layout_logs;
         if (texture_layout_logs<64u && out->format!=0x29u) {
@@ -1927,6 +2919,9 @@ static int frame_at_mode;
 static int frame_at_selected;
 static uint32_t frame_at_ms;
 static int frame_done;
+static int frame_record_mode_active(void) {
+    return frame_auto && !frame_done;
+}
 static uint32_t frame_submission_seen[8];
 static unsigned frame_submission_draws[8];
 
@@ -2242,7 +3237,7 @@ static void frame_depth_state(VPGxmGuestDepth *out,
     out->stencil_enable = s->value[0x4e0u];
 }
 
-static void frame_submit_clear(VPGpuSendContext *ctx, uint32_t value) {
+static void frame_submit_clear_impl(VPGpuSendContext *ctx, uint32_t value) {
     const vp_gpu_subchannel *s = &ctx->decode->state.sub[ctx->sub];
     unsigned rt = (value >> 6) & 0xfu;
     uint32_t base = 0x200u + 16u * rt;
@@ -2310,10 +3305,23 @@ static void frame_submit_clear(VPGpuSendContext *ctx, uint32_t value) {
              (unsigned long long)va, width, height, req.mask, packed, rc);
 }
 
+static void frame_submit_clear(VPGpuSendContext *ctx, uint32_t value) {
+    uint64_t fc = vp_gxm_frame_cost_category_begin(VP_FRAME_COST_CLEAR_SUBMIT);
+    frame_submit_clear_impl(ctx, value);
+    vp_gxm_frame_cost_category_end(VP_FRAME_COST_CLEAR_SUBMIT, fc);
+}
+
 /* Prepare one full-frame draw from the decoded state. Guest buffers remain
  * valid across the synchronous worker call, so only converted index data and
  * decoded CPU textures are copied. */
-static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state *draw) {
+static void frame_cost_phase(VPFrameCostPhase *phase, unsigned category) {
+    vp_gxm_frame_cost_category_end(phase->category, phase->started);
+    phase->category = category;
+    phase->started = vp_gxm_frame_cost_category_begin(category);
+}
+
+static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state *draw,
+                                  VPFrameCostPhase *phase) {
     const vp_gpu_subchannel *s = &ctx->decode->state.sub[ctx->sub];
     VPGxmDrawRequest req;
     VPGpuTextureInfo tex;
@@ -2542,6 +3550,7 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
      * here would make a later depth-sampling draw look GPU-resolved when no
      * depth texture path exists. */
 
+    frame_cost_phase(phase, VP_FRAME_COST_DRAW_INDEX);
     if (draw->indexed) {
         if (draw->index_count < 3u ||
             draw->index_count > VP_VERTEX_WINDOW_MAX_INDEX_COUNT ||
@@ -2663,6 +3672,7 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
     req.index_count = index_count;
     req.index_format = index_format;
 
+    frame_cost_phase(phase, VP_FRAME_COST_DRAW_CBUF);
     for (unsigned st = 0; st < 2u; st++) {
         unsigned gpu_stage = st == 0u ? 0u : 4u;
         for (unsigned bank = 0; bank < VP_GPU_CBUF_SLOTS; bank++) {
@@ -2699,19 +3709,53 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
                  s->value[0x4d5u], s->value[0x4d6u]);
         }
     }
+    frame_cost_phase(phase, VP_FRAME_COST_DRAW_RESOURCES);
+    int shared_prepare = shared_prepare_enabled();
+    VPGxmShaderResourcePlan fs_plan;
+    VPGxmShaderResourcePlan vs_plan;
+    int fs_plan_rc = 1;
+    int vs_plan_rc = 1;
+    int vertex_declared = 0;
+    int use_fs_plan = 0;
     for (unsigned c=0;c<VP_TEXTURE_CACHE_SLOTS;c++) texture_cache[c].pins=0;
+    vp_texture_pool_begin_request(&deep_texture_pool);
     {
-        int primary_declared =
-            vp_gxm_shader_has_fragment_sampler(req.fs_token,
-                                               req.viewport_transform,0u);
-        int resources_active =
-            primary_declared ? vp_gxm_static_resources_active() : 0;
+        int primary_declared;
+        int resources_active;
         VPResourceTexture primary_layout;
         int primary_layout_rc = 0;
         unsigned handle_offset = 32u;
+        if (shared_prepare) {
+            fs_plan_rc = vp_gxm_shader_resource_plan(
+                req.fs_token,4u,req.viewport_transform,&fs_plan);
+            if (fs_plan_rc == 0) {
+                use_fs_plan = 1;
+            } else {
+                static unsigned shared_plan_fallback_logs;
+                if (shared_plan_fallback_logs++ < 8u)
+                    slog(ctx->svc,"VP_GXM_SHARED_PLAN_FALLBACK stage=fragment "
+                         "token=0x%x rc=%d action=legacy-per-slot\n",
+                         req.fs_token,fs_plan_rc);
+            }
+        }
+        if (use_fs_plan) {
+            primary_declared = (fs_plan.declared_mask & 1u) != 0u;
+            resources_active = primary_declared ? fs_plan.resources_active : 0;
+        } else {
+            primary_declared = vp_gxm_shader_has_fragment_sampler(
+                req.fs_token,req.viewport_transform,0u);
+            resources_active = primary_declared
+                                   ? vp_gxm_static_resources_active() : 0;
+        }
         if (primary_declared && resources_active != 0) {
-            primary_layout_rc = vp_gxm_shader_resource(
-                req.fs_token,4u,req.viewport_transform,0u,&primary_layout);
+            if (use_fs_plan) {
+                primary_layout_rc = fs_plan.slots[0].layout_rc;
+                if (primary_layout_rc == 0)
+                    primary_layout = fs_plan.slots[0].layout;
+            } else {
+                primary_layout_rc = vp_gxm_shader_resource(
+                    req.fs_token,4u,req.viewport_transform,0u,&primary_layout);
+            }
             if (primary_layout_rc == 0)
                 handle_offset = primary_layout.offset;
         }
@@ -2810,13 +3854,44 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
         if (req.texture_source != VP_GXM_EXTRA_SOURCE_DEPTH &&
             !frame_target_seen(tex.va) && tex.storage != 0u) {
             uint32_t source = 0;
+            unsigned primary_upload =
+                vp_texture_upload_format(tex.format, tex.swizzle);
+            VPTextureDecodeOutcome decode_outcome = VP_TEX_DECODE_UNSUPPORTED;
             if (bridge_quiet && gpu_va_to_cpu(ctx->session,tex.va,tex.storage,&source)) {
-                linear=texture_cached_decode(ctx->svc,&tex,(const uint8_t *)(uintptr_t)source);
+                linear=texture_decode_any(ctx->svc,&tex,
+                    (const uint8_t *)(uintptr_t)source,
+                    VP_TEXTURE_DECODE_FRAGMENT,&decode_outcome);
                 linear_borrowed=linear!=NULL;
                 if (linear_borrowed) {
-                    req.tex_format=vp_texture_upload_format(tex.format,tex.swizzle);
+                    req.tex_format=primary_upload;
                     req.texels_owned=1u;
                 }
+            }
+            if (!linear && decode_outcome == VP_TEX_DECODE_FAILED) {
+                /* The deep contract accepted this texture but its bounded pool
+                 * could not provide a safe slot. Do not hide that behind a
+                 * second malloc/memblock allocation. */
+                static unsigned primary_pool_fail_logs;
+                if (primary_pool_fail_logs++ < 16u)
+                    slog(ctx->svc,"VP_TEX_POOL_MEMORY_FAIL fd=%u submission=%u "
+                         "idx=%u va=0x%llx detail=primary-draw-fail n=%u\n",
+                         ctx->fd,ctx->submission,draw->index,
+                         (unsigned long long)tex.va,primary_pool_fail_logs);
+                return -1;
+            }
+            if (!linear && vp_texture_mask8_upload(primary_upload)) {
+                /* Alpha8 has no RGBA fallback: decoding the one-byte source
+                 * into the legacy 4-byte buffer would silently change the
+                 * upload identity and sampled channel. The owned decode above
+                 * is the only accepted producer. */
+                static unsigned alpha8_fallback_logs;
+                if (alpha8_fallback_logs++ < 16u)
+                    slog(ctx->svc,"VP_TEX_ALPHA8_FALLBACK_REJECT fd=%u "
+                         "submission=%u idx=%u va=0x%llx %ux%u "
+                         "detail=no-owned-one-byte-decode\n",ctx->fd,
+                         ctx->submission,draw->index,
+                         (unsigned long long)tex.va,tex.width,tex.height);
+                return -1;
             }
             if (!linear) linear = malloc((size_t)tex.width * tex.height * 4u);
             int decoded=-1;
@@ -2894,13 +3969,26 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
             int layout_rc=0;
             VPResourceTexture layout;
             VPGxmExtraTexture *extra=&req.extra_textures[e];
-            if (!vp_gxm_shader_has_fragment_sampler(req.fs_token,req.viewport_transform,e+1u))
-                continue;
-            resources_active=vp_gxm_static_resources_active();
-            if (resources_active != 0) {
-                layout_rc=vp_gxm_shader_resource(req.fs_token,4u,
-                    req.viewport_transform,e+1u,&layout);
-                if (layout_rc == 0) handle_offset=layout.offset;
+            if (use_fs_plan) {
+                if ((fs_plan.declared_mask & (1u << (e + 1u))) == 0u)
+                    continue;
+                resources_active=fs_plan.resources_active;
+                if (resources_active != 0) {
+                    layout_rc=fs_plan.slots[e+1u].layout_rc;
+                    if (layout_rc == 0) layout=fs_plan.slots[e+1u].layout;
+                    if (layout_rc == 0) handle_offset=layout.offset;
+                }
+            } else {
+                if (!vp_gxm_shader_has_fragment_sampler(req.fs_token,
+                                                        req.viewport_transform,
+                                                        e+1u))
+                    continue;
+                resources_active=vp_gxm_static_resources_active();
+                if (resources_active != 0) {
+                    layout_rc=vp_gxm_shader_resource(req.fs_token,4u,
+                        req.viewport_transform,e+1u,&layout);
+                    if (layout_rc == 0) handle_offset=layout.offset;
+                }
             }
             if (resources_active < 0 ||
                 (resources_active > 0 && layout_rc != 0)) {
@@ -3029,8 +4117,19 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
                          plane.format,plane.header,(unsigned)plane.storage,map_rc);
                 continue;
             }
-            extra->texels=texture_cached_decode(ctx->svc,&plane,(const uint8_t *)(uintptr_t)ptr);
-            extra->texels_owned=extra->texels!=NULL;
+            {
+                VPTextureDecodeOutcome decode_outcome = VP_TEX_DECODE_UNSUPPORTED;
+                extra->texels=texture_decode_any(ctx->svc,&plane,
+                    (const uint8_t *)(uintptr_t)ptr,
+                    VP_TEXTURE_DECODE_FRAGMENT,&decode_outcome);
+                extra->texels_owned=extra->texels!=NULL;
+                if (!extra->texels && decode_outcome == VP_TEX_DECODE_FAILED) {
+                    if (extra_error_logs++<32u)
+                        slog(ctx->svc,"VP_TEX_POOL_MEMORY_FAIL slot=%u "
+                             "va=0x%llx detail=extra-no-fallback\n",e+1u,
+                             (unsigned long long)plane.va);
+                }
+            }
             if (!extra->texels) {
                 if (extra_error_logs++<32u)
                     slog(ctx->svc,"VP_GXM_EXTRA_TEX_MISSING slot=%u source=cpu "
@@ -3048,19 +4147,44 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
                      (unsigned)plane.storage);
         }
     }
-    if (vp_gxm_shader_has_vertex_sampler(req.vs_token,req.viewport_transform,0u)) {
+    if (shared_prepare) {
+        vs_plan_rc = vp_gxm_shader_resource_plan(
+            req.vs_token,0u,req.viewport_transform,&vs_plan);
+        if (vs_plan_rc == 0) {
+            vertex_declared = (vs_plan.declared_mask & 1u) != 0u;
+        } else {
+            static unsigned shared_vertex_plan_logs;
+            if (shared_vertex_plan_logs++ < 8u)
+                slog(ctx->svc,"VP_GXM_SHARED_PLAN_FALLBACK stage=vertex "
+                     "token=0x%x rc=%d action=legacy-per-slot\n",
+                     req.vs_token,vs_plan_rc);
+        }
+    }
+    if (vs_plan_rc != 0)
+        vertex_declared = vp_gxm_shader_has_vertex_sampler(
+            req.vs_token,req.viewport_transform,0u);
+    if (vertex_declared) {
         VPGpuTextureInfo vertex_tex;
         uint32_t source=0;
         VPGxmExtraTexture *extra=&req.vertex_texture;
         int resolve_rc=-1;
-        int resources_active=vp_gxm_static_resources_active();
+        const char *vertex_reason=NULL;
+        unsigned vertex_upload=0u;
+        int use_vs_plan = vs_plan_rc == 0;
+        int resources_active = use_vs_plan ? vs_plan.resources_active
+                                           : vp_gxm_static_resources_active();
         int layout_rc=0;
         VPResourceTexture layout;
         unsigned handle_offset=32u;
         memset(&vertex_tex,0,sizeof(vertex_tex));
         if (resources_active != 0) {
-            layout_rc=vp_gxm_shader_resource(req.vs_token,0u,
-                req.viewport_transform,0u,&layout);
+            if (use_vs_plan) {
+                layout_rc=vs_plan.slots[0].layout_rc;
+                if (layout_rc == 0) layout=vs_plan.slots[0].layout;
+            } else {
+                layout_rc=vp_gxm_shader_resource(req.vs_token,0u,
+                    req.viewport_transform,0u,&layout);
+            }
             if (layout_rc == 0) handle_offset=layout.offset;
         }
         if (resources_active < 0 ||
@@ -3076,8 +4200,22 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
                                           &vertex_tex);
                 extra->width=vertex_tex.width;
                 extra->height=vertex_tex.height;
-                extra->tex_format=vertex_tex.texture_type==3u?0u:
-                    vp_texture_upload_format(vertex_tex.format,vertex_tex.swizzle);
+                vertex_upload=texture_vertex_upload_format(&vertex_tex,&vertex_reason);
+                extra->tex_format=vertex_reason != NULL ? 0u : vertex_upload;
+                if (vertex_reason != NULL) {
+                    static unsigned vertex_contract_logs;
+                    if (vertex_contract_logs++<32u)
+                        slog(ctx->svc,"VP_VERTEX_TEXTURE_CONTRACT hash=0x%x "
+                             "va=0x%llx size=%ux%u fmt=%u header=%u pitch=%u "
+                             "storage=%u tsc=%08x,%08x sampler=%08x,%08x "
+                             "reason=%s\n", req.hash,
+                             (unsigned long long)vertex_tex.va,vertex_tex.width,
+                             vertex_tex.height,vertex_tex.format,
+                             vertex_tex.header,vertex_tex.pitch,
+                             (unsigned)vertex_tex.storage,vertex_tex.tsc[0],
+                             vertex_tex.tsc[1],vertex_tex.sampler[0],
+                             vertex_tex.sampler[1],vertex_reason);
+                }
                 extra->cube=vertex_tex.texture_type==3u;
                 extra->mip_count=extra->cube ?
                     (vertex_tex.max_mip_level+1u<
@@ -3118,11 +4256,23 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
                              vertex_tex.width, vertex_tex.height,
                              vertex_tex.format, vertex_tex.texture_type,
                              vertex_tex.header);
-                } else if (vertex_tex.storage &&
+                } else if (vertex_reason == NULL && vertex_tex.storage &&
                     gpu_va_to_cpu(ctx->session,vertex_tex.va,vertex_tex.storage,&source)) {
-                    extra->texels=texture_cached_decode(ctx->svc,&vertex_tex,
-                        (const uint8_t *)(uintptr_t)source);
+                    VPTextureDecodeOutcome decode_outcome =
+                        VP_TEX_DECODE_UNSUPPORTED;
+                    extra->texels=texture_decode_any(ctx->svc,&vertex_tex,
+                        (const uint8_t *)(uintptr_t)source,
+                        VP_TEXTURE_DECODE_VERTEX,&decode_outcome);
                     extra->texels_owned=extra->texels!=NULL;
+                    if (!extra->texels &&
+                        decode_outcome == VP_TEX_DECODE_FAILED) {
+                        static unsigned vertex_pool_fail_logs;
+                        if (vertex_pool_fail_logs++ < 16u)
+                            slog(ctx->svc,"VP_TEX_POOL_MEMORY_FAIL "
+                                 "stage=vertex va=0x%llx "
+                                 "detail=vertex-no-fallback\n",
+                                 (unsigned long long)vertex_tex.va);
+                    }
                 }
             }
         }
@@ -3146,12 +4296,15 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
         /* The producer is a surface we cleared/rendered; the worker resolves it
          * from its surface cache. A miss is reported there. */
     }
+    frame_cost_phase(phase, VP_FRAME_COST_DRAW_FINAL);
     if (frame_auto && !frame_done) {
         if (frame_event_count < VP_FRAME_EVENT_LIMIT) {
             VPFrameEvent *event = &frame_events[frame_event_count++];
             event->kind = 2;
             event->draw = req;
-            event->texels = linear;
+            /* Only a malloc fallback is owned by the event list. A decoder
+             * borrow stays owned by its cache/pool and must not reach free(). */
+            event->texels = linear_borrowed ? NULL : linear;
             linear = NULL;
             rc = 0;
         } else {
@@ -3163,7 +4316,7 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
             VPFrameEvent *event = &frame_events[frame_event_count++];
             event->kind = 2;
             event->draw = req;
-            event->texels = linear;
+            event->texels = linear_borrowed ? NULL : linear;
             linear = NULL;
         }
     }
@@ -3173,7 +4326,7 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
      * not (the surface was never created, see frame_submit_clear). */
     if (rc == 0 && req.color_mask != 0u) frame_note_target(req.target_va);
     if (!bridge_quiet || (ctx->submission % 128u) == 0u || rc != 0)
-        slog(ctx->svc, "%s fd=%u submission=%u idx=%u hash=0x%x rc=%d "
+        slog_work_success(ctx->svc, rc == 0, "%s fd=%u submission=%u idx=%u hash=0x%x rc=%d "
              "target=0x%llx tex=0x%llx count=%u indexed=%u icount=%u mask=0x%x\n",
              frame_auto && !frame_done ? "VP_GXM_FRAME_RECORD" : "VP_GXM_FRAME_SUBMIT",
              ctx->fd, ctx->submission, draw->index, req.hash, rc,
@@ -3184,7 +4337,12 @@ static int frame_submit_draw_impl(VPGpuSendContext *ctx, const vp_gpu_draw_state
 
 static int frame_submit_draw(VPGpuSendContext *ctx, const vp_gpu_draw_state *draw) {
     uint64_t started = svc_play_perf_enabled() ? sceKernelGetProcessTimeWide() : 0u;
-    int rc = frame_submit_draw_impl(ctx, draw);
+    uint64_t fc = vp_gxm_frame_cost_category_begin(VP_FRAME_COST_DRAW_SUBMIT);
+    VPFrameCostPhase phase = {VP_FRAME_COST_DRAW_STATE,
+        vp_gxm_frame_cost_category_begin(VP_FRAME_COST_DRAW_STATE)};
+    int rc = frame_submit_draw_impl(ctx, draw, &phase);
+    vp_gxm_frame_cost_category_end(phase.category, phase.started);
+    vp_gxm_frame_cost_category_end(VP_FRAME_COST_DRAW_SUBMIT, fc);
     if (started) {
         gpu_cpu_perf.draws++;
         gpu_cpu_perf.draw_prepare_us += sceKernelGetProcessTimeWide() - started;
@@ -4216,77 +5374,14 @@ static void vp_hid_fill_state(VPGuestSvc *svc) {
     }
 }
 
-static void vp_guest_gpu_decode_entry_locked(VPGuestSvc *svc, VPGuestSession *state,
-        VPGuestGpuChannel *channel, uint32_t fd, uint32_t submission,
-        uint32_t cpu, uint32_t words, int log) {
-    VPGpuDecode *decode = channel->gpu_decode;
-    vp_gpu_decode_stats stats;
-    int perf = svc_play_perf_enabled();
-    uint64_t phase = perf ? sceKernelGetProcessTimeWide() : 0u;
-    uint64_t phase_end;
+/* One dispatch pass over the already-collected entry. Extracted so the
+ * frame-cost dispatch span has a single exit point: every reject path is a
+ * return from this helper and the caller's span wrapper stays balanced. The
+ * decoded order, callbacks and error propagation are unchanged. */
+static int gpu_dispatch_entry_commands(VPGuestSvc *svc, VPGuestSession *state,
+        VPGpuDecode *decode, uint32_t fd, uint32_t submission, int log,
+        size_t write_count, unsigned *layout_consumed) {
     size_t k = 0;
-    size_t write_count = 0;
-    int bad;
-
-    vp_hid_fill_state(svc);
-    if (decode == NULL) {
-        decode = (VPGpuDecode *)calloc(1, sizeof(*decode));
-        if (decode == NULL) {
-            if (perf)
-                gpu_cpu_perf.entry_setup_us +=
-                    sceKernelGetProcessTimeWide() - phase;
-            return;
-        }
-        vp_macro_table_init(&decode->macros);
-        vp_macro_upload_state_init(&decode->upload);
-        vp_mme_shared_init(&decode->shared);
-        vp_gpu_state_init(&decode->state);
-        decode->binds[0].stage = 1u;
-        decode->binds[1].stage = 5u;
-        channel->gpu_decode = decode;
-    }
-    bad = !words || words > 0x1fffffu || cpu == 0u ||
-          !vp_guest_svc_readable(svc, cpu, words * 4u) ||
-          vp_gpu_command_buffer_reserve(&decode->commands, words) < 0;
-    if (perf) {
-        phase_end = sceKernelGetProcessTimeWide();
-        gpu_cpu_perf.entry_setup_us += phase_end - phase;
-        phase = phase_end;
-    }
-    if (bad) {
-        ++svc->ipc_unsupported;
-        slog(svc,"VP_GPU_ENTRY_REJECT fd=%u submission=%u words=%u reason=allocation-or-size\n",fd,submission,words);
-        return;
-    }
-    /* Snapshot the whole entry before decode/dispatch. The guest command RAM
-     * stays the producer's; decoder state never borrows a mutable pointer. */
-    memcpy(decode->commands.words,(const void *)(uintptr_t)cpu,
-           (size_t)words * sizeof(uint32_t));
-    if (perf) {
-        phase_end = sceKernelGetProcessTimeWide();
-        gpu_cpu_perf.command_copy_us += phase_end - phase;
-        gpu_cpu_perf.command_words += words;
-        phase = phase_end;
-    }
-    if (vp_gpu_decode_collect(decode->commands.words, words,
-                              decode->commands.writes, decode->commands.capacity,
-                              &stats) != 0) {
-        if (perf) {
-            phase_end = sceKernelGetProcessTimeWide();
-            gpu_cpu_perf.command_collect_us += phase_end - phase;
-        }
-        ++svc->ipc_unsupported;
-        slog(svc,"VP_GPU_ENTRY_REJECT fd=%u submission=%u words=%u reason=decode writes=%u\n",
-             fd,submission,words,(unsigned)stats.writes);
-        return;
-    }
-    write_count = stats.writes;
-    if (perf) {
-        phase_end = sceKernelGetProcessTimeWide();
-        gpu_cpu_perf.command_collect_us += phase_end - phase;
-        gpu_cpu_perf.decoded_writes += write_count;
-        phase = phase_end;
-    }
     VPGpuSendContext direct = {0};
     direct.decode = decode;
     direct.svc = svc;
@@ -4296,11 +5391,24 @@ static void vp_guest_gpu_decode_entry_locked(VPGuestSvc *svc, VPGuestSession *st
     direct.log = log;
     while (k < write_count) {
         vp_gpu_write write = decode->commands.writes[k];
+        if (write.method==VP_ENGINE_LAYOUT_METHOD &&
+            (write.value&0xffff0000u)==VP_ENGINE_LAYOUT_TOKEN) {
+            if (vp_engine_layout_consume(write.value,write.sub,&decode->state,&decode->shared)) {
+                ++svc->ipc_unsupported;
+                slog(svc,"VP_ENGINE_LAYOUT_REJECT token=%08x sub=%u fd=%u submission=%u\n",
+                    write.value, write.sub, fd, submission);
+                return -1;
+            }
+            (*layout_consumed)++;
+            k++;
+            continue;
+        }
         if (write.method < 0xE00u) {
             vp_macro_upload_apply(&decode->macros, &decode->upload,
                                   write.method, write.value);
             direct.sub = write.sub;
             gpu_state_send(&direct, write.method, write.value);
+            if (deep_decode_error) return -1;
             if (write.sub < VP_GPU_SUBCHANNELS) {
                 if (write.method == 0x35eu) decode->indexed[write.sub] = 0;
                 if (write.method == 0x5f8u) decode->indexed[write.sub] = 1;
@@ -4346,12 +5454,119 @@ static void vp_guest_gpu_decode_entry_locked(VPGuestSvc *svc, VPGuestSession *st
             ctx.fd = fd;
             ctx.submission = submission;
             ctx.log = log;
-            vp_mme_execute(&decode->macros, decode->macros.positions[index],
-                           decode->commands.params, param_count, &decode->shared,
-                           gpu_state_send, &ctx, &result);
+            {
+                uint64_t fc = vp_gxm_frame_cost_category_begin(
+                    VP_FRAME_COST_MME);
+                vp_mme_execute(&decode->macros, decode->macros.positions[index],
+                               decode->commands.params, param_count, &decode->shared,
+                               gpu_state_send, &ctx, &result);
+                vp_gxm_frame_cost_category_end(VP_FRAME_COST_MME, fc);
+            }
+            if (deep_decode_error) return -1;
             direct.upload_size = 0u;
         }
     }
+    return deep_decode_error ? -1 : 0;
+}
+
+static int vp_guest_gpu_decode_entry_locked(VPGuestSvc *svc, VPGuestSession *state,
+        VPGuestGpuChannel *channel, uint32_t fd, uint32_t submission,
+        uint32_t cpu, uint32_t words, int log) {
+    VPGpuDecode *decode = channel->gpu_decode;
+    vp_gpu_decode_stats stats;
+    int perf = svc_play_perf_enabled();
+    uint64_t phase = perf ? sceKernelGetProcessTimeWide() : 0u;
+    uint64_t phase_end;
+    size_t write_count = 0;
+    unsigned layout_consumed=0u;
+    int bad;
+
+    vp_hid_fill_state(svc);
+    if (decode == NULL) {
+        decode = (VPGpuDecode *)calloc(1, sizeof(*decode));
+        if (decode == NULL) {
+            if (perf)
+                gpu_cpu_perf.entry_setup_us +=
+                    sceKernelGetProcessTimeWide() - phase;
+            return -1;
+        }
+        vp_macro_table_init(&decode->macros);
+        vp_macro_upload_state_init(&decode->upload);
+        vp_mme_shared_init(&decode->shared);
+        vp_gpu_state_init(&decode->state);
+        decode->binds[0].stage = 1u;
+        decode->binds[1].stage = 5u;
+        channel->gpu_decode = decode;
+    }
+    bad = !words || words > 0x1fffffu || cpu == 0u ||
+          !vp_guest_svc_readable(svc, cpu, words * 4u) ||
+          vp_gpu_command_buffer_reserve(&decode->commands, words) < 0;
+    if (perf) {
+        phase_end = sceKernelGetProcessTimeWide();
+        gpu_cpu_perf.entry_setup_us += phase_end - phase;
+        phase = phase_end;
+    }
+    if (bad) {
+        ++svc->ipc_unsupported;
+        slog(svc,"VP_GPU_ENTRY_REJECT fd=%u submission=%u words=%u reason=allocation-or-size\n",fd,submission,words);
+        return -1;
+    }
+    /* Snapshot the whole entry before decode/dispatch. The guest command RAM
+     * stays the producer's; decoder state never borrows a mutable pointer. */
+    memcpy(decode->commands.words,(const void *)(uintptr_t)cpu,
+           (size_t)words * sizeof(uint32_t));
+    if (!(++decode->layout_report_entries&1023u)) {
+        vp_engine_layout_report(svc->log);
+        vp_engine_full_report(svc->log);
+    }
+    if (perf) {
+        phase_end = sceKernelGetProcessTimeWide();
+        gpu_cpu_perf.command_copy_us += phase_end - phase;
+        gpu_cpu_perf.command_words += words;
+        phase = phase_end;
+    }
+    if (vp_gpu_decode_collect(decode->commands.words, words,
+                              decode->commands.writes, decode->commands.capacity,
+                              &stats) != 0) {
+        if (perf) {
+            phase_end = sceKernelGetProcessTimeWide();
+            gpu_cpu_perf.command_collect_us += phase_end - phase;
+        }
+        ++svc->ipc_unsupported;
+        slog(svc,"VP_GPU_ENTRY_REJECT fd=%u submission=%u words=%u reason=decode writes=%u\n",
+             fd,submission,words,(unsigned)stats.writes);
+        return -1;
+    }
+    write_count = stats.writes;
+    if (perf) {
+        phase_end = sceKernelGetProcessTimeWide();
+        gpu_cpu_perf.command_collect_us += phase_end - phase;
+        gpu_cpu_perf.decoded_writes += write_count;
+        phase = phase_end;
+    }
+    /* The mode switch runs at the submission boundary before any draw of this
+     * entry is prepared. The desired flag is published by the host root poll;
+     * the actual flush, cache teardown and pool creation stay on the GXM
+     * worker and never on the host polling thread. */
+    {
+        int switch_rc = texture_pipeline_apply_pending(svc);
+        if (switch_rc < 0) {
+            static unsigned switch_fail_logs;
+            if (switch_fail_logs++ < 8u)
+                slog(svc, "VP_TEX_POOL_MODE_DEFER fd=%u submission=%u rc=%d "
+                     "action=submission-failed\n", fd, submission, switch_rc);
+            return switch_rc;
+        }
+    }
+    deep_decode_error = 0;
+    {
+        uint64_t fc = vp_gxm_frame_cost_category_begin(VP_FRAME_COST_DISPATCH);
+        int dispatch_rc = gpu_dispatch_entry_commands(svc, state, decode, fd,
+            submission, log, write_count, &layout_consumed);
+        vp_gxm_frame_cost_category_end(VP_FRAME_COST_DISPATCH, fc);
+        if (dispatch_rc < 0) return dispatch_rc;
+    }
+    vp_engine_layout_note_consumed(layout_consumed);
     if (perf) {
         phase_end = sceKernelGetProcessTimeWide();
         gpu_cpu_perf.command_dispatch_us += phase_end - phase;
@@ -4361,7 +5576,9 @@ static void vp_guest_gpu_decode_entry_locked(VPGuestSvc *svc, VPGuestSession *st
     if (perf)
         gpu_cpu_perf.submission_finish_us +=
             sceKernelGetProcessTimeWide() - phase;
+    return deep_decode_error ? -1 : 0;
 }
+
 typedef struct {
     VPGuestSvc *svc;
     VPGuestSession *state;
@@ -4372,12 +5589,17 @@ typedef struct {
      * only after vp_gxm_worker_execute signals completion. */
     uint64_t queued_us, callback_end_us;
     int log;
+    int rc;
 } VPGpuDecodeWork;
 
 static void gpu_decode_on_worker(void *opaque) {
     VPGpuDecodeWork *work = opaque;
     uint32_t released[2];
     int perf = svc_play_perf_enabled();
+    /* This is a complete decoder-entry boundary with an empty span stack.
+     * Marker and mode polling happen here, never in guest TLS or on another
+     * thread. */
+    vp_gxm_frame_cost_worker_boundary();
     /* B104: this is the only Session.state_lock handoff on the inline path.
      * It also restores the submitting guest thread's handle/TLS, so the whole
      * decoder entry, including its inline GXM requests, keeps that identity
@@ -4389,8 +5611,13 @@ static void gpu_decode_on_worker(void *opaque) {
     uint64_t started = perf ? sceKernelGetProcessTimeWide() : 0u;
     if (acquire_started)
         gpu_cpu_perf.segment_acquire_us += started - acquire_started;
-    vp_guest_gpu_decode_entry_locked(work->svc, work->state, work->channel,
-        work->fd, work->submission, work->cpu, work->words, work->log);
+    {
+        uint64_t fc = vp_gxm_frame_cost_category_begin(VP_FRAME_COST_ENTRY);
+        work->rc = vp_guest_gpu_decode_entry_locked(work->svc, work->state,
+            work->channel, work->fd, work->submission, work->cpu, work->words,
+            work->log);
+        vp_gxm_frame_cost_category_end(VP_FRAME_COST_ENTRY, fc);
+    }
     if (started) {
         gpu_cpu_perf.entries++;
         gpu_cpu_perf.decode_us += sceKernelGetProcessTimeWide() - started;
@@ -4453,19 +5680,20 @@ static int vp_guest_gpu_decode_entry(VPGuestSvc *svc, VPGuestSession *state,
     }
     display_bridge_init(svc);
     if (!display_bridge_enabled && frame_mode_state != 1) {
-        vp_guest_gpu_decode_entry_locked(svc, state, channel, fd, submission, cpu, words, log);
+        int decode_rc = vp_guest_gpu_decode_entry_locked(svc, state, channel, fd, submission, cpu, words, log);
         sceKernelUnlockMutex(gpu_execution_gate, 1);
-        return 0;
+        return decode_rc;
     }
     int perf = svc_play_perf_enabled();
     VPGpuDecodeWork work = {svc, state, channel, fd, submission, cpu, words,
-                            {0, 0}, 0u, 0u, log};
+                            {0, 0}, 0u, 0u, log, 0};
     /* The caller keeps the GPU gate until the worker returns. Release service
      * state while waiting; the worker acquires it once for the whole decode,
      * including the inline GXM requests, and releases it when the entry ends. */
     device_wait_begin(svc, work.token);
     work.queued_us = perf ? sceKernelGetProcessTimeWide() : 0u;
     int rc = vp_gxm_worker_execute(gpu_decode_on_worker, &work);
+    if (rc == 0) rc = work.rc;
     if (perf) {
         uint64_t returned = sceKernelGetProcessTimeWide();
         if (work.callback_end_us && returned >= work.callback_end_us)
@@ -5108,11 +6336,18 @@ static uint8_t root_interface(const char *name) {
  * fail with a logged reason instead of pretending the image is empty. */
 static int ensure_storage(VPGuestSvc *svc) {
     if (svc->storage.open) return 0;
-    if (vp_guest_storage_open(&svc->storage, VP_GUEST_STORAGE_INDEX_PATH,
-                              VP_GUEST_STORAGE_MAP_PATH, VP_GUEST_STORAGE_TREE_PATH) != 0) {
+    int font=vp_guest_pixel_font_enabled();
+    const char *index=font?"ux0:data/mhgu-vita-port/font-pixel/romfs.index":VP_GUEST_STORAGE_INDEX_PATH;
+    const char *map=font?"ux0:data/mhgu-vita-port/font-pixel/romfs.map":VP_GUEST_STORAGE_MAP_PATH;
+    if (vp_guest_pixel_font_native_enabled()) {
+        if (!font) return -1;
+        index="ux0:data/mhgu-vita-port/font-native/romfs.index";
+        map="ux0:data/mhgu-vita-port/font-native/romfs.map";
+    }
+    const char *tree=font?"ux0:data/mhgu-vita-port":VP_GUEST_STORAGE_TREE_PATH;
+    if (vp_guest_storage_open(&svc->storage,index,map,tree) != 0) {
         slog(svc, "SVC_STORAGE_OPEN result=failed index=%s map=%s tree=%s error=%s\n",
-             VP_GUEST_STORAGE_INDEX_PATH, VP_GUEST_STORAGE_MAP_PATH,
-             VP_GUEST_STORAGE_TREE_PATH, svc->storage.error);
+             index,map,tree,svc->storage.error);
         return -1;
     }
     slog(svc, "SVC_STORAGE_OPEN result=ok image_size=%llu data_offset=%llu files=%u tree_bytes=%llu index=%s map=%s tree=%s\n",
@@ -5120,8 +6355,7 @@ static int ensure_storage(VPGuestSvc *svc) {
          (unsigned long long)svc->storage.data_offset,
          svc->storage.file_count,
          (unsigned long long)svc->storage.tree_bytes,
-         VP_GUEST_STORAGE_INDEX_PATH, VP_GUEST_STORAGE_MAP_PATH,
-         VP_GUEST_STORAGE_TREE_PATH);
+         index,map,tree);
     return 0;
 }
 
@@ -9232,16 +10466,15 @@ swkbd_queue_full:
                         || controlled > 1u) {
                         result = SVC_RESULT_INVALID_COMBINATION;
                     } else {
-                        /* QueueBufferOutput {width, height, transformHint,
-                         * numPendingBuffers} followed by the connect status.
-                         * The dimensions are the docked 1920x1080 the locked
-                         * title renders to and match the modeled display. */
+                        /* QueueBufferOutput followed by connect status. The
+                         * native font profile uses the same 720p preset as
+                         * the original handheld renderer and VI allocation. */
                         put32(out_address + 0x00, 0x14u); /* data size */
                         put32(out_address + 0x04, 0x10u); /* data offset */
                         put32(out_address + 0x08, 0u);    /* objects size */
                         put32(out_address + 0x0c, 0x24u); /* objects offset */
-                        put32(out_address + 0x10, 1920u);
-                        put32(out_address + 0x14, 1080u);
+                        put32(out_address + 0x10, pixel_display_width());
+                        put32(out_address + 0x14, pixel_display_height());
                         put32(out_address + 0x18, 0u);
                         put32(out_address + 0x1c, 0u);
                         put32(out_address + 0x20, 0u);
@@ -9261,11 +10494,11 @@ swkbd_queue_full:
                     switch (what) {
                     case 0:
                         name = "Width";
-                        value = state->binder_width ? state->binder_width : 1920u;
+                        value = state->binder_width ? state->binder_width : pixel_display_width();
                         break;
                     case 1:
                         name = "Height";
-                        value = state->binder_height ? state->binder_height : 1080u;
+                        value = state->binder_height ? state->binder_height : pixel_display_height();
                         break;
                     case 2:
                         name = "Format";
@@ -9572,8 +10805,8 @@ swkbd_queue_full:
                     put32(out_address + 0x04, 0x10u);
                     put32(out_address + 0x08, 0u);
                     put32(out_address + 0x0c, 0x24u);
-                    put32(out_address + 0x10, state->binder_width ? state->binder_width : 1920u);
-                    put32(out_address + 0x14, state->binder_height ? state->binder_height : 1080u);
+                    put32(out_address + 0x10, state->binder_width ? state->binder_width : pixel_display_width());
+                    put32(out_address + 0x14, state->binder_height ? state->binder_height : pixel_display_height());
                     put32(out_address + 0x18, 0u); /* transform hint */
                     put32(out_address + 0x1c, state->binder_queues);
                     put32(out_address + 0x20, status);
@@ -9969,9 +11202,8 @@ swkbd_queue_full:
         && state->vi_role == VP_GUEST_VI_APPLICATION && command == 1000) {
         /* IApplicationDisplayService command 1000 ListDisplays: one OutArray
          * of 0x60-byte DisplayInfo records plus the returned count. The
-         * modeled target has the single "Default" display; its reported
-         * maximum layer size is the docked 1920x1080 the locked title also
-         * renders to in the reference captures. */
+         * modeled target has one "Default" display. Native fonts select the
+         * 720p handheld preset; the legacy profile retains its 1080p maximum. */
         uint32_t descriptor = (header0 & 0x01000000u) != 0;
         uint32_t capacity = descriptor ? get32(buffer + 8) / 0x60u : 0;
         uint32_t address = descriptor ? get32(buffer + 0xc) : 0;
@@ -9981,7 +11213,7 @@ swkbd_queue_full:
             result = SVC_RESULT_INVALID_COMBINATION;
         } else {
             uint8_t *info = (uint8_t *)(uintptr_t)address;
-            uint64_t values[3] = {1, 1920, 1080}; /* layer max, width, height */
+            uint64_t values[3] = {1, pixel_display_width(), pixel_display_height()};
             memset(info, 0, 0x60);
             memcpy(info, "Default", 8);
             info[0x40] = 1; /* HasLayerLimit */
@@ -11818,7 +13050,7 @@ swkbd_queue_full:
                     sflush(svc);
                     return VP_BRIDGE_UNSUPPORTED;
                 }
-                slog(svc, "VP_GXM_BATCH_SUBMIT_FLUSH fd=%u submission=%u "
+                slog_work_success(svc, 1, "VP_GXM_BATCH_SUBMIT_FLUSH fd=%u submission=%u "
                      "rc=0 action=fence-eligible\n",
                      fd, channel->submit_count);
             }
@@ -13616,6 +14848,11 @@ static int query_memory(VPGuestSvc *svc, VPBridgeFrame *f) {
     return 0;
 }
 
+static unsigned memory_audit_enabled;
+void vp_guest_memory_audit_set(unsigned enabled) {
+    memory_audit_enabled = enabled;
+}
+
 static int get_info(VPGuestSvc *svc, VPBridgeFrame *f) {
     uint64_t subtype = (uint64_t)f->regs[0] | ((uint64_t)f->regs[3] << 32);
     uint32_t type = f->regs[1], handle = f->regs[2];
@@ -13660,6 +14897,17 @@ static int get_info(VPGuestSvc *svc, VPBridgeFrame *f) {
         slog(svc, "SVC_GETINFO_REJECT type=0x%x handle=0x%08x subtype=0x%llx result=0x%08x\n",
                 type, handle, (unsigned long long)subtype, result);
         sflush(svc);
+    }
+    if (memory_audit_enabled && type >= 4u && type <= 7u) {
+        slog(svc, "MEMORY_AUDIT_QUERY type=%u value=%llu result=%u "
+             "pc=0x%x lr=0x%x sp=0x%x fp=0x%x\n", type,
+             (unsigned long long)value, result, f->pc, f->lr, f->sp, f->regs[11]);
+        if (vp_guest_svc_readable(svc, f->sp, 24u * sizeof(uint32_t))) {
+            const uint32_t *stack = (const uint32_t *)(uintptr_t)f->sp;
+            for (unsigned i = 0u; i < 24u; ++i)
+                slog(svc, "MEMORY_AUDIT_STACK type=%u sp=0x%x index=%u word=0x%x\n",
+                     type, f->sp, i, stack[i]);
+        }
     }
     f->regs[0] = result;
     f->regs[1] = (uint32_t)value;
@@ -14027,7 +15275,7 @@ static int set_thread_core_mask(VPGuestSvc *svc, VPBridgeFrame *f) {
     uint64_t mask = (uint64_t)f->regs[2] | ((uint64_t)f->regs[3] << 32);
     VPGuestHandle *slot = thread_handle(svc, handle);
     /* svcSetThreadCoreMask's r1 is the ideal core; -1 means "no preference"
-     * (switchbrew/Atmosph猫re ABI). The movie player's NuPlayer threads call
+     * (switchbrew/Atmosph鐚玶e ABI). The movie player's NuPlayer threads call
      * SetThreadCoreMask(thread, -1, mask) when they start, so rejecting -1
      * makes nn::os abort the thread with 0xE0010004 before it opens the
      * movie file. Only a concrete ideal core has to be inside the mask. */

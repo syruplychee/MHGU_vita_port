@@ -1,6 +1,8 @@
 #ifndef VP_GUEST_SVC_H
 #define VP_GUEST_SVC_H
 #include <stdint.h>
+/* Set once by the loader before guest threads start; diagnostic only. */
+void vp_guest_memory_audit_set(unsigned enabled);
 #include <stdio.h>
 #include "host_bridge.h"
 #include "guest_storage.h"
@@ -1000,4 +1002,10 @@ int vp_guest_svc_queue_applet_message(VPGuestSvc *, uint32_t message, const char
 int vp_guest_svc_process_exit_requested(VPGuestSvc *);
 /* Returns 0 when the original veneer may resume, or VP_BRIDGE_UNSUPPORTED. */
 int vp_guest_svc_dispatch(VPGuestSvc *, VPBridgeFrame *);
+/* Original rTexture lifecycle hooks also identify the private R8 font pack. */
+int vp_guest_pixel_font_enabled(void);
+int vp_guest_pixel_font_native_enabled(void);
+int vp_guest_pixel_font_quad(VPGuestSvc *, uint32_t *regs, unsigned kind);
+int vp_guest_pixel_font_quad_uv(VPGuestSvc *, uint32_t *regs);
+int vp_guest_pixel_font_event(VPGuestSvc *, unsigned event, uint32_t object);
 #endif

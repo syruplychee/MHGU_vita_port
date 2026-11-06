@@ -9,6 +9,7 @@
 | Ninja | 1.10+（测试 1.13.2） | 构建执行器 | https://github.com/ninja-build/ninja/releases |
 | Python | **3.10+**（测试 3.12.10） | 输入校验、头生成、离线工具 | https://www.python.org/downloads/ |
 | Python `lz4` | 4.x（测试 4.4.5） | 解压锁定 NSO | `python -m pip install -r tools/requirements.txt` |
+| Python `Pillow` | 10+（测试 13.0.0） | 点阵字体包与预览、相关宿主测试 | 同上 |
 | VitaSDK | GCC 15.2.0 测试通过 | ARMv7 交叉编译、SELF/VPK 打包 | https://vitasdk.org/ 或 https://github.com/vitasdk/vdpm |
 | 游戏输入 | MHGU 完整 1.4.0 | 构建 VPK 时打包四模块 | 见 [游戏输入](03-game-inputs.md) |
 

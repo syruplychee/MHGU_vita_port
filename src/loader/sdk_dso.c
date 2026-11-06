@@ -14,6 +14,11 @@
 #include "media_video.h"
 #include "movie_control.h"
 #include "session_gate.h"
+#include "engine_submit_probe.h"
+#include "engine_layout.h"
+#include "engine_full.h"
+#include "gxm_runtime.h"
+#include "resource_experiment.h"
 #include <stddef.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/kernel/cpu.h>
@@ -36,6 +41,11 @@ extern void vp_sdk_try_lock(void),vp_sdk_is_locked(void);
 extern void vp_sdk_video_readback(void);
 extern void vp_movie_color_rgb_enter(void),vp_movie_color_rgb_leave(void);
 extern void vp_movie_color_nv12_enter(void),vp_movie_color_nv12_leave(void);
+extern void vp_engine_submit_enter(void),vp_engine_submit_leave(void);
+extern void vp_engine_layout_entry(void);
+extern void vp_engine_full_entry(void);
+uint32_t vp_engine_layout_resume;
+uint32_t vp_engine_layout_fallback;
 extern const unsigned char vp_sdk_svc_site_template[],vp_sdk_svc_site_end[];
 extern const unsigned char vp_sdk_svc_site_service_value[],vp_sdk_svc_site_continuation_value[],vp_sdk_svc_site_branch[];
 extern const unsigned char vp_sdk_timer_site_template[],vp_sdk_timer_site_end[];
@@ -89,6 +99,39 @@ typedef struct {
     uint32_t mode,width,height,destination,source_y,source_uv;
 } VPMovieColorTiming;
 static int movie_color_probe_enabled;
+static int engine_submit_probe_enabled;
+static int engine_full_ab_enabled;
+static uint32_t engine_full_ab_trampoline;
+static uint32_t engine_submit_replay;
+static uint32_t engine_submit_leave_replay;
+#define VP_GAME_COST_SITES 4u
+#define VP_GAME_COST_DEPTH 16u
+extern void vp_game_cost_frame(void), vp_game_cost_submit(void);
+extern void vp_game_cost_queue(void), vp_game_cost_end_frame(void);
+static int game_cost_enabled;
+static uint32_t game_cost_trampolines[VP_GAME_COST_SITES];
+typedef struct {
+    uint64_t started, child_us, bridge_us, bridge_calls;
+    uint32_t site, context, caller, presents;
+} VPGameCostSpan;
+typedef struct {
+    VPGameCostSpan stack[VP_GAME_COST_DEPTH];
+    unsigned depth;
+} VPGameCostThread;
+/* Same-process A/B accounting. entry_us/t_us use the process clock on the host
+ * side; command is the root context's command buffer and before/after are its
+ * write offsets. mode is the mode selected when this call entered, so a control
+ * file change applies only to later root calls. */
+#define VP_ENGINE_AB_CONTROL_PATH "ux0:data/mhgu-vita-port/engine-full-mode.txt"
+#define VP_ENGINE_AB_POLL_US 500000ull
+typedef struct {
+    uint64_t entry_us;
+    uint32_t context,command,before,block_before,mode,active;
+} VPEnginePrepareTiming;
+typedef struct {
+    uint64_t started;
+    uint32_t active,object,state,command,before,family,same_object,same_layout;
+} VPEngineSubmitTiming;
 typedef struct {
     VPThreadLocalAllocator allocator;
     Lock locks[VP_SDK_LOCK_LIMIT];
@@ -103,6 +146,13 @@ typedef struct {
     VPExecutor *main_executor;
     VPMovieColorTiming movie_color[64]; /* Main plus the 63 guest worker slots. */
     unsigned movie_color_samples;
+    VPEngineSubmitTiming engine_submit[64];
+    VPEnginePrepareTiming engine_prepare[64];
+    VPGameCostThread game_cost[64];
+    uint64_t engine_ab_poll_us;
+    uint32_t engine_ab_mode;
+    unsigned engine_ab_mode_valid;
+    VPEngineSubmitStats engine_stats;
     unsigned movie_readback_stacks;
     VPUnwindRegistry exceptions;
     VPSdkExceptionIndex indexes[4];
@@ -418,7 +468,504 @@ static int movie_color_probe_patch(FILE *log,VPNativeModule *m) {
     return rc;
 }
 
+static int engine_submit_probe_patch(FILE *log,VPNativeModule *m) {
+    FILE *marker=fopen("ux0:data/mhgu-vita-port/engine-submit-probe.enable","rb");
+    engine_submit_probe_enabled=marker!=NULL;
+    if (marker) fclose(marker);
+    fprintf(log,"ENGINE_SUBMIT_PROBE_MODE enabled=%d\n",engine_submit_probe_enabled);
+    if (!engine_submit_probe_enabled) return 0;
+    static const unsigned char file_sha[32]={
+        0xb3,0x93,0x54,0x15,0x49,0x95,0x49,0xad,0xaf,0x4c,0x0e,0x89,0x82,0x28,0x31,0xda,
+        0xa1,0x75,0xcf,0xd4,0x56,0xa7,0x99,0x07,0x91,0xc7,0x9b,0xe3,0x99,0x76,0x45,0xef};
+    static const unsigned char body_sha[32]={
+        0xe7,0x1e,0x66,0xbb,0xa8,0x8c,0x89,0xc1,0x8a,0xd8,0xd2,0xe4,0x65,0x1d,0xd3,0x18,
+        0x8c,0xcb,0x3a,0xed,0xf5,0x34,0x84,0xaf,0x9b,0x30,0xd2,0x10,0xc8,0xb4,0x65,0x7e};
+    static const struct {uint32_t site,word;void (*entry)(void);} sites[]={
+        {0xbc1764u,0xe92d4ff0u,vp_engine_submit_enter},
+        {0xbc23d4u,0xe28dd04cu,vp_engine_submit_leave}};
+    unsigned char sha[32];
+    if (memcmp(m->nso.file_sha256,file_sha,32)) return VP_PATCH_BINDING;
+    if (m->nso.segments[0].bytes<0xbc23dcu) return VP_PATCH_RANGE;
+    vp_sha256(m->image+0xbc1764u,0xc78u,sha);
+    if (memcmp(sha,body_sha,32)) return VP_PATCH_BINDING;
+    for (unsigned i=0;i<2u;i++)
+        if (word(m->image+sites[i].site)!=sites[i].word) return VP_PATCH_BINDING;
+    uint32_t off=m->island_offset+m->island_bytes;
+    if ((off&3u) || off>m->capacity || 32u>m->capacity-off) return VP_PATCH_RANGE;
+    for (unsigned i=0;i<2u;i++) {
+        int64_t delta=(int64_t)off+i*8u-sites[i].site-8;
+        if (delta<-(int64_t)VP_PATCH_BRANCH_REACH || delta>=VP_PATCH_BRANCH_REACH)
+            return VP_PATCH_REACH;
+    }
+    VPPatchTarget target;
+    int rc=vp_patch_open(&target,m->image,m->nso.span,m->base);
+    for (unsigned i=0;i<2u && !rc;i++) {
+        uint32_t island=m->base+off+i*8u;
+        uint32_t veneer[2]={0xe51ff004u,(uint32_t)(uintptr_t)sites[i].entry};
+        memcpy(m->image+off+i*8u,veneer,sizeof(veneer));
+        rc=vp_patch_site(&target,sites[i].site,sites[i].word,island);
+        fprintf(log,"ENGINE_SUBMIT_PATCH site=0x%x original=%08x island=%08x status=%d\n",
+            sites[i].site,sites[i].word,island,rc);
+    }
+    if (!rc) {
+        uint32_t replay[4]={0xe92d4ff0u,0xea000000u|
+            (((0xbc1768u-(off+20u+8u))>>2)&0xffffffu),
+            0xe28dd04cu,0xea000000u|(((0xbc23d8u-(off+28u+8u))>>2)&0xffffffu)};
+        memcpy(m->image+off+16u,replay,sizeof(replay));
+        engine_submit_replay=m->base+off+16u;
+        engine_submit_leave_replay=m->base+off+24u;
+        m->island_bytes+=32u;
+    }
+    return rc;
+}
+
+static int engine_layout_patch(FILE *log,VPNativeModule modules[4]) {
+    FILE *marker=fopen("ux0:data/mhgu-vita-port/engine-layout.enable","rb");
+    int enabled=marker!=NULL;
+    if (marker) fclose(marker);
+    fprintf(log,"ENGINE_LAYOUT_MODE enabled=%d\n",enabled);
+    if (!enabled) return 0;
+    if (engine_submit_probe_enabled) return VP_PATCH_BINDING;
+    VPNativeModule *m=&modules[1],*sdk=&modules[3];
+    static const unsigned char main_sha[32]={
+        0xe7,0x1e,0x66,0xbb,0xa8,0x8c,0x89,0xc1,0x8a,0xd8,0xd2,0xe4,0x65,0x1d,0xd3,0x18,
+        0x8c,0xcb,0x3a,0xed,0xf5,0x34,0x84,0xaf,0x9b,0x30,0xd2,0x10,0xc8,0xb4,0x65,0x7e};
+    static const struct {unsigned offset,bytes;unsigned char sha[32];} checks[]={
+        {0x33f8b0u,0x1b4u,{0x4c,0x22,0x37,0xd6,0xaa,0x39,0xc8,0x9a,
+            0x07,0x5d,0xe1,0xc8,0x0d,0x91,0x9c,0xdb,0xae,0xbb,0xe8,0x14,0xf0,0x4a,0x9f,0x4d,
+            0x96,0x9e,0xdb,0xb6,0x61,0xc2,0xc6,0x72}},
+        {0x33fa64u,0x154u,{0x81,0x70,0x47,0x6f,0xe0,0x5b,0x44,0x83,
+            0xc7,0x95,0x30,0xbe,0x82,0x7b,0xa1,0x59,0xf6,0x00,0x65,0xe2,0x72,0x31,0xde,0x98,
+            0xce,0xdf,0x4d,0xba,0xc9,0xe4,0xcb,0x53}}};
+    unsigned char sha[32];
+    if (m->nso.segments[0].bytes<0xbc23e4u || sdk->nso.segments[0].bytes<0x33fbb8u)
+        return VP_PATCH_RANGE;
+    if (word(m->image+0xbc23e0u)!=0x00c7ffbcu) return VP_PATCH_BINDING;
+    vp_sha256(m->image+0xbc1764u,0xc78u,sha);
+    if (memcmp(sha,main_sha,32)) return VP_PATCH_BINDING;
+    for (unsigned i=0;i<2u;i++) {
+        vp_sha256(sdk->image+checks[i].offset,checks[i].bytes,sha);
+        if (memcmp(sha,checks[i].sha,32)) return VP_PATCH_BINDING;
+    }
+    uint32_t off=m->island_offset+m->island_bytes;
+    if ((off&3u) || off>m->capacity || 20u>m->capacity-off) return VP_PATCH_RANGE;
+    int64_t delta=(int64_t)off-0xbc17d8u-8;
+    if (delta<-(int64_t)VP_PATCH_BRANCH_REACH || delta>=VP_PATCH_BRANCH_REACH) return VP_PATCH_REACH;
+    if (vp_engine_layout_init(sdk->base+0x33f8b0u,sdk->base+0x33fa64u)) return VP_PATCH_ARGUMENT;
+    vp_engine_layout_resume=m->base+0xbc1814u;
+    vp_engine_layout_fallback=m->base+off+8u;
+    uint32_t veneer[5]={0xe51ff004u,(uint32_t)(uintptr_t)vp_engine_layout_entry,
+        0xe59f0000u,0xea000000u|(((0xbc17dcu-(off+20u))>>2)&0xffffffu),
+        word(m->image+0xbc23e0u)};
+    memcpy(m->image+off,veneer,sizeof(veneer));
+    VPPatchTarget target;
+    int rc=vp_patch_open(&target,m->image,m->nso.span,m->base);
+    if (!rc) rc=vp_patch_site(&target,0xbc17d8u,0xe59f0c00u,m->base+off);
+    if (!rc) m->island_bytes+=20u;
+    fprintf(log,"ENGINE_LAYOUT_PATCH site=0xbc17d8 original=e59f0c00 continuation=%08x status=%d\n",
+        vp_engine_layout_resume,rc);
+    return rc;
+}
+
+/* The A/B control file is host state, never guest memory. Modes 0..9 are one
+ * digit and modes 10..12 are two digits without a leading zero; trailing
+ * whitespace is accepted. The loader reads a bounded prefix and hands the
+ * complete token to the same pure parser the host test exercises. Missing and
+ * malformed files are distinct so the caller can report the actual failure
+ * instead of falling back to a path. */
+static int engine_ab_read_control(uint32_t *mode) {
+    char text[VP_ENGINE_AB_CONTROL_MAX_BYTES+1u];
+    FILE *f=fopen(VP_ENGINE_AB_CONTROL_PATH,"rb");
+    if (!f) return 1;
+    size_t length=fread(text,1,sizeof(text),f);
+    int extra=fgetc(f),failed=ferror(f);
+    fclose(f);
+    unsigned parsed=0;
+    if (failed || extra!=EOF || vp_engine_ab_control_parse(text,length,&parsed))
+        return 2;
+    *mode=parsed;
+    return 0;
+}
+static int engine_marker_present(const char *path) {
+    FILE *marker=fopen(path,"rb");
+    if (marker) fclose(marker);
+    return marker!=NULL;
+}
+static int engine_texture_pipeline_marker(void) {
+    return !engine_marker_present("ux0:data/mhgu-vita-port/texture-pipeline.disable");
+}
+
+/* One startup record proving the complete texture/log configuration that was
+ * actually published. Values are read back atomically so the line cannot mix
+ * a pre-publish and post-publish state. */
+static void engine_log_texture_config(FILE *log,const char *source) {
+    fprintf(log,"ENGINE_TEXTURE_CONFIG source=%s deep=%u memory=%u idle=%u quiet=%u "
+        "shared=%u clear=%u\n",source,
+        __atomic_load_n(&vp_engine_texture_pipeline_enabled,__ATOMIC_ACQUIRE),
+        __atomic_load_n(&vp_engine_texture_memory_mode,__ATOMIC_ACQUIRE),
+        __atomic_load_n(&vp_engine_texture_idle_resize_enabled,__ATOMIC_ACQUIRE),
+        __atomic_load_n(&vp_engine_work_log_reduce_enabled,__ATOMIC_ACQUIRE),
+        __atomic_load_n(&vp_engine_shared_prepare_enabled,__ATOMIC_ACQUIRE),
+        __atomic_load_n(&vp_engine_clear_defer_enabled,__ATOMIC_ACQUIRE));
+    fflush(log);
+}
+
+/* Publish the complete texture memory configuration as one atomic value.
+ * When the deep pipeline is enabled, the memory mode is stored first and the
+ * pipeline flag second, so a reader can never observe "deep enabled" with a
+ * stale budget/class pair. When it is disabled, the pipeline flag is cleared
+ * first and the memory mode returns to the ordinary 64 MiB unified value. */
+static void engine_publish_texture_mode(uint32_t mode) {
+    uint32_t memory_mode=vp_engine_ab_mode_texture_memory(mode);
+    __atomic_store_n(&vp_engine_work_log_reduce_enabled,
+        vp_engine_ab_mode_reduces_work_log(mode)?1u:0u,__ATOMIC_RELEASE);
+    if (!vp_engine_ab_mode_uses_deep_texture(mode)) {
+        __atomic_store_n(&vp_engine_texture_pipeline_enabled,0u,__ATOMIC_RELEASE);
+        __atomic_store_n(&vp_engine_texture_memory_mode,0u,__ATOMIC_RELEASE);
+    } else {
+        __atomic_store_n(&vp_engine_texture_memory_mode,memory_mode,__ATOMIC_RELEASE);
+        __atomic_store_n(&vp_engine_texture_pipeline_enabled,1u,__ATOMIC_RELEASE);
+    }
+}
+
+static int engine_full_patch(FILE *log,VPNativeModule *m) {
+    FILE *marker=fopen("ux0:data/mhgu-vita-port/engine-full.enable","rb");
+    int full=marker!=NULL;
+    if (marker) fclose(marker);
+    FILE *ab_marker=fopen("ux0:data/mhgu-vita-port/engine-full-ab.enable","rb");
+    int ab=ab_marker!=NULL;
+    if (ab_marker) fclose(ab_marker);
+    FILE *fast_marker=fopen("ux0:data/mhgu-vita-port/engine-full-fast.enable","rb");
+    int fast=fast_marker!=NULL;
+    if (fast_marker) fclose(fast_marker);
+    int enabled=full||ab||fast;
+    vp_engine_full_fast_enabled=fast?1u:0u;
+    /* No downstream shared preparation unless mode 3 is selected below. The
+     * texture pipeline is a separate switch: A/B mode owns it when present;
+     * otherwise texture-pipeline.disable opts out of the default path. */
+    __atomic_store_n(&vp_engine_shared_prepare_enabled,0u,__ATOMIC_RELEASE);
+    __atomic_store_n(&vp_engine_texture_idle_resize_enabled,0u,__ATOMIC_RELEASE);
+    __atomic_store_n(&vp_engine_clear_defer_enabled,0u,__ATOMIC_RELEASE);
+    __atomic_store_n(&vp_engine_work_log_reduce_enabled,0u,__ATOMIC_RELEASE);
+    if (!ab) {
+        int texture_pipeline=engine_texture_pipeline_marker();
+        int pool128=engine_marker_present(
+            "ux0:data/mhgu-vita-port/texture-pool-128.enable");
+        int idle=engine_marker_present(
+            "ux0:data/mhgu-vita-port/texture-idle-recycle.enable");
+        int quiet=engine_marker_present(
+            "ux0:data/mhgu-vita-port/work-log-reduce.enable");
+        /* Ordinary startup never reads the mode experiment file. The three
+         * independent markers are read exactly once here. The 128 MiB budget
+         * and idle page recycle only exist inside the deep pipeline; asking
+         * for either while texture-pipeline.disable is present is refused
+         * instead of being silently ignored or downgraded. */
+        if (!vp_engine_startup_texture_valid(texture_pipeline,pool128,idle)) {
+            fprintf(log,"ENGINE_TEXTURE_CONFIG_ERROR reason=deep-required "
+                "pipeline=0 pool128=%d idle=%d quiet=%d\n",
+                pool128,idle,quiet);
+            fflush(log);
+            return VP_PATCH_ARGUMENT;
+        }
+        __atomic_store_n(&vp_engine_texture_memory_mode,
+            pool128?1u:0u,__ATOMIC_RELEASE);
+        __atomic_store_n(&vp_engine_texture_pipeline_enabled,
+            texture_pipeline?1u:0u,__ATOMIC_RELEASE);
+        __atomic_store_n(&vp_engine_texture_idle_resize_enabled,
+            idle?1u:0u,__ATOMIC_RELEASE);
+        __atomic_store_n(&vp_engine_work_log_reduce_enabled,
+            quiet?1u:0u,__ATOMIC_RELEASE);
+        engine_log_texture_config(log,"startup-markers");
+    }
+    fprintf(log,"ENGINE_FULL_MODE enabled=%d ab=%d\n",enabled,ab);
+    if (!enabled) {
+        engine_full_ab_enabled=0;
+        vp_engine_full_profile_enabled=0;
+        return 0;
+    }
+#ifdef VP_ENGINE_CAPTURE
+    /* The capture build stops by design on a fixed call count. Running it in
+     * the A/B profile would inject that stop into the measured interval, so
+     * the combination is refused instead of producing a contaminated sample. */
+    if (ab || fast) {
+        fprintf(log,"ENGINE_FULL_AB_REJECT reason=engine-capture-build ab=%d fast=%d\n",ab,fast);
+        fflush(log);
+        return VP_PATCH_BINDING;
+    }
+#endif
+    if (engine_submit_probe_enabled || vp_engine_layout_resume) {
+        fprintf(log,"ENGINE_FULL_AB_REJECT reason=exclusive-marker layout=%d probe=%d\n",
+            vp_engine_layout_resume!=0,engine_submit_probe_enabled!=0);
+        fflush(log);
+        return VP_PATCH_BINDING;
+    }
+    static const struct {uint32_t offset,bytes;const char *sha;} checks[]={
+        {0xbbe9c8u,7004u,"32a31fb8ec825cfab9c184d0864fab8411c12b41c93767fd26e9a8f5399b3b67"},
+        {0xbc0e98u,1328u,"57a40e584db356275bd74acc66213efda539a6f1891225dfcd0046083a158478"},
+        {0xbc13e0u,856u,"05ff02d5f4b4628c3d72728eb4a2047a15aaf002e5d1672a7098f33140ed6df9"},
+        {0xbc1764u,3192u,"e71e66bba88c89c18ad8d2e4651dd3188ccb3aedf53484af9b30d210c8b4657e"}};
+    static const char digits[]="0123456789abcdef";
+    for (unsigned i=0;i<4u;i++) {
+        const uint32_t offset=checks[i].offset,bytes=checks[i].bytes;
+        if (offset>m->nso.segments[0].bytes || bytes>m->nso.segments[0].bytes-offset)
+            return VP_PATCH_RANGE;
+        unsigned char sha[32];
+        vp_sha256(m->image+offset,bytes,sha);
+        for (unsigned j=0;j<32u;j++)
+            if (digits[sha[j]>>4]!=checks[i].sha[j*2u] ||
+                digits[sha[j]&15u]!=checks[i].sha[j*2u+1u]) return VP_PATCH_BINDING;
+    }
+    if (ab) {
+        uint32_t initial=0;
+        int control=engine_ab_read_control(&initial);
+        if (control) {
+            fprintf(log,"ENGINE_PREPARE_CONTROL_ERROR path=%s reason=%s status=%d\n",
+                VP_ENGINE_AB_CONTROL_PATH,control==1?"missing":"invalid",control);
+            fflush(log);
+            return VP_PATCH_ARGUMENT;
+        }
+        fprintf(log,"ENGINE_FULL_AB_MODE control=%s initial=%s\n",
+            VP_ENGINE_AB_CONTROL_PATH,vp_engine_ab_mode_name(initial));
+        __atomic_store_n(&vp_engine_shared_prepare_enabled,
+            vp_engine_ab_mode_uses_shared_prepare(initial)?1u:0u,__ATOMIC_RELEASE);
+        engine_publish_texture_mode(initial);
+        __atomic_store_n(&vp_engine_texture_idle_resize_enabled,
+            vp_engine_ab_mode_uses_idle_resize(initial)?1u:0u,__ATOMIC_RELEASE);
+        __atomic_store_n(&vp_engine_clear_defer_enabled,
+            vp_engine_ab_mode_uses_clear_defer(initial)?1u:0u,__ATOMIC_RELEASE);
+        engine_log_texture_config(log,"ab-mode");
+    }
+    if (m->island_offset>m->capacity || m->island_bytes>m->capacity-m->island_offset)
+        return VP_PATCH_RANGE;
+    uint32_t off=m->island_offset+m->island_bytes;
+    uint32_t island_bytes=ab?20u:8u;
+    if ((off&3u) || off>m->capacity || island_bytes>m->capacity-off) return VP_PATCH_RANGE;
+    if (ab && ((off+8u)&3u)) return VP_PATCH_RANGE;
+    int64_t delta=(int64_t)off-0xbbe9c8u-8;
+    if (delta<-(int64_t)VP_PATCH_BRANCH_REACH || delta>=VP_PATCH_BRANCH_REACH) return VP_PATCH_REACH;
+    if (vp_engine_full_init(m->base)) return VP_PATCH_ARGUMENT;
+    engine_full_ab_enabled=ab;
+    vp_engine_full_profile_enabled=ab?1u:0u;
+    uint32_t original[4]={0,0,0,0};
+    memcpy(original,m->image+0xbbe9c8u,sizeof(original));
+    if (ab)
+        fprintf(log,"ENGINE_FULL_AB_ORIGINAL site=0xbbe9c8 bytes=%08x,%08x,%08x,%08x\n",
+            original[0],original[1],original[2],original[3]);
+    uint32_t veneer[2]={0xe51ff004u,(uint32_t)(uintptr_t)vp_engine_full_entry};
+    memcpy(m->image+off,veneer,sizeof(veneer));
+    if (ab) {
+        /* Replay the displaced PUSH, then jump absolutely into the untouched
+         * original body at main+0xBBE9CC. PC-relative instructions inside the
+         * body stay at their linked addresses; no function bytes are copied. */
+        uint32_t trampoline[3]={0xe92d4ff0u,0xe51ff004u,m->base+0xbbe9ccu};
+        memcpy(m->image+off+8u,trampoline,sizeof(trampoline));
+        engine_full_ab_trampoline=m->base+off+8u;
+        fprintf(log,"ENGINE_FULL_AB_TRAMPOLINE address=0x%08x range=[0x%x,0x%x) "
+            "bytes=%08x,%08x,%08x target=0x%08x\n",
+            engine_full_ab_trampoline,m->base+off+8u,m->base+off+20u,
+            trampoline[0],trampoline[1],trampoline[2],m->base+0xbbe9ccu);
+    }
+    VPPatchTarget target;
+    int rc=vp_patch_open(&target,m->image,m->nso.span,m->base);
+    if (!rc) rc=vp_patch_site(&target,0xbbe9c8u,0xe92d4ff0u,m->base+off);
+    if (!rc) m->island_bytes+=island_bytes;
+    fprintf(log,"ENGINE_FULL_PATCH site=0xbbe9c8 original=e92d4ff0 veneer=0x%08x "
+        "trampoline=0x%08x island=[0x%x,0x%x) island_bytes=%u capacity=%u "
+        "branch_delta=%lld ab=%d status=%d\n",
+        m->base+off,ab?engine_full_ab_trampoline:0u,m->base+off,m->base+off+island_bytes,
+        island_bytes,m->capacity,(long long)delta,ab,rc);
+    return rc;
+}
+
+static int game_cost_patch(FILE *log, VPNativeModule *m) {
+    static const struct {
+        uint32_t offset, bytes, first;
+        const char *sha;
+        void (*entry)(void);
+    } sites[VP_GAME_COST_SITES] = {
+        {0x3da8fcu, 0x688u, 0xe92d4ff0u,
+         "8b5f4df7baf5038cbce56497b87b71c8de40779fdea3c64179ee573ec8fdd749", vp_game_cost_frame},
+        {0xbbe154u, 0x504u, 0xe92d4ff0u,
+         "36d52f82c0048a26998537d64597b65c91d9a01dbfad47afb391c1c0ea1f01fd", vp_game_cost_submit},
+        {0xbbe66cu, 0x184u, 0xe92d4ff0u,
+         "73113068eaf1b2c985cb7a4d8f8c97ad1e5cda4c1c8b482ba7fbbe41b2e5ca86", vp_game_cost_queue},
+        {0xbc0874u, 0x36cu, 0xe92d41f0u,
+         "a94873db81179626ef67cc814069fb4831934d590558c9f952952e01a213cac6", vp_game_cost_end_frame}
+    };
+    FILE *marker = fopen("ux0:data/mhgu-vita-port/game-cost.enable", "rb");
+    game_cost_enabled = marker != NULL;
+    if (marker) fclose(marker);
+    fprintf(log, "GAME_COST_MODE enabled=%d sites=%u\n", game_cost_enabled, VP_GAME_COST_SITES);
+    if (!game_cost_enabled) return 0;
+    /* Validate every immutable range before writing any site. The module
+     * identity has already passed the loader's locked input checks. */
+    const char *digits = "0123456789abcdef";
+    for (unsigned i = 0; i < VP_GAME_COST_SITES; ++i) {
+        unsigned char sha[32];
+        if (sites[i].offset > m->nso.span ||
+            sites[i].bytes > m->nso.span - sites[i].offset) return VP_PATCH_RANGE;
+        if (word(m->image + sites[i].offset) != sites[i].first) return VP_PATCH_BINDING;
+        vp_sha256(m->image + sites[i].offset, sites[i].bytes, sha);
+        for (unsigned j = 0; j < 32u; ++j)
+            if (digits[sha[j] >> 4] != sites[i].sha[j * 2u] ||
+                digits[sha[j] & 15u] != sites[i].sha[j * 2u + 1u]) return VP_PATCH_BINDING;
+    }
+    if (m->island_offset > m->capacity ||
+        m->island_bytes > m->capacity - m->island_offset) return VP_PATCH_RANGE;
+    uint32_t off = m->island_offset + m->island_bytes;
+    if ((off & 3u) || 20u * VP_GAME_COST_SITES > m->capacity - off) return VP_PATCH_RANGE;
+    for (unsigned i = 0; i < VP_GAME_COST_SITES; ++i) {
+        int64_t delta = (int64_t)(off + 20u * i) - sites[i].offset - 8;
+        if (delta < -(int64_t)VP_PATCH_BRANCH_REACH || delta >= VP_PATCH_BRANCH_REACH)
+            return VP_PATCH_REACH;
+    }
+    VPPatchTarget target;
+    int rc = vp_patch_open(&target, m->image, m->nso.span, m->base);
+    if (rc) return rc;
+    for (unsigned i = 0; i < VP_GAME_COST_SITES; ++i) {
+        uint32_t at = off + 20u * i;
+        uint32_t code[5] = {0xe51ff004u, (uint32_t)(uintptr_t)sites[i].entry,
+            sites[i].first, 0xe51ff004u, m->base + sites[i].offset + 4u};
+        memcpy(m->image + at, code, sizeof(code));
+        game_cost_trampolines[i] = m->base + at + 8u;
+        rc = vp_patch_site(&target, sites[i].offset, sites[i].first, m->base + at);
+        fprintf(log, "GAME_COST_PATCH id=%u site=0x%x bytes=4 original=%08x "
+            "island=[0x%x,0x%x) trampoline=0x%x return=0x%x branch_delta=%lld status=%d\n",
+            i, sites[i].offset, sites[i].first, m->base + at, m->base + at + 20u,
+            game_cost_trampolines[i], code[4], (long long)at - sites[i].offset - 8, rc);
+        if (rc) return rc;
+    }
+    m->island_bytes += 20u * VP_GAME_COST_SITES;
+    return 0;
+}
+
+static int resource_guard(const VPNativeModule *m, uint32_t offset,
+                          uint32_t bytes, const char *expected) {
+    if (offset > m->nso.span || bytes > m->nso.span - offset) return VP_PATCH_RANGE;
+    unsigned char sha[32];
+    const char *digits="0123456789abcdef";
+    vp_sha256(m->image+offset,bytes,sha);
+    for (unsigned i=0;i<32u;++i)
+        if (digits[sha[i]>>4]!=expected[i*2u] ||
+            digits[sha[i]&15u]!=expected[i*2u+1u]) return VP_PATCH_BINDING;
+    return 0;
+}
+
+static int title_heap_experiment_patch(FILE *log, VPNativeModule *m) {
+    FILE *marker=fopen("ux0:data/mhgu-vita-port/title-texture-heap-256.enable","rb");
+    unsigned texture_mib=marker?256u:850u;
+    if (marker) fclose(marker);
+    marker=fopen("ux0:data/mhgu-vita-port/title-texture-heap-512.enable","rb");
+    if (marker) {
+        fclose(marker);
+        if (texture_mib==256u) return VP_PATCH_BINDING;
+        texture_mib=512u;
+    }
+    fprintf(log,"TITLE_HEAP_MODE texture_mib=%u\n",texture_mib);
+    if (texture_mib==850u) return 0;
+    int rc=resource_guard(m,VP_TITLE_HEAP_GUARD_OFFSET,VP_TITLE_HEAP_GUARD_BYTES,
+                          VP_TITLE_HEAP_GUARD_SHA);
+    if (rc) return rc;
+    VPPatchTarget target;
+    rc=vp_patch_open(&target,m->image,m->nso.span,m->base);
+    for (unsigned i=0;i<sizeof(vp_title_heap_words)/sizeof(vp_title_heap_words[0]) && !rc;++i) {
+        const VPTitleHeapWord *p=&vp_title_heap_words[i];
+        uint32_t replacement=texture_mib==512u?p->reduced512:p->reduced256;
+        rc=vp_patch_word(&target,p->offset,p->original,replacement);
+        fprintf(log,"TITLE_HEAP_PATCH site=0x%x original=%08x replacement=%08x status=%d\n",
+                p->offset,p->original,replacement,rc);
+    }
+    return rc;
+}
+
+static int native_display_patch(FILE *log, VPNativeModule *game) {
+    if (!vp_guest_pixel_font_native_enabled()) return 0;
+    int rc=resource_guard(game,VP_NATIVE_DISPLAY_GUARD_OFFSET,
+                          VP_NATIVE_DISPLAY_GUARD_BYTES,VP_NATIVE_DISPLAY_GUARD_SHA);
+    if (rc) return rc;
+    VPPatchTarget target;
+    rc=vp_patch_open(&target,game->image,game->nso.span,game->base);
+    for (unsigned i=0;i<2u && !rc;++i) {
+        const VPNativeDisplayWord *p=&vp_native_display_words[i];
+        rc=vp_patch_word(&target,p->offset,p->original,p->replacement);
+        fprintf(log,"NATIVE_FONT_DISPLAY_PATCH site=0x%x original=%08x replacement=%08x status=%d\n",
+                p->offset,p->original,p->replacement,rc);
+    }
+    return rc;
+}
+
+static int resource_lifecycle_patch(FILE *log, VPNativeModule modules[4]) {
+    FILE *marker=fopen("ux0:data/mhgu-vita-port/resource-lifecycle.enable","rb");
+    unsigned trace=marker!=NULL;
+    if (marker) fclose(marker);
+    unsigned font=vp_guest_pixel_font_enabled();
+    fprintf(log,"RESOURCE_LIFECYCLE_MODE enabled=%u pixel_font=%u\n",trace,font);
+    if (!trace && !font) return 0;
+    VPNativeModule *game=&modules[1],*sdk=&modules[3];
+    FILE *font_trace=fopen("ux0:data/mhgu-vita-port/pixel-font-trace.enable","rb");
+    unsigned trace_font=font && font_trace!=NULL;
+    unsigned native_font=font && vp_guest_pixel_font_native_enabled();
+    const unsigned count=6u+(trace_font?2u:0u)+((trace_font||native_font)?4u:0u);
+    if (font_trace) fclose(font_trace);
+    const uint32_t bytes=(uint32_t)(vp_sdk_svc_site_end-vp_sdk_svc_site_template);
+    const uint32_t service_at=(uint32_t)(vp_sdk_svc_site_service_value-vp_sdk_svc_site_template);
+    const uint32_t return_at=(uint32_t)(vp_sdk_svc_site_continuation_value-vp_sdk_svc_site_template);
+    const uint32_t branch_at=(uint32_t)(vp_sdk_svc_site_branch-vp_sdk_svc_site_template);
+    const uint32_t stride=(8u+bytes+15u)&~15u;
+    const uint32_t base=sdk->island_offset+sdk->island_bytes;
+    if (sdk->island_offset>sdk->capacity || base>sdk->capacity ||
+        count*stride>sdk->capacity-base || service_at+4u>bytes ||
+        return_at+4u>bytes || branch_at+4u>bytes) return VP_PATCH_RANGE;
+    for (unsigned i=0;i<count;++i) {
+        const VPResourceProbeSite *p=&vp_resource_probe_sites[(i<6u || trace_font)?i:i+2u];
+        int rc=resource_guard(game,p->offset,64u,p->sha);
+        if (rc) return rc;
+        int64_t delta=(int64_t)(uint32_t)(uintptr_t)vp_bridge_saved_entry-
+                      (sdk->base+base+i*stride+8u+branch_at+8u);
+        if ((delta&3) || delta<-(int64_t)VP_PATCH_BRANCH_REACH ||
+            delta>=(int64_t)VP_PATCH_BRANCH_REACH) return VP_PATCH_REACH;
+    }
+    VPPatchTarget target;
+    int rc=vp_patch_open(&target,game->image,game->nso.span,game->base);
+    if (rc) return rc;
+    for (unsigned i=0;i<count;++i) {
+        const VPResourceProbeSite *p=&vp_resource_probe_sites[(i<6u || trace_font)?i:i+2u];
+        uint32_t at=base+i*stride, island=sdk->base+at;
+        uint32_t continuation=game->base+p->offset+8u;
+        uint32_t original[2]={p->first,p->second};
+        memcpy(sdk->image+at,original,8u);
+        memcpy(sdk->image+at+8u,vp_sdk_svc_site_template,bytes);
+        memset(sdk->image+at+8u+bytes,0,stride-8u-bytes);
+        memcpy(sdk->image+at+8u+service_at,&p->service,4u);
+        memcpy(sdk->image+at+8u+return_at,&continuation,4u);
+        int64_t delta=(int64_t)(uint32_t)(uintptr_t)vp_bridge_saved_entry-
+                      (island+8u+branch_at+8u);
+        uint32_t branch=0xea000000u|((uint32_t)(delta>>2)&0xffffffu);
+        memcpy(sdk->image+at+8u+branch_at,&branch,4u);
+        rc=vp_patch_word(&target,p->offset,p->first,0xe51ff004u);
+        if (!rc) rc=vp_patch_word(&target,p->offset+4u,p->second,island);
+        fprintf(log,"RESOURCE_LIFECYCLE_PATCH name=%s site=0x%x bytes=8 island=0x%x "
+                "return=0x%x bridge_delta=%lld status=%d\n",p->name,p->offset,island,
+                continuation,(long long)delta,rc);
+        if (rc) return rc;
+    }
+    sdk->island_bytes=base+count*stride-sdk->island_offset;
+    return 0;
+}
+
 int vp_sdk_dso_patch(FILE *log,VPNativeModule modules[4]) {
+    int resource_rc=title_heap_experiment_patch(log,&modules[1]);
+    if (!resource_rc) resource_rc=native_display_patch(log,&modules[1]);
+    if (!resource_rc) resource_rc=resource_lifecycle_patch(log,modules);
+    if (resource_rc) return resource_rc;
+    int engine_rc=engine_submit_probe_patch(log,&modules[1]);
+    if (engine_rc) return engine_rc;
+    engine_rc=engine_layout_patch(log,modules);
+    if (engine_rc) return engine_rc;
+    engine_rc=engine_full_patch(log,&modules[1]);
+    if (engine_rc) return engine_rc;
+    engine_rc=game_cost_patch(log,&modules[1]);
+    if (engine_rc) return engine_rc;
     int color_rc=movie_color_probe_patch(log,&modules[2]);
     if (color_rc) {
         fprintf(log,"MOVIE_COLOR_PROBE_REJECT status=%d\n",color_rc);fflush(log);
@@ -801,8 +1348,440 @@ static int movie_color_probe_service(Session *s,VPExecutor *e,VPBridgeFrame *f) 
     return 0;
 }
 
-static int dispatch_locked(VPExecutor *e,VPBridgeFrame *f) {
+static void engine_submit_report(Session *s) {
+    const VPEngineSubmitStats *p=&s->engine_stats;
+    fprintf(s->log,"ENGINE_SUBMIT_STATS calls=%llu same_object=%llu same_layout=%llu "
+        "elapsed_us=%llu max_us=%u encoded_bytes=%llu families=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+        (unsigned long long)p->calls,(unsigned long long)p->same_object,
+        (unsigned long long)p->same_layout,(unsigned long long)p->elapsed_us,p->max_us,
+        (unsigned long long)p->encoded_bytes,(unsigned long long)p->families[0],
+        (unsigned long long)p->families[1],(unsigned long long)p->families[2],
+        (unsigned long long)p->families[3],(unsigned long long)p->families[4],
+        (unsigned long long)p->families[5],(unsigned long long)p->families[6],
+        (unsigned long long)p->families[7],(unsigned long long)p->families[8]);
+}
+
+static int engine_submit_probe_service(Session *s,VPExecutor *e,VPBridgeFrame *f) {
+    if (!engine_submit_probe_enabled) return VP_BRIDGE_UNSUPPORTED;
+    VPGuestThread *thread=thread_for_executor(e);
+    unsigned slot;
+    if (e==s->main_executor) slot=0u;
+    else if (thread && thread->handle) slot=1u+(unsigned)(thread-thread_pool.threads);
+    else return VP_BRIDGE_ARGUMENT;
+    VPEngineSubmitTiming *t=&s->engine_submit[slot];
+    if (f->service==0x250u) {
+        uint32_t state=f->regs[1],object=f->regs[2],old,layout,old_layout=0u;
+        if (t->active || state>UINT32_MAX-0x14u || object>UINT32_MAX-12u ||
+            !vp_guest_svc_readable(&s->svc,state,0x14u) ||
+            !vp_guest_svc_readable(&s->svc,object,12u) ||
+            f->sp<36u || !writable(e,s,f->sp-36u,36u)) return VP_BRIDGE_ARGUMENT;
+        old=word((void *)(uintptr_t)(state+0x10u));
+        layout=word((void *)(uintptr_t)(object+8u));
+        if (old) {
+            if (old>UINT32_MAX-12u || !vp_guest_svc_readable(&s->svc,old,12u))
+                return VP_BRIDGE_ARGUMENT;
+            old_layout=word((void *)(uintptr_t)(old+8u));
+        }
+        uint32_t command=word((void *)(uintptr_t)(state+4u));
+        if (command>UINT32_MAX-0x2cu || !vp_guest_svc_readable(&s->svc,command,0x2cu))
+            return VP_BRIDGE_ARGUMENT;
+        *t=(VPEngineSubmitTiming){.active=1u,.object=object,.state=state,
+            .command=command,.before=word((void *)(uintptr_t)(command+12u)),
+            .family=vp_engine_submit_family(f->lr-e->modules[1].base),
+            .same_object=old==object,.same_layout=old && old_layout==layout};
+        if (s->engine_stats.calls<16u)
+            fprintf(s->log,"ENGINE_SUBMIT_SAMPLE thread=%u caller=%08x ctx=%08x state=%08x "
+                "object=%08x old=%08x layout=%08x old_layout=%08x command=%08x family=%u\n",
+                slot,f->lr-e->modules[1].base,f->regs[0],state,object,old,layout,old_layout,
+                command,t->family);
+        /* PUSH must run after restoring the bridge frame: its guest stack
+         * destination overlaps the tail of the currently saved frame. */
+        f->pc=engine_submit_replay;
+        t->started=sceKernelGetProcessTimeWide();
+    } else {
+        uint64_t elapsed=sceKernelGetProcessTimeWide()-t->started;
+        if (!t->active || f->sp>UINT32_MAX-0x4cu) return VP_BRIDGE_ARGUMENT;
+        uint32_t after=word((void *)(uintptr_t)(t->command+12u));
+        /* A command-buffer growth is not a contiguous byte range. */
+        uint32_t bytes=after>=t->before && after-t->before<0x100000u ? after-t->before:0u;
+        vp_engine_submit_account(&s->engine_stats,t->family,t->same_object,t->same_layout,
+            elapsed>UINT32_MAX?UINT32_MAX:(uint32_t)elapsed,bytes);
+        t->active=0u;
+        f->pc=engine_submit_leave_replay;
+        if (!(s->engine_stats.calls&4095u)) engine_submit_report(s);
+    }
+    return 0;
+}
+
+/* The vi:obj BufferQueue model releases a queued slot when the producer asks
+ * for a new buffer. That counter is cumulative; the analyzer uses deltas
+ * between recorded samples, never the absolute value as an interval count. */
+static uint32_t engine_prepare_presents(const Session *s) {
+    uint32_t presents=0;
+    for (unsigned i=0;i<VP_GUEST_HANDLE_LIMIT;++i) {
+        const VPGuestHandle *h=&s->svc.handles[i];
+        if (h->kind!=2u || strcmp(h->name,"vi:obj")) continue;
+        if (h->session<1u || h->session>VP_GUEST_SESSION_LIMIT) continue;
+        uint32_t add=s->svc.sessions[h->session-1u].binder_presents;
+        presents=add>UINT32_MAX-presents?UINT32_MAX:presents+add;
+    }
+    return presents;
+}
+
+/* Poll at most twice per second, always before the root entry timestamp. The
+ * poll and its file I/O are therefore part of the frame but not of the reported
+ * root interval, and both paths pay the same cadence. */
+static int engine_prepare_ab_poll(Session *s,uint64_t now) {
+    if (s->engine_ab_mode_valid && now>=s->engine_ab_poll_us
+        && now-s->engine_ab_poll_us<VP_ENGINE_AB_POLL_US) return 0;
+    s->engine_ab_poll_us=now;
+    uint32_t mode=0;
+    int rc=engine_ab_read_control(&mode);
+    if (rc) {
+        __atomic_store_n(&vp_engine_shared_prepare_enabled,0u,__ATOMIC_RELEASE);
+        __atomic_store_n(&vp_engine_work_log_reduce_enabled,0u,__ATOMIC_RELEASE);
+        __atomic_store_n(&vp_engine_texture_pipeline_enabled,0u,__ATOMIC_RELEASE);
+        __atomic_store_n(&vp_engine_texture_memory_mode,0u,__ATOMIC_RELEASE);
+        __atomic_store_n(&vp_engine_texture_idle_resize_enabled,0u,__ATOMIC_RELEASE);
+        __atomic_store_n(&vp_engine_clear_defer_enabled,0u,__ATOMIC_RELEASE);
+        fprintf(s->log,"ENGINE_PREPARE_CONTROL_ERROR path=%s reason=%s status=%d thread=0x%x\n",
+            VP_ENGINE_AB_CONTROL_PATH,rc==1?"missing":"invalid",rc,
+            s->svc.current_thread_handle);
+        fflush(s->log);
+        return VP_BRIDGE_ARGUMENT;
+    }
+    /* Publish before the root timestamp so this call's downstream draws and
+     * the elapsed_us interval see the same mode decision. */
+    __atomic_store_n(&vp_engine_shared_prepare_enabled,
+        vp_engine_ab_mode_uses_shared_prepare(mode)?1u:0u,__ATOMIC_RELEASE);
+    engine_publish_texture_mode(mode);
+    __atomic_store_n(&vp_engine_texture_idle_resize_enabled,
+        vp_engine_ab_mode_uses_idle_resize(mode)?1u:0u,__ATOMIC_RELEASE);
+    __atomic_store_n(&vp_engine_clear_defer_enabled,
+        vp_engine_ab_mode_uses_clear_defer(mode)?1u:0u,__ATOMIC_RELEASE);
+    if (!s->engine_ab_mode_valid || mode!=s->engine_ab_mode) {
+        fprintf(s->log,"ENGINE_PREPARE_PHASE mode=%s t_us=%llu previous=%s thread=0x%x\n",
+            vp_engine_ab_mode_name(mode),(unsigned long long)now,
+            s->engine_ab_mode_valid?vp_engine_ab_mode_name(s->engine_ab_mode):"none",
+            s->svc.current_thread_handle);
+        fflush(s->log);
+    }
+    s->engine_ab_mode=mode;
+    s->engine_ab_mode_valid=1;
+    return 0;
+}
+
+static int engine_prepare_ab_service(Session *s,VPExecutor *e,VPBridgeFrame *f) {
+    if (!engine_full_ab_enabled) return VP_BRIDGE_UNSUPPORTED;
+    VPGuestThread *thread=thread_for_executor(e);
+    unsigned slot;
+    if (e==s->main_executor) slot=0u;
+    else if (thread && thread->handle && thread>=thread_pool.threads
+        && (unsigned)(thread-thread_pool.threads)<VP_GUEST_THREAD_LIMIT)
+        slot=1u+(unsigned)(thread-thread_pool.threads);
+    else return VP_BRIDGE_ARGUMENT;
+    VPEnginePrepareTiming *t=&s->engine_prepare[slot];
+    if (f->service==0x253u) {
+        if (t->active) {
+            fprintf(s->log,"ENGINE_PREPARE_NESTED slot=%u thread=0x%x context=0x%08x mode=%s\n",
+                slot,s->svc.current_thread_handle,f->regs[0],
+                vp_engine_ab_mode_name(t->mode));
+            fflush(s->log);
+            return VP_BRIDGE_ARGUMENT;
+        }
+        /* Poll first, then take the start timestamp. The file access is
+         * deliberate frame work on both paths; it is not charged to root time. */
+        int rc=engine_prepare_ab_poll(s,sceKernelGetProcessTimeWide());
+        if (rc) return rc;
+        uint64_t started=sceKernelGetProcessTimeWide();
+        uint32_t context=f->regs[0];
+        if (context>UINT32_MAX-0x98u
+            || !vp_guest_svc_readable(&s->svc,context+0x94u,4u)) {
+            fprintf(s->log,"ENGINE_PREPARE_ENTER_ERROR slot=%u thread=0x%x reason=context context=0x%08x\n",
+                slot,s->svc.current_thread_handle,context);
+            fflush(s->log);
+            return VP_BRIDGE_ARGUMENT;
+        }
+        uint32_t command=word((void *)(uintptr_t)(context+0x94u));
+        if (command>UINT32_MAX-0x2cu || !vp_guest_svc_readable(&s->svc,command,0x2cu)) {
+            fprintf(s->log,"ENGINE_PREPARE_ENTER_ERROR slot=%u thread=0x%x reason=command command=0x%08x\n",
+                slot,s->svc.current_thread_handle,command);
+            fflush(s->log);
+            return VP_BRIDGE_ARGUMENT;
+        }
+        uint32_t mode=s->engine_ab_mode;
+        /* Only modes 1 and 2 use the native C bodies. Every other valid mode,
+         * including 3, 4..9 and the 10..12 combinations, executes the original
+         * root trampoline. Mode 3 enables shared preparation; 4..12 enable the
+         * deep texture pipeline; 5/6/10/11 enable idle page resizing before a
+         * GPU drain, and only 6 defers the full-colour clear boundary. Modes
+         * 7/11/12 publish the 128 MiB budget; only 8 publishes split raw. */
+        uint32_t target=vp_engine_ab_mode_uses_fast_c(mode)?
+            (uint32_t)(uintptr_t)vp_engine_full_run_fast:
+            vp_engine_ab_mode_uses_native_c(mode)?
+            (uint32_t)(uintptr_t)vp_engine_full_run:engine_full_ab_trampoline;
+        if (!s->engine_ab_mode_valid || !vp_engine_ab_mode_valid(mode) || !target) {
+            fprintf(s->log,"ENGINE_PREPARE_ENTER_ERROR slot=%u thread=0x%x reason=target mode=%u target=0x%08x\n",
+                slot,s->svc.current_thread_handle,mode,target);
+            fflush(s->log);
+            return VP_BRIDGE_ARGUMENT;
+        }
+        t->entry_us=started;
+        t->context=context;
+        t->command=command;
+        t->before=word((void *)(uintptr_t)(command+12u));
+        t->block_before=word((void *)(uintptr_t)(command+0x28u));
+        t->mode=mode;
+        t->active=1u;
+        /* r0 stays context; the bridge restores it and this write supplies ip. */
+        f->regs[12]=target;
+        return 0;
+    }
+    if (f->service!=0x254u) return VP_BRIDGE_UNSUPPORTED;
+    uint64_t ended=sceKernelGetProcessTimeWide();
+    if (!t->active) {
+        fprintf(s->log,"ENGINE_PREPARE_LEAVE_ERROR slot=%u thread=0x%x reason=not-active\n",
+            slot,s->svc.current_thread_handle);
+        fflush(s->log);
+        return VP_BRIDGE_ARGUMENT;
+    }
+    /* Only the native C bodies (modes 1 and 2) declare a result. The original
+     * root trampoline is used by every other mode; its callers do not consume
+     * r0, so any value is valid there. */
+    if ((vp_engine_ab_mode_uses_native_c(t->mode) ||
+         vp_engine_ab_mode_uses_fast_c(t->mode)) && f->regs[0]) {
+        fprintf(s->log,"ENGINE_FULL_FATAL rc=%d\n",(int32_t)f->regs[0]);
+        vp_engine_full_report(s->log);
+        fflush(s->log);
+        t->active=0u;
+        return VP_BRIDGE_ARGUMENT;
+    }
+    uint32_t bytes=0u,growth=1u;
+    if (t->command<=UINT32_MAX-0x2cu
+        && vp_guest_svc_readable(&s->svc,t->command,0x2cu)) {
+        uint32_t after=word((void *)(uintptr_t)(t->command+12u));
+        if (after>=t->before && after-t->before<0x100000u &&
+            word((void *)(uintptr_t)(t->command+0x28u))==t->block_before) {
+            bytes=after-t->before;
+            growth=0u;
+        }
+    }
+    uint64_t elapsed=ended>=t->entry_us?ended-t->entry_us:0u;
+    fprintf(s->log,"ENGINE_PREPARE_TIME mode=%s thread=0x%x context=0x%08x "
+        "entry_us=%llu t_us=%llu elapsed_us=%llu encoded_bytes=%u growth=%u presents=%u\n",
+        vp_engine_ab_mode_name(t->mode),s->svc.current_thread_handle,t->context,
+        (unsigned long long)t->entry_us,(unsigned long long)ended,
+        (unsigned long long)elapsed,bytes,growth,engine_prepare_presents(s));
+    t->active=0u;
+    return 0;
+}
+
+static int game_cost_service(Session *s, VPExecutor *e, VPBridgeFrame *f) {
+    if (!game_cost_enabled) return VP_BRIDGE_UNSUPPORTED;
+    unsigned site = f->regs[12];
+    if (site >= VP_GAME_COST_SITES) return VP_BRIDGE_ARGUMENT;
+    VPGuestThread *thread = thread_for_executor(e);
+    unsigned slot;
+    if (e == s->main_executor) slot = 0u;
+    else if (thread && thread->handle && thread >= thread_pool.threads &&
+        (unsigned)(thread - thread_pool.threads) < VP_GUEST_THREAD_LIMIT)
+        slot = 1u + (unsigned)(thread - thread_pool.threads);
+    else return VP_BRIDGE_ARGUMENT;
+    VPGameCostThread *cost = &s->game_cost[slot];
+    uint64_t now = sceKernelGetProcessTimeWide();
+    if (f->service == 0x255u) {
+        if (cost->depth == VP_GAME_COST_DEPTH ||
+            !vp_guest_svc_readable(&s->svc, f->sp, 8u)) {
+            fprintf(s->log, "GAME_COST_ERROR reason=entry slot=%u site=%u depth=%u\n",
+                slot, site, cost->depth);
+            return VP_BRIDGE_ARGUMENT;
+        }
+        VPGameCostSpan *span = &cost->stack[cost->depth++];
+        span->started = now;
+        span->child_us = 0u;
+        span->bridge_us = span->bridge_calls = 0u;
+        span->site = site;
+        span->context = f->regs[0];
+        span->caller = word((void *)(uintptr_t)(f->sp + 4u));
+        span->presents = engine_prepare_presents(s);
+        f->regs[12] = game_cost_trampolines[site];
+        if (!f->regs[12]) return VP_BRIDGE_ARGUMENT;
+        return 0;
+    }
+    if (!cost->depth || cost->stack[cost->depth - 1u].site != site) {
+        fprintf(s->log, "GAME_COST_ERROR reason=leave slot=%u site=%u depth=%u\n",
+            slot, site, cost->depth);
+        return VP_BRIDGE_ARGUMENT;
+    }
+    VPGameCostSpan span = cost->stack[--cost->depth];
+    if (now < span.started || now - span.started < span.child_us + span.bridge_us) {
+        fprintf(s->log, "GAME_COST_ERROR reason=clock slot=%u site=%u\n", slot, site);
+        return VP_BRIDGE_ARGUMENT;
+    }
+    uint64_t elapsed = now - span.started;
+    if (cost->depth) cost->stack[cost->depth - 1u].child_us += elapsed;
+    fprintf(s->log, "GAME_COST_TIME site=%u slot=%u thread=0x%x depth=%u "
+        "context=0x%x caller=0x%x entry_us=%llu t_us=%llu incl_us=%llu self_us=%llu "
+        "bridge_us=%llu bridge_calls=%llu presents_before=%u presents_after=%u\n", site, slot, s->svc.current_thread_handle,
+        cost->depth, span.context, span.caller, (unsigned long long)span.started,
+        (unsigned long long)now, (unsigned long long)elapsed,
+        (unsigned long long)(elapsed - span.child_us),
+        (unsigned long long)span.bridge_us, (unsigned long long)span.bridge_calls,
+        span.presents, engine_prepare_presents(s));
+    return 0;
+}
+
+static int dispatch_locked_body(VPExecutor *e,VPBridgeFrame *f);
+
+/* Original-function self wall includes calls into the platform bridge. Account
+ * these separately on the active innermost original span. This is wall time,
+ * including blocking/worker handoff; subtraction is not a CPU-cycle claim. */
+static int dispatch_locked(VPExecutor *e, VPBridgeFrame *f) {
+    Session *s = e->user;
+    VPGameCostThread *cost = NULL;
+    if (game_cost_enabled && f->service != 0x255u && f->service != 0x256u) {
+        if (e == s->main_executor) cost = &s->game_cost[0];
+        else {
+            VPGuestThread *thread = thread_for_executor(e);
+            if (thread && thread->handle && thread >= thread_pool.threads &&
+                (unsigned)(thread - thread_pool.threads) < VP_GUEST_THREAD_LIMIT)
+                cost = &s->game_cost[1u + (unsigned)(thread - thread_pool.threads)];
+        }
+    }
+    unsigned depth = cost ? cost->depth : 0u;
+    uint64_t started = depth ? sceKernelGetProcessTimeWide() : 0u;
+    int rc = dispatch_locked_body(e, f);
+    if (started) {
+        uint64_t ended = sceKernelGetProcessTimeWide();
+        if (cost->depth != depth || ended < started) {
+            fprintf(s->log, "GAME_COST_ERROR reason=bridge-depth-or-clock depth=%u\n", depth);
+            return VP_BRIDGE_ARGUMENT;
+        }
+        cost->stack[depth - 1u].bridge_us += ended - started;
+        cost->stack[depth - 1u].bridge_calls++;
+    }
+    return rc;
+}
+
+static int dispatch_locked_body(VPExecutor *e,VPBridgeFrame *f) {
     Session *s=e->user;
+    if (f->service==0x261u || f->service==0x262u) {
+        return vp_guest_pixel_font_quad_uv(&s->svc,f->regs)<0?VP_BRIDGE_ARGUMENT:0;
+    }
+    if (f->service==0x25fu || f->service==0x260u) {
+        if (vp_guest_pixel_font_quad(&s->svc,f->regs,f->service-0x25fu)<0)
+            return VP_BRIDGE_ARGUMENT;
+        static int trace_font=-1;
+        if (trace_font<0) {
+            FILE *marker=fopen("ux0:data/mhgu-vita-port/pixel-font-trace.enable","rb");
+            trace_font=marker!=NULL;
+            if (marker) fclose(marker);
+        }
+        if (!trace_font) return 0;
+        static uint32_t signatures[128];
+        static unsigned used;
+        uint32_t owner=f->regs[0],ctx=f->regs[1],ch=f->regs[2];
+        if (!vp_guest_svc_readable(&s->svc,owner,0x58u) ||
+            !vp_guest_svc_readable(&s->svc,ctx,0x40u) ||
+            !vp_guest_svc_readable(&s->svc,ch,0x2cu)) return VP_BRIDGE_ARGUMENT;
+        const uint8_t *p=(const uint8_t *)(uintptr_t)ch;
+        uint32_t glyph=word(p+0xcu);
+        if (!glyph) return 0;
+        if (!vp_guest_svc_readable(&s->svc,glyph,20u)) return VP_BRIDGE_ARGUMENT;
+        const uint8_t *g=(const uint8_t *)(uintptr_t)glyph;
+        uint32_t cp=word(g);
+        if (cp<0x3000u) return 0;
+        uint32_t sig=2166136261u;
+        const uint8_t *o=(const uint8_t *)(uintptr_t)owner;
+        const uint8_t *c=(const uint8_t *)(uintptr_t)ctx;
+        for (unsigned i=0;i<12u;++i) sig=(sig^word(o+0x10u+i*4u))*16777619u;
+        sig=(sig^word(c))*16777619u;
+        sig=(sig^word(p+0x18u))*16777619u;
+        sig=(sig^word(p+0x1cu))*16777619u;
+        for (unsigned i=0;i<used;++i) if (signatures[i]==sig) return 0;
+        if (used==128u) return 0;
+        signatures[used++]=sig;
+        fprintf(s->log,"PIXEL_FONT_QUAD kind=%u owner=%x ctx=%x cp=%x glyph=%08x,%08x,%08x,%08x,%08x xywh=",
+                f->service-0x25fu,owner,ctx,cp,word(g),word(g+4u),word(g+8u),word(g+12u),word(g+16u));
+        for (unsigned i=0;i<4u;++i) {float v;memcpy(&v,p+0x10u+i*4u,4u);fprintf(s->log,"%s%.9g",i?",":"",(double)v);}
+        fprintf(s->log," matrix=");
+        for (unsigned i=0;i<16u;++i) {float v;memcpy(&v,o+0x10u+i*4u,4u);fprintf(s->log,"%s%.9g",i?",":"",(double)v);}
+        fprintf(s->log," ctxwords=");
+        for (unsigned i=0;i<16u;++i) fprintf(s->log,"%s%08x",i?",":"",word(c+i*4u));
+        fprintf(s->log,"\n");
+        return 0;
+    }
+    if (f->service==0x25du || f->service==0x25eu) {
+        static unsigned calls[2];
+        unsigned kind=f->service-0x25du;
+        if (calls[kind]++<48u) {
+            uint32_t font=f->regs[0];
+            if (!vp_guest_svc_readable(&s->svc,font,0xd8u)) return VP_BRIDGE_ARGUMENT;
+            const uint8_t *p=(const uint8_t *)(uintptr_t)font;
+            fprintf(s->log,"PIXEL_FONT_ORIGINAL kind=%u font=0x%x arg=0x%x "
+                "pages=%u glyphs=%u records=0x%x textures=0x%x flags=0x%x lr=0x%x\n",
+                kind,font,f->regs[1],word(p+0x98u),word(p+0x9cu),word(p+0xacu),
+                word(p+0xb8u),word(p+0xc4u),f->lr);
+        }
+        return 0;
+    }
+    if (f->service>=0x257u && f->service<=0x25cu) {
+        static uint32_t sequence;
+        unsigned id=f->service-0x257u;
+        uint32_t object=id==1u?f->regs[4]:f->regs[0];
+        if (vp_guest_pixel_font_event(&s->svc,id,object)<0) {
+            fprintf(s->log,"PIXEL_FONT_RESOURCE_REJECT event=%u object=0x%x\n",id,object);
+            return VP_BRIDGE_ARGUMENT;
+        }
+        /* The production font hook needs identity, not full resource dumps. */
+        static int resource_trace=-1;
+        if (resource_trace<0) {
+            FILE *marker=fopen("ux0:data/mhgu-vita-port/resource-lifecycle.enable","rb");
+            resource_trace=marker!=NULL;
+            if (marker) fclose(marker);
+        }
+        if (!resource_trace) return 0;
+        uint32_t gpu=0u;
+        uint32_t event=++sequence;
+        char event_line[512];
+        size_t event_length=(size_t)snprintf(event_line,sizeof(event_line),
+                "RESOURCE_LIFECYCLE event=%u kind=%s object=0x%x "
+                "lr=0x%x sp=0x%x thread=0x%x",event,vp_resource_probe_sites[id].name,
+                object,f->lr,f->sp,s->svc.current_thread_handle);
+        if (vp_guest_svc_readable(&s->svc,object,0xf0u)) {
+            const unsigned char *p=(const unsigned char *)(uintptr_t)object;
+            gpu=word(p+0xd0u);
+            event_length+=(size_t)snprintf(event_line+event_length,sizeof(event_line)-event_length,
+                    " vptr=0x%x name=%.64s gpu=0x%x width=%u height=%u "
+                    "depth=%u lod=%u",word(p),(const char *)(p+8u),gpu,
+                    word(p+0xdcu),word(p+0xe0u),word(p+0xe4u),word(p+0xe8u));
+        } else event_length+=(size_t)snprintf(event_line+event_length,
+                sizeof(event_line)-event_length," object_readable=0");
+        if (id==3u) event_length+=(size_t)snprintf(event_line+event_length,
+                sizeof(event_line)-event_length," replacement=0x%x",f->regs[1]);
+        event_line[event_length++]='\n';
+        fwrite(event_line,1,event_length,s->log);
+        if (gpu && vp_guest_svc_readable(&s->svc,gpu,0x210u)) {
+            char line[1400];
+            size_t length=(size_t)snprintf(line,sizeof(line),
+                    "RESOURCE_GPU_OBJECT event=%u gpu=0x%x words=",event,gpu);
+            for (unsigned offset=0;offset<0x210u;offset+=4u)
+                length+=(size_t)snprintf(line+length,sizeof(line)-length,"%s%08x",offset?",":"",
+                        word((const unsigned char *)(uintptr_t)gpu+offset));
+            line[length++]='\n';
+            fwrite(line,1,length,s->log);
+        }
+        return 0;
+    }
+    if (f->service==0x255u || f->service==0x256u) return game_cost_service(s,e,f);
+    if (f->service==0x252u) {
+        fprintf(s->log,"ENGINE_FULL_FATAL rc=%d\n",(int32_t)f->regs[0]);
+        vp_engine_full_report(s->log);
+        fflush(s->log);
+        return VP_BRIDGE_ARGUMENT;
+    }
+    if (f->service==0x253u || f->service==0x254u) return engine_prepare_ab_service(s,e,f);
+    if (f->service==0x250u || f->service==0x251u) return engine_submit_probe_service(s,e,f);
     if (f->service>=0x24cu && f->service<=0x24fu) return movie_color_probe_service(s,e,f);
     if (f->service==0x24bu) {
         int32_t error=(int32_t)f->regs[0];
@@ -1597,17 +2576,33 @@ static int dispatch(VPExecutor *e,VPBridgeFrame *f) {
  * extra 8 MiB is borrowed from the heap (0x76F00000 -> 0x76700000). The
  * title's heap high-water mark is 0x76200000, leaving 5 MiB of slack; this is
  * a layout experiment that must be checked against the title's pool init. */
-#define VP_GUEST_HEAP_BYTES  (0x76700000u)
-#define VP_GUEST_ALIAS_BYTES (8u<<20)
-#define VP_GUEST_STACK_BYTES (16u<<20)
-#define VP_GUEST_POOL_BYTES  (VP_GUEST_HEAP_BYTES+VP_GUEST_ALIAS_BYTES+VP_GUEST_STACK_BYTES)
+#include "guest_heap_config.h"
 #define VP_GUEST_LAUNCH_BYTES 0x9000u
 static int setup_guest_memory(Session *s,VPExecutor *e) {
+    uint32_t heap_bytes=VP_GUEST_HEAP_DEFAULT_BYTES;
+    FILE *heap_control=fopen("ux0:data/mhgu-vita-port/guest-heap-limit-mib.txt","rb");
+    int heap_override=heap_control!=NULL;
+    if (heap_override) {
+        char text[32];
+        size_t length=fread(text,1,sizeof(text),heap_control);
+        int extra=fgetc(heap_control);
+        fclose(heap_control);
+        if (extra!=EOF || vp_guest_heap_parse(text,length,&heap_bytes)<0) {
+            fprintf(s->log,"SVC_MEMORY_LIMIT_ERROR reason=invalid-control\n");
+            fflush(s->log);return VP_EXECUTOR_ARGUMENT;
+        }
+    }
+    uint32_t pool_bytes=vp_guest_pool_bytes(heap_bytes);
+    fprintf(s->log,"SVC_MEMORY_LIMIT override=%d heap_bytes=%u pool_bytes=%u\n",
+        heap_override,heap_bytes,pool_bytes);
+    FILE *memory_audit=fopen("ux0:data/mhgu-vita-port/memory-audit.enable","rb");
+    vp_guest_memory_audit_set(memory_audit!=NULL);
+    if (memory_audit) fclose(memory_audit);
     SceKernelAllocMemBlockOpt opt;memset(&opt,0,sizeof(opt));opt.size=sizeof(opt);
     opt.attr=SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT;opt.alignment=0x10000;
-    s->pool_block=sceKernelAllocMemBlock("vp-guest-pool",SCE_KERNEL_MEMBLOCK_TYPE_USER_RW,VP_GUEST_POOL_BYTES,&opt);
+    s->pool_block=sceKernelAllocMemBlock("vp-guest-pool",SCE_KERNEL_MEMBLOCK_TYPE_USER_RW,pool_bytes,&opt);
     if (s->pool_block<0) {
-        fprintf(s->log,"SVC_MEMORY_ALLOC arena=pool bytes=%u status=%d\n",VP_GUEST_POOL_BYTES,s->pool_block);fflush(s->log);
+        fprintf(s->log,"SVC_MEMORY_ALLOC arena=pool bytes=%u status=%d\n",pool_bytes,s->pool_block);fflush(s->log);
         return s->pool_block;
     }
     s->launch_block=sceKernelAllocMemBlock("vp-launch-args",SCE_KERNEL_MEMBLOCK_TYPE_USER_RW,VP_GUEST_LAUNCH_BYTES,&opt);
@@ -1619,15 +2614,15 @@ static int setup_guest_memory(Session *s,VPExecutor *e) {
     int rc=sceKernelGetMemBlockBase(s->pool_block,&pool);if(rc) return rc;
     rc=sceKernelGetMemBlockBase(s->launch_block,&launch);if(rc) return rc;
     s->pool_base=(uint32_t)(uintptr_t)pool;s->launch_address=(uint32_t)(uintptr_t)launch;
-    memset(pool,0,VP_GUEST_POOL_BYTES);memset(launch,0,VP_GUEST_LAUNCH_BYTES);
+    memset(pool,0,pool_bytes);memset(launch,0,VP_GUEST_LAUNCH_BYTES);
     /* The original nnosInitialize parses this NSO argument block: allocated
      * size, command-line length, 0x18 reserved bytes, then the string. */
     static const char command_line[]="mhgu-vita-port";
     uint32_t header[8]={VP_GUEST_LAUNCH_BYTES,(uint32_t)(sizeof(command_line)-1),0,0,0,0,0,0};
     memcpy(launch,header,sizeof(header));memcpy((char *)launch+32,command_line,sizeof(command_line));
     VPGuestSvc *v=&s->svc;
-    v->heap_base=s->pool_base;v->heap_size=VP_GUEST_HEAP_BYTES;
-    v->alias_base=s->pool_base+VP_GUEST_HEAP_BYTES;v->alias_size=VP_GUEST_ALIAS_BYTES;
+    v->heap_base=s->pool_base;v->heap_size=heap_bytes;
+    v->alias_base=s->pool_base+heap_bytes;v->alias_size=VP_GUEST_ALIAS_BYTES;
     v->stack_base=v->alias_base+VP_GUEST_ALIAS_BYTES;v->stack_size=VP_GUEST_STACK_BYTES;
     v->aslr_base=v->alias_base;v->aslr_size=v->alias_size;
     v->plr_base=s->launch_address+0x8000;v->plr_size=0x1000;
@@ -1705,7 +2700,7 @@ static int setup_guest_memory(Session *s,VPExecutor *e) {
      * again instead of converging on the capacity this loader backs. */
     v->total_memory=v->used_memory+(v->used_memory>UINT32_MAX-v->heap_size?0:v->heap_size);
     fprintf(s->log,"SVC_MEMORY profile=title-arena-evidence pool=0x%08x bytes=%u heap=0x%08x+%u alias=0x%08x+%u stack=0x%08x+%u launch=0x%08x+%u executor=0x%08x+%u total=%u used=%u regions=%u\n",
-        s->pool_base,VP_GUEST_POOL_BYTES,v->heap_base,v->heap_size,v->alias_base,v->alias_size,
+        s->pool_base,pool_bytes,v->heap_base,v->heap_size,v->alias_base,v->alias_size,
         v->stack_base,v->stack_size,s->launch_address,VP_GUEST_LAUNCH_BYTES,e->stack_base,e->stack_bytes,v->total_memory,v->used_memory,v->region_count);
     fflush(s->log);return rc;
 }
@@ -3234,6 +4229,8 @@ int vp_sdk_dso_execute(FILE *log,VPExecutor *e) {
         /* DSO registration and constructor dispatch now happen inside the
          * original Start path, after nnosInitialize installed ThreadManager. */
         uint32_t flag=word(m->image+0x862754),tp=word((void *)(uintptr_t)(e->bridge.guest.tls_ro+0x1f8));
+        if (engine_submit_probe_enabled) engine_submit_report(s);
+        vp_engine_layout_report(log);
         fprintf(log,"SDK_DSO status=%d service=0x%x observed=%u mask=%u gated=%u sdk_flag=%u tls_ro=0x%08x tp=0x%08x tls_rw=0x%08x live=%u peak=%u locks=%u unlocks=%u recycles=%u nnmain=%u session_stop=%u\n",
             stopped,f->service,s->observed,s->observed_mask,s->gated,flag,e->bridge.guest.tls_ro,tp,e->bridge.guest.tls_rw,s->allocator.live_allocations,s->allocator.peak_bytes,s->lock_calls,s->unlock_calls,s->lock_recycles,
             s->nnmain_found?1u:0u,s->session_stopped?1u:0u);

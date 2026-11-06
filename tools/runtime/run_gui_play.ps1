@@ -204,9 +204,13 @@ function Select-VPMainWindow {
         if (-not $m.Success -or $m.Groups['vis'].Value -ne 'True') { continue }
         $w = [int]$m.Groups['w'].Value
         $h = [int]$m.Groups['hgt'].Value
-        if ($w -le 0 -or $h -le 0) { continue }
+        # A minimized Qt launcher reports a 0x0 client but still owns the
+        # process closeEvent. Geometry is a capture requirement, not a close
+        # requirement; Close-OwnedWindowGracefully separately verifies the PID.
+        $isLauncher = $m.Groups['title'].Value -match '^Vita3K\b'
+        if (($w -le 0 -or $h -le 0) -and -not $isLauncher) { continue }
         $score = [int]($w * $h / 10000)
-        if ($m.Groups['title'].Value -match '^Vita3K\b') { $score += 100000 }
+        if ($isLauncher) { $score += 100000 }
         if ($m.Groups['title'].Value -match 'MHGU|Bilinear|Vulkan') { $score -= 100000 }
         if ($score -gt $bestScore) {
             $bestScore = $score
@@ -522,6 +526,14 @@ foreach ($name in @('src/platform/guest_svc.c','src/platform/guest_svc.h',
                     'src/platform/nvmap_table.c','src/platform/nvmap_table.h',
                     'src/platform/memory_attributes.c','src/platform/memory_attributes.h',
                     'src/platform/time_calendar.h','src/platform/gxm_runtime.c',
+                    'src/platform/frame_cost_profile.c','src/platform/frame_cost_profile.h',
+                    'src/platform/texture_pool.c','src/platform/texture_pool.h',
+                    'src/platform/texture_regions.h',
+                    'src/platform/work_log.h',
+                    'src/loader/guest_heap_config.h',
+                    'src/loader/resource_experiment.h',
+                    'src/platform/engine_full.c','src/platform/engine_full.h',
+                    'src/bridge/armv7/sdk_dso.S',
                     'src/platform/log_sink.c','src/platform/log_sink.h',
                     'src/platform/vertex_format.c','src/platform/vertex_format.h',
                     'src/platform/vertex_window.c','src/platform/vertex_window.h',

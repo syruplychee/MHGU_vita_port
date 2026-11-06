@@ -67,6 +67,150 @@ VP_HOST_BRIDGE_FUNCTION vp_movie_color_rgb_enter, 0x24c
 VP_HOST_BRIDGE_FUNCTION vp_movie_color_rgb_leave, 0x24d
 VP_HOST_BRIDGE_FUNCTION vp_movie_color_nv12_enter, 0x24e
 VP_HOST_BRIDGE_FUNCTION vp_movie_color_nv12_leave, 0x24f
+/* Locked main resource-submit sites; handlers replay the displaced words. */
+VP_HOST_BRIDGE_FUNCTION vp_engine_submit_enter, 0x250
+VP_HOST_BRIDGE_FUNCTION vp_engine_submit_leave, 0x251
+VP_HOST_BRIDGE_FUNCTION vp_engine_full_failed, 0x252
+/* A/B profile boundary around one complete root call. The enter handler keeps
+ * r0=context and returns the selected target (native C or original trampoline)
+ * in ip; the leave handler accounts the completed call before restoring the
+ * caller's callee-saved registers. */
+VP_HOST_BRIDGE_FUNCTION vp_engine_full_ab_enter, 0x253
+VP_HOST_BRIDGE_FUNCTION vp_engine_full_ab_leave, 0x254
+VP_HOST_BRIDGE_FUNCTION vp_game_cost_enter, 0x255
+VP_HOST_BRIDGE_FUNCTION vp_game_cost_leave, 0x256
+
+/* Audited A32 functions take their object in r0 and have no stack arguments.
+ * Keep the caller LR/r4 and replay the displaced PUSH through a trampoline.
+ * The bridge preserves GPR/VFP/FPSCR and the original return registers. */
+.macro VP_GAME_COST_ENTRY name, id
+    .balign 4
+    .global \name
+    .type \name,%function
+\name:
+    push {r4,lr}
+    movw ip, #\id
+    bl vp_game_cost_enter
+    blx ip
+    movw ip, #\id
+    bl vp_game_cost_leave
+    pop {r4,lr}
+    bx lr
+    .size \name,.-\name
+.endm
+VP_GAME_COST_ENTRY vp_game_cost_frame, 0
+VP_GAME_COST_ENTRY vp_game_cost_submit, 1
+VP_GAME_COST_ENTRY vp_game_cost_queue, 2
+VP_GAME_COST_ENTRY vp_game_cost_end_frame, 3
+
+/* Full queue replacement: C owns its local state; original caller ABI stays
+ * on the guest stack. Failures enter the normal host bridge and stop. The
+ * profile flag is read once at the root entry so the single-path build keeps
+ * the original fast path. */
+.balign 4
+.global vp_engine_full_entry
+.type vp_engine_full_entry,%function
+vp_engine_full_entry:
+    ldr ip, 1f
+    ldr ip, [ip]
+    cmp ip, #0
+    bne vp_engine_full_ab_entry
+    ldr ip, 2f
+    ldr ip, [ip]
+    cmp ip, #0
+    bne vp_engine_full_fast_entry
+    push {r4,lr}
+    bl vp_engine_full_run
+    pop {r4,lr}
+    cmp r0,#0
+    bne vp_engine_full_failed
+    bx lr
+1:  .word vp_engine_full_profile_enabled
+2:  .word vp_engine_full_fast_enabled
+.size vp_engine_full_entry,.-vp_engine_full_entry
+
+.balign 4
+.type vp_engine_full_fast_entry,%function
+vp_engine_full_fast_entry:
+    push {r4,lr}
+    bl vp_engine_full_run_fast
+    pop {r4,lr}
+    cmp r0,#0
+    bne vp_engine_full_failed
+    bx lr
+.size vp_engine_full_fast_entry,.-vp_engine_full_fast_entry
+
+/* Alternating A/B wrapper. push {r4,lr} keeps SP 8-byte aligned and preserves
+ * the caller's r4 and return address. The bridge enter leaves r0=context and
+ * writes the path target to ip; blx ip runs either the native C body or the
+ * original-entry trampoline. The leave bridge checks the C return value only
+ * in native mode, so an arbitrary original-root r0 is never treated as an
+ * error. On success the two bridges restore the complete register/FPSCR/VFP
+ * frame and this wrapper returns the untouched original caller ABI. */
+.balign 4
+.global vp_engine_full_ab_entry
+.type vp_engine_full_ab_entry,%function
+vp_engine_full_ab_entry:
+    push {r4,lr}
+    bl vp_engine_full_ab_enter
+    blx ip
+    bl vp_engine_full_ab_leave
+    pop {r4,lr}
+    bx lr
+.size vp_engine_full_ab_entry,.-vp_engine_full_ab_entry
+
+/* Invoke the exact locked NVN slot with core, stack and hard-float arguments.
+ * Call offsets: r[]=8, stack[]=24, s[]=60. Keep 8-byte SP alignment. */
+.balign 4
+.global vp_engine_nvn_call
+.type vp_engine_nvn_call,%function
+vp_engine_nvn_call:
+    push {r4-r11,ip,lr}
+    sub sp,sp,#32
+    mov r4,r0
+    mov r5,r1
+    mov r6,r2
+    add ip,r5,#24
+    ldm ip,{r0-r3,r8-r11}
+    stm sp,{r0-r3,r8-r11}
+    vldr s0,[r5,#60]
+    vldr s1,[r5,#64]
+    vldr s2,[r5,#68]
+    vldr s3,[r5,#72]
+    add ip,r5,#8
+    ldm ip,{r0-r3}
+    blx r4
+    cmp r6,#0
+    strne r0,[r6]
+    strne r1,[r6,#4]
+    movne r2,#1
+    strne r2,[r6,#8]
+    add sp,sp,#32
+    pop {r4-r11,ip,pc}
+.size vp_engine_nvn_call,.-vp_engine_nvn_call
+
+/* Only the two fixed-count layout encoders are replaced. The C helper uses
+ * guest-TLS-safe memory operations and original SDK calls on
+ * misses. It preserves callee-saved registers and the original guest stack. */
+.balign 4
+.global vp_engine_layout_entry
+.type vp_engine_layout_entry,%function
+vp_engine_layout_entry:
+    push {r0-r3,ip,lr}
+    mov r0,r5
+    mov r1,r4
+    bl vp_engine_layout_prepare
+    cmp r0,#0
+    beq 2f
+    pop {r0-r3,ip,lr}
+    ldr ip,1f
+    ldr pc,[ip]
+1:  .word vp_engine_layout_resume
+2:  pop {r0-r3,ip,lr}
+    ldr ip,3f
+    ldr pc,[ip]
+3:  .word vp_engine_layout_fallback
+.size vp_engine_layout_entry,.-vp_engine_layout_entry
 
 /* Pure tail forwards: exception propagation stays entirely on the guest
  * stack, through the original SDK runtime. No host C++ runtime is linked. */

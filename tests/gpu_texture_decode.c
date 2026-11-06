@@ -1,10 +1,12 @@
 #include "gpu_texture.h"
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static uint8_t input[4096], output[64 * 64 * 4];
 static uint8_t float_source[48], float_half[16];
+static uint8_t float32_source[128], float32_rg32[128];
 static uint8_t cube_rgba[4 * 4 * 4],cube_data[504];
 static uint8_t cube_rgba64[64 * 64 * 4],cube_data64[135168];
 
@@ -72,6 +74,153 @@ int main(void) {
         assert(memcmp(float_half,expected,sizeof(expected))==0);
         assert(vp_texture_rgba32f_pitch_to_rgba16f(float_source,31,
             float_half,2,1,32,0x58d7ff81u)==-1);
+    }
+    {
+        /* Lossless vertex RGBA32F -> RG32F. The 32-bit patterns below are not
+         * half-representable; copying them through a half conversion would
+         * change both value and bit identity. */
+        const uint32_t pixel0[4]={0x3f800001u,0x3eaaaaabu,0x80000001u,0x7f7fffffu};
+        const uint32_t pixel1[4]={0x7fc00001u,0x00000001u,0xc0490fdbu,0x3f800000u};
+        const uint32_t expected[8]={0x3f800001u,0x3eaaaaabu,0x80000001u,
+                                    0x7f7fffffu,0x7fc00001u,0x00000001u,
+                                    0xc0490fdbu,0x3f800000u};
+        uint32_t got[8];
+        memcpy(float32_source,pixel0,sizeof(pixel0));
+        memcpy(float32_source+16,pixel1,sizeof(pixel1));
+        memset(float32_rg32,0xa5,sizeof(float32_rg32));
+        assert(vp_texture_rgba32f_pitch_to_rg32f(float32_source,sizeof(float32_source),
+            float32_rg32,64,2,1,32,0x58d7ff81u)==0);
+        memcpy(got,float32_rg32,sizeof(got));
+        assert(memcmp(got,expected,sizeof(got))==0);
+        assert(got[0]==0x3f800001u && got[3]==0x7f7fffffu);
+        /* TIC remap (G,R,1,0): the physical RG/BA pairs follow the selected
+         * logical channels, with the constant one kept as raw F32 bits. */
+        {
+            uint32_t remap=0x01u|(0xfffu<<7)|(3u<<19)|(2u<<22)|(7u<<25);
+            const uint32_t mapped[4]={pixel0[1],pixel0[0],0x3f800000u,0u};
+            assert(vp_texture_rgba32f_pitch_to_rg32f(float32_source,32,
+                float32_rg32,32,1,1,32,remap)==0);
+            assert(memcmp(float32_rg32,mapped,sizeof(mapped))==0);
+        }
+        /* Unmeasured selector values 1 and 6 stay refusals. */
+        assert(vp_texture_rgba32f_pitch_to_rg32f(float32_source,32,
+            float32_rg32,16,1,1,32,0x01u|(0xfffu<<7)|(1u<<19))==-1);
+        assert(vp_texture_rgba32f_pitch_to_rg32f(float32_source,32,
+            float32_rg32,16,1,1,32,0x01u|(0xfffu<<7)|(6u<<19))==-1);
+        /* Two logical rows with a padded source pitch: 48-byte pitch for a
+         * 32-byte logical row. The destination is tightly packed. */
+        memset(float32_source,0x5a,sizeof(float32_source));
+        memcpy(float32_source,pixel0,16);
+        memcpy(float32_source+48,pixel1,16);
+        memset(float32_rg32,0xa5,sizeof(float32_rg32));
+        assert(vp_texture_rgba32f_pitch_to_rg32f(float32_source,96,float32_rg32,
+            64,2,2,48,0x58d7ff81u)==0);
+        assert(memcmp(float32_rg32,pixel0,16)==0);
+        assert(memcmp(float32_rg32+32,pixel1,16)==0);
+        /* Bounds and the physical 2x-width limit. */
+        assert(vp_texture_rgba32f_pitch_to_rg32f(float32_source,95,float32_rg32,
+            64,2,2,48,0x58d7ff81u)==-1);
+        assert(vp_texture_rgba32f_pitch_to_rg32f(float32_source,96,float32_rg32,
+            63,2,2,48,0x58d7ff81u)==-1);
+        assert(vp_texture_rgba32f_pitch_to_rg32f(float32_source,96,float32_rg32,
+            64,2,2,31,0x58d7ff81u)==-1);
+        assert(vp_texture_rgba32f_pitch_to_rg32f(float32_source,96,float32_rg32,
+            64,0,2,48,0x58d7ff81u)==-1);
+        assert(vp_texture_rgba32f_pitch_to_rg32f(float32_source,96,float32_rg32,
+            64,2049,1,2049u*16u,0x58d7ff81u)==-1);
+        assert(VP_TEXTURE_UPLOAD_RGBA32F_RG32F==0x201u);
+        assert(vp_texture_upload_bytes(1024,64,VP_TEXTURE_UPLOAD_RGBA32F_RG32F)==
+               1048576u);
+        assert(vp_texture_upload_bytes(1024,64,VP_TEXTURE_UPLOAD_RGBA32F_RG32F)==
+               2u*vp_texture_upload_bytes(1024,64,VP_TEXTURE_UPLOAD_RGBA16F));
+        assert(vp_texture_upload_bytes(2048,4096,
+               VP_TEXTURE_UPLOAD_RGBA32F_RG32F)==(size_t)2048u*4096u*16u);
+        assert(vp_texture_upload_bytes(2049,1,
+               VP_TEXTURE_UPLOAD_RGBA32F_RG32F)==0);
+    }
+    {
+        /* The vertex contract accepts only the measured pitch-linear 2D,
+         * point, no-mip, no-border descriptor with FLOAT component fields. */
+        VPTextureVertexRg32fView view;
+        memset(&view,0,sizeof(view));
+        view.width=1024u;
+        view.height=64u;
+        view.tic_word0=0x58d7ff81u;
+        view.tic_format=0x01u;
+        view.tic_header=2u;
+        view.texture_type=1u;
+        view.depth=1u;
+        view.max_mip_level=0u;
+        view.pitch=16384u;
+        view.storage=1048576u;
+        view.sampler[0]=0u;      /* repeat U/V */
+        view.sampler[1]=0x11u;   /* point min+mag, mip filter disabled */
+        assert(vp_texture_vertex_rg32f_check(&view)==NULL);
+        view.width=2049u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"logical-width")==0);
+        view.width=0u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"zero-size")==0);
+        view.width=1024u;
+        view.height=4097u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"height")==0);
+        view.height=64u;
+        view.tic_format=0x24u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"format")==0);
+        view.tic_format=0x01u;
+        view.tic_header=3u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"header")==0);
+        view.tic_header=2u;
+        view.texture_type=3u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"type")==0);
+        view.texture_type=1u;
+        view.depth=2u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"depth")==0);
+        view.depth=1u;
+        view.block_depth=1u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"block-depth")==0);
+        view.block_depth=0u;
+        view.max_mip_level=1u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"mip")==0);
+        view.max_mip_level=0u;
+        view.tic_word0=0x58d7ff81u&~(0xfffu<<7);
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),
+                      "component-type")==0);
+        view.tic_word0=(0x58d7ff81u&~(7u<<19))|(1u<<19);
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),
+                      "swizzle-selector")==0);
+        view.tic_word0=0x58d7ff81u;
+        view.pitch=16383u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"pitch")==0);
+        view.pitch=16384u;
+        view.storage=1048575u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"storage")==0);
+        view.storage=1048576u;
+        view.sampler[1]=0x10u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"filter")==0);
+        view.sampler[1]=0x21u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"filter")==0);
+        view.sampler[1]=0xd1u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"mip-filter")==0);
+        view.sampler[1]=0x11u;
+        view.sampler[0]=3u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"border")==0);
+        view.sampler[0]=5u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"addr-mode")==0);
+        view.sampler[0]=0u;
+        view.sampler[0]=1u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"packed-u-mode")==0);
+        view.sampler[0]=2u;
+        assert(vp_texture_vertex_rg32f_check(&view)==NULL);
+        view.width=1023u;
+        assert(strcmp(vp_texture_vertex_rg32f_check(&view),"row-alignment")==0);
+        view.width=1024u;
+        /* Real captured TIC/TSC: 2DNoMipmap and a dormant linear mip filter.
+         * Rejecting type 7 or the mip field would erase every character. */
+        view.texture_type=7u;
+        view.sampler[0]=0x00026092u;
+        view.sampler[1]=0x00000391u;
+        assert(vp_texture_vertex_rg32f_check(&view)==NULL);
+        assert(strcmp(vp_texture_vertex_rg32f_check(NULL),"missing")==0);
     }
     assert(vp_texture_cube_mip_count(4,4)==3);
     assert(vp_texture_cube_upload_bytes(4,4)==504);
@@ -310,6 +459,309 @@ int main(void) {
             assert(vp_texture_upload_format(0x28, (w5 & ~(0xfffu << 19)) |
                    ((3u << 19) | (2u << 22) | (0u << 25) | (7u << 28))) == 0);
         }
+    }
+    {
+        /* Differential decode: the fused path must be byte-identical to the
+         * reviewed decode + swizzle pair for every GOB layout, tail, padded
+         * row and selector combination below. This compares two independent
+         * traversals rather than mirroring the new implementation. */
+        static const unsigned widths[] =
+            {1,2,3,4,7,8,15,16,17,31,32,33,47,48,63,64,65,127,128,129};
+        static const unsigned heights[] = {1,2,3,7,8,9,15,16,17,33};
+        static const uint32_t selector_words[] = {
+            0xb1au<<19,                            /* identity R,G,B,A */
+            0x00000000u,                           /* zero,zero,zero,zero */
+            (2u<<19)|(0u<<22)|(0u<<25)|(7u<<28),   /* R,0,0,1 */
+            (1u<<19)|(2u<<22)|(3u<<25)|(4u<<28),   /* undefined 1 -> zero */
+            (6u<<19)|(7u<<22)|(5u<<25)|(4u<<28),   /* 6/7 both -> 255 */
+            (5u<<19)|(4u<<22)|(3u<<25)|(2u<<28),   /* reversed channels */
+            (7u<<19)|(7u<<22)|(7u<<25)|(7u<<28),   /* all one */
+            (2u<<19)|(2u<<22)|(0u<<25)|(1u<<28)    /* duplicates/zero */
+        };
+        uint32_t lcg = 0x12345678u;
+        for (unsigned wi = 0; wi < sizeof(widths)/sizeof(widths[0]); ++wi)
+        for (unsigned hi = 0; hi < sizeof(heights)/sizeof(heights[0]); ++hi)
+        for (unsigned bh = 0; bh <= 5u; ++bh)
+        for (unsigned si = 0;
+             si < sizeof(selector_words)/sizeof(selector_words[0]); ++si) {
+            unsigned w = widths[wi], h = heights[hi];
+            size_t storage = vp_texture_storage(w, h, 8u, bh);
+            size_t pixels = (size_t)w * h;
+            uint8_t *source, *old, *fused;
+            if (!storage) continue;
+            source = (uint8_t *)malloc(storage);
+            old = (uint8_t *)malloc(pixels * 4u);
+            fused = (uint8_t *)malloc(pixels * 4u);
+            assert(source != NULL && old != NULL && fused != NULL);
+            for (size_t i = 0; i < storage; ++i) {
+                lcg = lcg * 1664525u + 1013904223u;
+                source[i] = (uint8_t)(lcg >> 24);
+            }
+            assert(vp_texture_rgba(source, storage - (storage > 1u ? 1u : 0u),
+                                   old, w, h, 8u, bh) ==
+                   (storage > 1u ? -1 : 0));
+            assert(vp_texture_rgba(source, storage, old, w, h, 8u, bh) == 0);
+            vp_texture_swizzle(old, pixels, selector_words[si]);
+            assert(vp_texture_rgba8_untile_swizzle(source, storage, fused, w, h,
+                                                   bh, selector_words[si]) ==
+                   0);
+            assert(memcmp(old, fused, pixels * 4u) == 0);
+            free(source);
+            free(old);
+            free(fused);
+        }
+        puts("PASS fused RGBA8 tiled decode equals the reviewed decode+swizzle");
+    }
+    {
+        /* Pitch-linear RGBA8 (TIC header 2) fusion, including padded rows. */
+        static const unsigned widths[] = {1,2,3,4,5,7,15,16,17,33,64};
+        static const uint32_t selector_words[] = {
+            0xb1au<<19, 0x00000000u,
+            (2u<<19)|(0u<<22)|(0u<<25)|(7u<<28),
+            (1u<<19)|(2u<<22)|(3u<<25)|(4u<<28),
+            (6u<<19)|(7u<<22)|(5u<<25)|(4u<<28)
+        };
+        uint32_t lcg = 0x9e3779b9u;
+        for (unsigned wi = 0; wi < sizeof(widths)/sizeof(widths[0]); ++wi)
+        for (unsigned extra = 0u; extra <= 12u; extra += 4u)
+        for (unsigned si = 0;
+             si < sizeof(selector_words)/sizeof(selector_words[0]); ++si) {
+            unsigned w = widths[wi], h = 5u;
+            size_t pitch = (size_t)w * 4u + extra;
+            size_t pixels = (size_t)w * h;
+            uint8_t *source = (uint8_t *)malloc(pitch * h);
+            uint8_t *old = (uint8_t *)malloc(pixels * 4u);
+            uint8_t *fused = (uint8_t *)malloc(pixels * 4u);
+            assert(source != NULL && old != NULL && fused != NULL);
+            for (size_t i = 0; i < pitch * h; ++i) {
+                lcg = lcg * 1664525u + 1013904223u;
+                source[i] = (uint8_t)(lcg >> 24);
+            }
+            for (unsigned y = 0; y < h; ++y)
+                memcpy(old + (size_t)y * w * 4u, source + (size_t)y * pitch,
+                       (size_t)w * 4u);
+            vp_texture_swizzle(old, pixels, selector_words[si]);
+            assert(vp_texture_rgba8_linear_swizzle(source, pitch * h, fused, w,
+                                                   h, pitch,
+                                                   selector_words[si]) == 0);
+            assert(memcmp(old, fused, pixels * 4u) == 0);
+            assert(vp_texture_rgba8_linear_swizzle(source, pitch * h - 1u,
+                                                   fused, w, h, pitch,
+                                                   selector_words[si]) == -1);
+            free(source);
+            free(old);
+            free(fused);
+        }
+        puts("PASS fused pitch-linear RGBA8 decode equals decode+swizzle");
+    }
+    {
+        /* Identity RG32F split is a pure row copy; every raw 32-bit pattern,
+         * including NaN, -0 and subnormals, must survive unchanged. */
+        const uint32_t patterns[4] = {
+            0x7fc00001u, 0x80000000u, 0x00000001u, 0xff800000u
+        };
+        uint8_t source[2 * 144 + 16], output[2 * 8 * 16];
+        uint32_t lcg = 0x5a5a5a5au;
+        for (size_t i = 0; i < sizeof(source); ++i) {
+            lcg = lcg * 1664525u + 1013904223u;
+            source[i] = (uint8_t)(lcg >> 24);
+        }
+        for (unsigned i = 0; i < 4u; ++i)
+            memcpy(source + i * 16u, &patterns[i], 4u);
+        memset(output, 0xa5, sizeof(output));
+        assert(vp_texture_rgba32f_pitch_to_rg32f(source, 2u * 144u, output,
+                                                 sizeof(output), 8, 2, 144,
+                                                 0x58d7ff81u) == 0);
+        assert(memcmp(output, source, 8u * 16u) == 0);
+        assert(memcmp(output + 8u * 16u, source + 144, 8u * 16u) == 0);
+        puts("PASS identity RG32F split preserves every 32-bit channel pattern");
+    }
+    {
+        /* Native Alpha8 identity, descriptor contract and payload size. Only
+         * the evidenced Maxwell R8 format 0x1d with four UNORM fields and the
+         * exact (7,7,7,2) tuple may select the one-byte upload; every other
+         * descriptor keeps the old path. */
+        const uint32_t word = 0x1du | (0x492u << 7) | (0x5ffu << 19);
+        const uint32_t type_bits = 0xfffu << 7;
+        const uint32_t selector_bits = 0xfffu << 19;
+        assert(VP_TEXTURE_UPLOAD_ALPHA8 != VP_TEXTURE_UPLOAD_RGBA16F);
+        assert(VP_TEXTURE_UPLOAD_ALPHA8 != VP_TEXTURE_UPLOAD_RGBA32F_RG32F);
+        assert(VP_TEXTURE_UPLOAD_ALPHA8 != 0x24u &&
+               VP_TEXTURE_UPLOAD_ALPHA8 != 0x124u &&
+               VP_TEXTURE_UPLOAD_ALPHA8 != 0x26u &&
+               VP_TEXTURE_UPLOAD_ALPHA8 != 0x126u);
+        for (unsigned code = 0; code < 8u; ++code)
+            assert(VP_TEXTURE_UPLOAD_ALPHA8 !=
+                   (0x27u | (code << VP_TEXTURE_UPLOAD_SWIZZLE_SHIFT)));
+        for (unsigned code = 0; code < 6u; ++code)
+            assert(VP_TEXTURE_UPLOAD_ALPHA8 !=
+                   (0x28u | (code << VP_TEXTURE_UPLOAD_SWIZZLE_SHIFT)));
+        assert(vp_texture_upload_format(0x1du, word) ==
+               VP_TEXTURE_UPLOAD_ALPHA8);
+        assert(vp_texture_upload_format(0x1du,
+               (word&~selector_bits)|(0xe02u<<19))==VP_TEXTURE_UPLOAD_R8);
+        assert(vp_texture_upload_bytes(5,3,VP_TEXTURE_UPLOAD_R8)==24u);
+        /* 0x1c shares the C decoder's byte branch but has no reviewed channel
+         * identity; it must not be selected by this contract. */
+        assert(vp_texture_upload_format(0x1cu, word) == 0u);
+        assert(vp_texture_upload_format(0x1du,
+               (word & ~selector_bits) |
+               ((2u << 19) | (7u << 22) | (7u << 25) | (2u << 28))) == 0u);
+        assert(vp_texture_upload_format(0x1du,
+               (word & ~selector_bits) |
+               ((2u << 19) | (3u << 22) | (4u << 25) | (5u << 28))) == 0u);
+        assert(vp_texture_upload_format(0x1du,
+               (word & ~selector_bits) |
+               ((7u << 19) | (7u << 22) | (7u << 25) | (5u << 28))) == 0u);
+        assert(vp_texture_upload_format(0x1du,
+               (word & ~selector_bits) |
+               ((7u << 19) | (7u << 22) | (7u << 25) | (6u << 28))) == 0u);
+        assert(vp_texture_upload_format(0x1du,
+               (word & ~selector_bits) |
+               ((7u << 19) | (7u << 22) | (7u << 25) | (7u << 28))) == 0u);
+        assert(vp_texture_upload_format(0x1du,
+               (word & ~type_bits) | (0x249u << 7)) == 0u);
+        assert(vp_texture_upload_format(0x1du,
+               (word & ~type_bits) |
+               ((3u << 7) | (3u << 10) | (3u << 13) | (3u << 16))) == 0u);
+        assert(vp_texture_upload_format(0x1du,
+               (word & ~type_bits) |
+               ((1u << 7) | (2u << 10) | (2u << 13) | (2u << 16))) == 0u);
+        assert(vp_texture_upload_format(0x1du, word & ~type_bits) == 0u);
+        assert(vp_texture_upload_format(0x18u, word) == 0u);
+        assert(vp_texture_upload_format(8u, word) == 0u);
+
+        assert(vp_texture_upload_bytes(1024, 1024,
+               VP_TEXTURE_UPLOAD_ALPHA8) == 1048576u);
+        assert(vp_texture_upload_bytes(1024, 64,
+               VP_TEXTURE_UPLOAD_ALPHA8) == 65536u);
+        assert(vp_texture_upload_bytes(5, 3, VP_TEXTURE_UPLOAD_ALPHA8) == 24u);
+        assert(vp_texture_upload_bytes(1, 1, VP_TEXTURE_UPLOAD_ALPHA8) == 8u);
+        uint8_t padded[25];
+        for (unsigned i=0;i<25u;++i) padded[i]=(uint8_t)(i+1u);
+        assert(vp_texture_alpha8_pad_rows(padded,23u,5u,3u)==-1);
+        assert(padded[0]==1u && padded[24]==25u);
+        assert(vp_texture_alpha8_pad_rows(padded,24u,5u,3u)==0);
+        for (unsigned y=0;y<3u;++y) {
+            for (unsigned x=0;x<5u;++x) assert(padded[y*8u+x]==y*5u+x+1u);
+            for (unsigned x=5;x<8u;++x) assert(padded[y*8u+x]==0u);
+        }
+        assert(padded[24]==25u);
+        assert(vp_texture_upload_bytes(0, 1, VP_TEXTURE_UPLOAD_ALPHA8) == 0u);
+        assert(vp_texture_upload_bytes(4097, 1,
+               VP_TEXTURE_UPLOAD_ALPHA8) == 0u);
+        assert(vp_texture_upload_bytes(1024, 64, VP_TEXTURE_UPLOAD_ALPHA8) * 4u ==
+               vp_texture_upload_bytes(1024, 64, 0u));
+        assert(vp_texture_storage(1024, 1024, 0x1d, 0) == 1048576u);
+        assert(vp_texture_storage(70, 9, 0x1d, 0) == 2048u);
+    }
+    {
+        /* Hand-computed GOB offsets for real U8 block-linear input. For 1 bpp
+         * a GOB row is 64 contiguous pixels split into +0/+32/+256/+288
+         * spans; the 5x3 and 70x9 cases also cover a narrow tail and a second
+         * 64-pixel GOB. */
+        static const unsigned off5[15] = {0,1,2,3,4,16,17,18,19,20,
+                                          64,65,66,67,68};
+        static const unsigned pos_wide[16][2] = {
+            {0,0},{15,0},{16,0},{31,0},{32,0},{47,0},{48,0},{63,0},
+            {64,0},{69,0},{0,1},{69,1},{63,7},{64,7},{0,8},{64,8}
+        };
+        static const unsigned off_wide[16] = {0,15,32,47,256,271,288,303,
+                                              512,517,16,533,511,720,
+                                              1024,1536};
+        uint8_t src[2048], dst[70 * 9];
+        assert(vp_texture_storage(5, 3, 0x1d, 0) == 512);
+        memset(src, 0, sizeof(src));
+        for (unsigned i = 0; i < 15u; ++i) src[off5[i]] = (uint8_t)(100u + i);
+        memset(dst, 0xa5, sizeof(dst));
+        assert(vp_texture_alpha8_untile(src, 512, dst, 15, 5, 3, 0x1d, 0) == 0);
+        for (unsigned i = 0; i < 15u; ++i) assert(dst[i] == 100u + i);
+        assert(vp_texture_alpha8_untile(src, 511, dst, 15, 5, 3, 0x1d, 0) == -1);
+        assert(vp_texture_alpha8_untile(src, 512, dst, 14, 5, 3, 0x1d, 0) == -1);
+        assert(vp_texture_alpha8_untile(src, 512, dst, 15, 5, 3, 0x1c, 0) == -1);
+        assert(vp_texture_alpha8_untile(src, 512, dst, 15, 0, 3, 0x1d, 0) == -1);
+        assert(vp_texture_alpha8_untile(src, 512, dst, 15, 5, 3, 0x1d, 6) == -1);
+        /* block height 1 keeps the first 8-row group's offsets and doubles
+         * only the GOB stride. */
+        assert(vp_texture_storage(5, 3, 0x1d, 1) == 1024);
+        assert(vp_texture_alpha8_untile(src, 1024, dst, 15, 5, 3, 0x1d, 1) == 0);
+        for (unsigned i = 0; i < 15u; ++i) assert(dst[i] == 100u + i);
+
+        memset(src, 0, sizeof(src));
+        for (unsigned i = 0; i < 16u; ++i) src[off_wide[i]] = (uint8_t)(1u + i);
+        memset(dst, 0xa5, sizeof(dst));
+        assert(vp_texture_alpha8_untile(src, 2048, dst, 70u * 9u, 70, 9,
+                                        0x1d, 0) == 0);
+        for (unsigned i = 0; i < 16u; ++i) {
+            unsigned x = pos_wide[i][0], y = pos_wide[i][1];
+            assert(dst[(size_t)y * 70u + x] == 1u + i);
+        }
+        assert(dst[1] == 0u && dst[(size_t)8 * 70u + 1u] == 0u);
+        assert(vp_texture_alpha8_untile(src, 2047, dst, 70u * 9u, 70, 9,
+                                        0x1d, 0) == -1);
+    }
+    {
+        /* Pitch-linear U8: padded source rows are skipped, the destination is
+         * tightly packed one byte per pixel, and truncation/pitch/size
+         * mismatches are explicit failures. */
+        uint8_t src[3 * 8], dst[5 * 3], tight[5 * 3];
+        memset(src, 0xee, sizeof(src));
+        for (unsigned y = 0; y < 3u; ++y)
+            for (unsigned x = 0; x < 5u; ++x)
+                src[y * 8u + x] = (uint8_t)(200u + y * 10u + x);
+        assert(vp_texture_alpha8_linear(src, 24, dst, 15, 5, 3, 8) == 0);
+        for (unsigned y = 0; y < 3u; ++y)
+            for (unsigned x = 0; x < 5u; ++x)
+                assert(dst[y * 5u + x] == 200u + y * 10u + x);
+        assert(vp_texture_alpha8_linear(src, 23, dst, 15, 5, 3, 8) == -1);
+        assert(vp_texture_alpha8_linear(src, 24, dst, 14, 5, 3, 8) == -1);
+        assert(vp_texture_alpha8_linear(src, 24, dst, 15, 5, 3, 4) == -1);
+        assert(vp_texture_alpha8_linear(src, 24, dst, 15, 5, 3, 0) == -1);
+        assert(vp_texture_alpha8_linear(src, 24, dst, 15, 0, 3, 8) == -1);
+        for (unsigned i = 0; i < 15u; ++i) tight[i] = (uint8_t)(30u + i);
+        assert(vp_texture_alpha8_linear(tight, 15, dst, 15, 5, 3, 5) == 0);
+        assert(memcmp(dst, tight, 15u) == 0);
+    }
+    {
+        /* Differential decode: the one-byte decoder must reproduce exactly
+         * the old RGBA U8 decode plus the reviewed (7,7,7,2) selector pass.
+         * The old path yields (255,255,255,byte); GXM U8_R111 samples the
+         * single channel as (1,1,1,R), so the alpha bytes must match bit for
+         * bit and the RGB contract is the constant 255. */
+        static const unsigned widths[] = {1,2,3,4,5,7,15,16,17,31,32,
+                                          33,63,64,65,70,127};
+        static const unsigned heights[] = {1,2,3,7,8,9,15,16,17};
+        const uint32_t swizzle = (7u << 19) | (7u << 22) | (7u << 25) |
+                                 (2u << 28);
+        uint32_t lcg = 0x1badf00du;
+        for (unsigned wi = 0; wi < sizeof(widths) / sizeof(widths[0]); ++wi)
+        for (unsigned hi = 0; hi < sizeof(heights) / sizeof(heights[0]); ++hi)
+        for (unsigned bh = 0; bh <= 2u; ++bh) {
+            unsigned w = widths[wi], h = heights[hi];
+            size_t storage = vp_texture_storage(w, h, 0x1d, bh);
+            size_t pixels = (size_t)w * h;
+            uint8_t *source = (uint8_t *)malloc(storage);
+            uint8_t *old = (uint8_t *)malloc(pixels * 4u);
+            uint8_t *alpha = (uint8_t *)malloc(pixels);
+            assert(source != NULL && old != NULL && alpha != NULL);
+            for (size_t i = 0; i < storage; ++i) {
+                lcg = lcg * 1664525u + 1013904223u;
+                source[i] = (uint8_t)(lcg >> 24);
+            }
+            assert(vp_texture_rgba(source, storage, old, w, h, 0x1d, bh) == 0);
+            vp_texture_swizzle(old, pixels, swizzle);
+            assert(vp_texture_alpha8_untile(source, storage, alpha, pixels,
+                                            w, h, 0x1d, bh) == 0);
+            for (size_t p = 0; p < pixels; ++p) {
+                assert(old[p * 4u] == 255u && old[p * 4u + 1u] == 255u &&
+                       old[p * 4u + 2u] == 255u &&
+                       old[p * 4u + 3u] == alpha[p]);
+            }
+            free(source);
+            free(old);
+            free(alpha);
+        }
+        puts("PASS Alpha8 U8 decode equals the old RGBA decode + (7,7,7,2)");
     }
     puts("PASS RGBA GOB sectors, BC1 color/transparency, RGBA32F-to-RGBA16F, bounds");
     return 0;

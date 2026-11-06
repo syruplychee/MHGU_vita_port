@@ -55,6 +55,12 @@ add_executable(vita_port_native_loader
     src/platform/guest_svc.c
     src/platform/gpu_stream.c
     src/platform/gpu_texture.c
+    src/platform/engine_layout.c
+    src/platform/engine_material.c
+    src/platform/engine_state.c
+    src/platform/engine_queue_native.c
+    src/platform/engine_full.c
+    src/platform/frame_cost_profile.c
     src/platform/gxm_depth.c
     src/platform/gxm_depth_clear_native.c
     src/platform/gxm_depth_view.c
@@ -72,6 +78,7 @@ add_executable(vita_port_native_loader
     src/platform/sdk_exception_index.c
     src/platform/sdk_tls_slots.c
     src/platform/static_shader_index.c
+    src/platform/texture_pool.c
     src/platform/thread_local_allocator.c
     src/platform/vertex_format.c
     src/platform/vertex_window.c)
@@ -89,6 +96,18 @@ target_include_directories(vita_port_native_loader PRIVATE
     src/app src/loader src/bridge src/bridge/armv7 src/platform src/generated
     "${VITA_PORT_GENERATED_DIR}")
 target_compile_features(vita_port_native_loader PRIVATE c_std_11)
+set_source_files_properties(src/platform/engine_material.c src/platform/engine_state.c
+    src/platform/engine_queue_native.c PROPERTIES
+    COMPILE_DEFINITIONS "memcpy=vp_engine_copy;memset=vp_engine_clear"
+    COMPILE_OPTIONS "-fno-builtin;-fno-tree-loop-distribute-patterns")
+set_source_files_properties(src/platform/engine_full.c PROPERTIES
+    COMPILE_OPTIONS "-fno-builtin;-fno-tree-loop-distribute-patterns")
+if(VITA_PORT_ENGINE_CAPTURE)
+    target_sources(vita_port_native_loader PRIVATE src/platform/engine_capture.c)
+    target_compile_definitions(vita_port_native_loader PRIVATE VP_ENGINE_CAPTURE=1)
+    set_source_files_properties(src/platform/engine_capture.c PROPERTIES
+        COMPILE_OPTIONS "-fno-builtin;-fno-tree-loop-distribute-patterns")
+endif()
 target_compile_options(vita_port_native_loader PRIVATE
     -O2 -mcpu=cortex-a9 -mfpu=neon-vfpv3 -mfloat-abi=hard
     -Wall -Wextra -Werror)
@@ -100,7 +119,7 @@ target_link_options(vita_port_native_loader PRIVATE
     "LINKER:--defsym=__sce_headroom=0x10000")
 target_link_libraries(vita_port_native_loader PRIVATE
     SceSysmem_stub SceIofilemgr_stub SceGxm_stub SceDisplay_stub
-    SceCtrl_stub SceLibKernel_stub)
+    SceCtrl_stub SceLibKernel_stub m)
 target_compile_definitions(vita_port_native_loader PRIVATE
     "VP_GXM_STATIC_DIR=\"${VITA_PORT_STATIC_SHADER_PACKAGE_DIR}\"")
 

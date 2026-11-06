@@ -7,6 +7,14 @@ Marker 是 `ux0:data/mhgu-vita-port/` 下的空文件或短文本文件。运行
 
 | Marker | 作用 |
 |---|---|
+| `engine-full.enable` | 实验：替换公共队列、program／材质资源及状态准备；与 engine-layout／engine-submit-probe 互斥；默认关闭，restart 修正后村庄采样画面恢复，见 ADR 0019–0020 |
+| `engine-full-fast.enable` | 实验：启用已核对的纯查询直接计算、减少准备开销；存在时启用完整接管，默认关闭，见 ADR 0022 |
+| `engine-full-ab.enable` | 实验：同进程交替运行完整接管的原入口与 C 路径。存在时即使没有 `engine-full.enable` 也启用完整接管；与 engine-layout／engine-submit-probe 互斥；`VITA_PORT_ENGINE_CAPTURE` 诊断构建显式拒绝；见 ADR 0021、0023 |
+| `engine-full-mode.txt` | A/B 控制文件，允许 `0`–`12` 和尾部空白；拒绝前导空白、前导零、多余字符和超过 16 字节。`0` 原 root，`1/2` C 接管，`3` shared，`4` deep 64，`5` deep+idle，`6` deep+idle+clear-defer，`7` deep 128，`8` split raw，`9` deep+quiet，`10` deep 64+idle+quiet，`11` deep 128+idle+quiet，`12` deep 128+quiet。只有 `1/2` 替换 root；其余保留原 root。仅 AB marker 存在时读取，非法显式失败。完整位图见 ADR 0035 |
+| `texture-pipeline.disable` | 退出当前分支默认启用的深纹理管线。存在 A/B 控制时由 `engine-full-mode.txt` 决定，本 marker 不覆盖。切换在 GPU submission 边界 drain 后应用，不改变 draw 内控制流 |
+| `texture-pool-128.enable` | 无 AB 时启动一次读取，把 deep 统一 raw+decoded 预算设为 128 MiB；不保证实际已分配齐。与 texture-pipeline.disable 冲突则拒绝启动。见 ADR 0035 |
+| `texture-idle-recycle.enable` | 无 AB 时启动一次读取，允许先回收空闲的异尺寸纹理页；活资源、pin 与真实 GPU 完成条件不变。要求 deep。见 ADR 0035 |
+| `work-log-reduce.enable` | 无 AB 时启动一次读取，在格式化前省去已审计的正常工作记录；错误、拒绝和证据记录保留。不依赖 deep。见 ADR 0030/0035 |
 | `play.enable` | 进入可玩路径；runner 默认写入 |
 | `display-bridge.enable` | 启用显示桥 |
 | `display-bridge.disable` | 显式关闭显示桥 |
@@ -18,6 +26,10 @@ Marker 是 `ux0:data/mhgu-vita-port/` 下的空文件或短文本文件。运行
 | `sdk-session-kernel.enable` | Session 全部使用原内核互斥体，供同一 SELF 对照用户态门锁；启动时读取 |
 
 ## 2. 渲染策略
+
+`engine-layout.enable` 启动时接管已锁定的游戏公共入口，复用顶点布局的完整准备结果；
+当前为显式选择，详见 ADR 0018。`engine-submit-probe.enable` 仅测原入口，默认关闭，
+两者不能同时使用。它们都不允许通过跳过 draw 或降低效果来宣称提速。
 
 | Marker | 默认 | 说明 |
 |---|---|---|
@@ -37,12 +49,35 @@ Marker 是 `ux0:data/mhgu-vita-port/` 下的空文件或短文本文件。运行
 | Marker | 作用 |
 |---|---|
 | `play-perf.enable` | 启用逐帧/服务计时；关闭时计时字段为 0 |
+| `frame-cost.enable` | 启用独立的 GXM worker 帧成本分解计时。不存在时不做持续轮询/取时钟；存在时才在完整 decoder-entry 边界读取控制文件。默认关闭，见 ADR 0027 |
+| `frame-cost-mode.txt` | `frame-cost.enable` 存在时的控制文件（不是 marker）：内容必须恰好是 `0` 或 `1`，允许尾部空白。`0` 保持同样的边界轮询频率但不建 span；`1` 启用 span。缺失或非法时显式记录 control error 并禁用本进程数据。切换只在 span 栈为空时发生，记录 epoch/mode/time |
+| `VP_FRAME_COST_SNAPSHOT_BEGIN/ROW/END` | 仅 mode 1：每 32 个 present 输出同一身份的完整累计快照；最终 schema 3 为 22 类，另有同端点 GXM/纹理细分。关闭时补最后闭合快照。缺行、错误、倒退、self/root 不对账均拒绝；见 ADR 0027 |
+| `VP_FRAME_COST_POINT` / `VP_FRAME_COST_EPOCH` / `VP_FRAME_COST_CONTROL` | mode 0/1 切换、epoch 端点、marker 删除和控制错误的显式记录；不包括成本 span |
+| `VP_FRAME_COST_ROOT` | 闭合 worker 根调用的起止 journal；区间和必须等于同端点 root 累计差。用于和原游戏区间求并集，不能跨线程相加 |
+| `frame-resource-audit.enable` | 默认关；与 frame-cost 一起启用，每个 mode-1 epoch 的前 16 个 present 范围记录纹理完整 key/长度/真实查询结果，不写像素。不纳入正式性能窗口；首尾不完整帧由分析器排除 |
+| `game-cost.enable` | 默认关；安装四个原游戏 A32 函数观测钩子，保留原函数，记录嵌套与平台桥墙钟。入口、原字节、范围和 ABI 见 `config/patch-plans/game-cost.json`、ADR 0028 |
+| `guest-heap-limit-mib.txt` | 默认不存在；启动时读取的真实 guest 堆容量控制，严格十进制 128–1895 MiB。实际内存块和 GetInfo/区域布局同时调整，非法则失败。见 ADR 0031 |
+| `memory-audit.enable` | 默认关；记录实际 GetInfo 内存查询返回值和有界原栈字，仅作候选调用现场，不是展开调用栈 |
+| `title-texture-heap-256.enable` / `title-texture-heap-512.enable` | 默认均关，二选一，冲突则失败；改原游戏 NVNTexture 子堆两条已核对容量指令。256 MiB 已因破图否决，512 MiB 仅有有限 L3；见 ADR 0031 |
+| `resource-lifecycle.enable` | 默认关；启动时安装六处原 rTexture 加载/替换/释放/析构观测点，记录名字、对象、GPU 对象。不会关闭 raw 内容比较；见 ADR 0032 |
+| `VP_GPU_WAIT` / `VP_GPU_WAIT_TOTAL` | play-perf 下每 32 个 present 输出完整 28 原因累计快照；记录真实通知等待、poll 命中、失败、阻塞时间及粗直方图，与原全局通知计时对账。mode 6 的 clear-materialize 等待单列一行。用 `analyze_gpu_wait.py` 做完整快照端点差分；不是 GPU 硬件执行时间 |
 | `draw-trace.enable` | draw 跟踪 |
 | `vtx-dump.enable` | 顶点 dump |
-| `b34-passdump.enable` | pass 级 dump |
+| `b34-passdump.enable` | pass 级 dump；存在期间强制同步 scene，marker 消失前保持原行为 |
+| `capture-live.enable` / `capture-request.txt` | 实时截图邮箱；`inputs!=0` 的 surface 输入 capture 期间强制同步，只拍 present（`inputs=0`）保持异步流水线，capture 完成后恢复 |
 | `shader-word-dump.disable` | 关闭 shader word dump（runner 默认写） |
 | `texture-asset-dump.enable` | 纹理资产 dump |
 | `media-instrument.enable` | 媒体详细计时 |
+| `VP_TEX_POOL_STATS` / `VP_GXM_TEXTURE_PIPELINE_STATS` | deep 管线累计计数日志（既有 512 request／256 draw 节奏）：region 申请/复用、pressure、decode family、direct bind/bytes、retain/release/quarantine、实际 memcpy 字节、deferred scene、notification poll/real wait、combined drain、mode transition；`VP_TEX_POOL_STATS` 另带 `memory_mode/raw_class/budget/split`。region 模式的 arena 碎片项为 0，不能据此判断系统碎片；普通计时包含嵌套项 |
+| `VP_TEX_MEMORY_CONFIG` | mode 切换前后各一条：`memory_mode/budget/split/raw_class/decoded_class`、真实 `raw_cached_bytes/raw_cached_alloc_bytes/decoded_mapped_bytes/decoded_mapped_alloc_bytes`、合计 `physical_bytes/peak_bytes`、region kernel 分配/释放和 user/CDRAM free。切换本身是 warmup，不纳入正式窗口 |
+| `VP_TEX_MEMORY_METRICS` | deep 已应用时每 32 个 present 在 frame-cost 同一端点输出：`memory_mode/split/raw_cached/raw_mapped/decoded_mapped`、实际 raw cached 与 decoded mapped 的 chunk/子分配字节、合计 physical/peak、pool 使用/峰值/槽/淘汰/pressure/nomem/GPU refs 和 user/CDRAM free；不依赖 `frame-cost.enable`，不是期望预算 |
+| `VP_GXM_CLEAR_DEFER_STATS` | mode 6 累计计数，在既有 `static_log_stats` 节奏输出：try／accept／fallback／scene submit／coalesce／materialize 调用与失败／in-scene 消费／仍带 async 标签的 surface 数。不新增逐 clear 日志；`tries` 与 accept+fallback+submit_fail 对账，失败含真实错误传播 |
+
+mode 8 的 cached raw 最终实现来自现有 C 堆，并逐块核对 USER_RW 类型；不新建 cached
+内核块、不扩大 C 堆、不做 uncached 回退。启动即启用已观察到加载失败，当前只完成
+进村后切换的稳态对照，未证明提速。mode 7 早期因原游戏大堆挤占未取得完整 128 MiB；缩小原子堆后已取得完整 backing，
+见[原游戏内存验证](../18-resource-lifecycle-and-capacity.md)。是否在新字体下保留大池，
+以[组合复测](../21-performance-consolidation.md)为准；split raw 仍关闭。
 
 ## 4. 输入
 
@@ -75,6 +110,9 @@ Marker 是 `ux0:data/mhgu-vita-port/` 下的空文件或短文本文件。运行
 | `native-movie.enable` | 启用框架级原生播片；从 ROM 树读取用户自己的 MP4，复用 SceAvcdec，原生呈现视频。默认关闭；当前无音频。移除后重启回到原 guest 管线 |
 | `native-movie.limit-ms` | 诊断：文件内十进制毫秒数，原生播放在该时长后停止并走游戏停止命令；只用于有界测试，不作为验收结果 |
 | `thread-probe.enable` | 诊断：记录 guest ThreadType 的 user entry/arg/name、uMovie vtable 和 movie 控制地址；只读，默认关闭 |
+| `pixel-font.enable` | 启用独立 font-pixel RomFS 包、原 rTexture 身份登记和点阵字体单通道采样；启动时读取。缺少配套包明确失败；移除并重启恢复原字体。见 ADR 0033 |
+| `pixel-font-native.enable` | 配合 pixel-font.enable，读取 font-native/ 包并接管原字形发射；原生字模、720p 原游戏显示预设与上下 2px 像素对齐显示。要求 540p、gpu-present，重启生效；见 ADR 0034 |
+| `pixel-font-trace.enable` | 配合字体模式，观测原 GFD 查字/取页、字形发射和有界真实 GPU 顶点/copy；默认关闭，会增加 bridge 和日志成本 |
 | `movie-force-stop.enable` | 诊断：首次解码 5 秒后向游戏 uMovie 命令字写入 8，用于单独验证停止路径；不用于正式播片 |
 
 ## 6. 优先级

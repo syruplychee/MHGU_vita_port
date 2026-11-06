@@ -1,6 +1,10 @@
 #include "gxm_runtime.h"
+#include "texture_pipeline.h"
+#include "texture_regions.h"
 #include "batch_policy.h"
 #include "clear_fusion.h"
+#include "engine_full.h"
+#include "gxm_sampler_plan.h"
 #include "texture_snapshot.h"
 #include "gpu_texture.h"
 #include "gxm_depth.h"
@@ -18,6 +22,10 @@
 #include "vertex_format.h"
 #include "vertex_window.h"
 #include "gpu_indices.h"
+#include "gpu_wait_profile.h"
+#include "frame_cost_profile.h"
+#include "work_log.h"
+#include "guest_svc.h"
 
 #include <psp2/display.h>
 #include <psp2/gxm.h>
@@ -27,9 +35,29 @@
 #include <psp2/kernel/processmgr.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <malloc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* The pure sampler planner uses portable enum values; these assertions keep
+ * them identical to the VitaSDK sampler enums actually passed to GXM. */
+_Static_assert(SCE_GXM_TEXTURE_FILTER_POINT == 0, "sampler point value");
+_Static_assert(SCE_GXM_TEXTURE_FILTER_LINEAR == 1, "sampler linear value");
+_Static_assert(SCE_GXM_TEXTURE_MIP_FILTER_DISABLED == 0, "mip disabled value");
+_Static_assert(SCE_GXM_TEXTURE_MIP_FILTER_ENABLED == 0x200, "mip enabled value");
+_Static_assert((unsigned)SCE_GXM_TEXTURE_ADDR_REPEAT ==
+               (unsigned)VP_GXM_SAMPLER_ADDR_REPEAT, "addr repeat value");
+_Static_assert((unsigned)SCE_GXM_TEXTURE_ADDR_MIRROR ==
+               (unsigned)VP_GXM_SAMPLER_ADDR_MIRROR, "addr mirror value");
+_Static_assert((unsigned)SCE_GXM_TEXTURE_ADDR_CLAMP ==
+               (unsigned)VP_GXM_SAMPLER_ADDR_CLAMP, "addr clamp value");
+_Static_assert((unsigned)SCE_GXM_TEXTURE_ADDR_MIRROR_CLAMP ==
+               (unsigned)VP_GXM_SAMPLER_ADDR_MIRROR_CLAMP,
+               "addr mirror clamp value");
+_Static_assert((unsigned)SCE_GXM_TEXTURE_ADDR_CLAMP_FULL_BORDER ==
+               (unsigned)VP_GXM_SAMPLER_ADDR_CLAMP_FULL_BORDER,
+               "addr border value");
 
 #define VP_GXM_WIDTH 960
 #define VP_GXM_HEIGHT 544
@@ -79,6 +107,7 @@ static SceGxmVertexProgram *vertex_program;
 static SceGxmFragmentProgram *fragment_program;
 static const SceGxmProgram *gxm_vs_program;
 static const SceGxmProgram *gxm_fs_program;
+/* VP_HOST_TEST_EXTRACT:pair_base_begin */
 typedef struct {
     unsigned hash;
     unsigned viewport_transform;
@@ -91,6 +120,7 @@ typedef struct {
     const SceGxmProgram *vs_program;
     const SceGxmProgram *fs_program;
 } VPGxmProgramPair;
+/* VP_HOST_TEST_EXTRACT:pair_base_end */
 static VPGxmProgramPair gxm_pairs[VP_GXM_PROGRAM_STORE];
 static unsigned gxm_pair_count;
 /* Static shader index v1. The index is built offline; this module only
@@ -111,6 +141,9 @@ typedef struct {
     unsigned default_uniform_bytes;
     const SceGxmProgramParameter *tex[VP_GXM_FRAGMENT_SAMPLER_LIMIT];
     const SceGxmProgramParameter *tex_inv_size[VP_GXM_FRAGMENT_SAMPLER_LIMIT];
+    /* Vertex-only RGBA32F layout selector: 0 ordinary, 1 packed/repeat U,
+     * 2 packed/clamp U. Logical inverse extents remain unchanged. */
+    const SceGxmProgramParameter *tex_rgba32f_packed[VP_GXM_FRAGMENT_SAMPLER_LIMIT];
     const SceGxmProgramParameter *fragcoord_scale;
     /* Software-shadow helper ABI: three float4 uniforms per declared shadow
      * slot.  A partial trio is never filled with zero; it is refused. */
@@ -146,6 +179,7 @@ typedef struct {
      * parameters on every depth draw. */
     unsigned has_f_mask;
 } VPStaticResident;
+/* VP_HOST_TEST_EXTRACT:pair_struct_begin */
 typedef struct VPStaticPair {
     int used;
     uint32_t vs_stage, fs_stage;
@@ -158,6 +192,15 @@ typedef struct VPStaticPair {
     uint32_t packed_mask;
     uint16_t packed_stream_stride;
     uint32_t blend[6];
+    /* Immutable result of build_blend_info at pair creation. Shared mode reuses
+     * it on later hits instead of converting the same six guest enums again. */
+    SceGxmBlendInfo blend_info;
+    /* Per-stage default-uniform sizes and the face-state condition used by the
+     * batch uniform budget. Pair-held residents cannot be evicted, so these
+     * values stay valid for the pair lifetime. */
+    uint32_t vs_default_uniform_bytes;
+    uint32_t fs_default_uniform_bytes;
+    uint32_t fs_face_state;
     SceGxmVertexProgram *vs;
     SceGxmFragmentProgram *fs;
     const SceGxmProgram *vs_program;
@@ -166,6 +209,7 @@ typedef struct VPStaticPair {
     uint32_t last_use;
     VPGxmProgramPair base;
 } VPStaticPair;
+/* VP_HOST_TEST_EXTRACT:pair_struct_end */
 typedef struct {
     unsigned index_hits, index_misses, gxp_loads, registrations, unregistrations;
     unsigned pair_hits, pair_misses, pair_evictions, resident_evictions;
@@ -206,35 +250,79 @@ static uint16_t static_resident_slots[VP_STATIC_INDEX_MAX_VARIANTS];
 static unsigned static_resident_used;
 static unsigned static_resident_bytes;
 static unsigned static_clock;
-/* One most-recent successful pair. Only a key back to the slot; the full
- * inputs are still compared with static_pair_inputs_match. */
+static VPStaticPair static_pairs[VP_GXM_STATIC_PAIR_LIMIT];
+/* VP_HOST_TEST_EXTRACT:pair_hint_begin */
+/* Recent successful pairs. Only keys back to slots; every probe still runs the
+ * full input comparison. Several pairs normally alternate (UI, terrain,
+ * characters), so a one-entry hint misses about half of all lookups and every
+ * miss scans the whole pair table. */
+#define VP_STATIC_PAIR_HINTS 8u
 typedef struct {
     VPStaticPair *pair;
     uint32_t vs_token;
     uint32_t fs_token;
     unsigned viewport;
+    uint64_t age;
 } VPStaticPairHint;
-static VPStaticPair static_pairs[VP_GXM_STATIC_PAIR_LIMIT];
-static VPStaticPairHint static_pair_hint;
-static VPStaticPair *static_current_pair;
+static VPStaticPairHint static_pair_hints[VP_STATIC_PAIR_HINTS];
+static uint64_t static_pair_hint_clock;
 
 static void static_pair_hint_reset(void) {
-    memset(&static_pair_hint, 0, sizeof(static_pair_hint));
+    for (unsigned i = 0; i < VP_STATIC_PAIR_HINTS; ++i)
+        memset(&static_pair_hints[i], 0, sizeof(static_pair_hints[i]));
+    static_pair_hint_clock = 0u;
 }
 
 /* Called before a slot is released or reused; only its identity matters. */
 static void static_pair_hint_forget(const VPStaticPair *pair) {
-    if (static_pair_hint.pair == pair) static_pair_hint_reset();
+    for (unsigned i = 0; i < VP_STATIC_PAIR_HINTS; ++i)
+        if (static_pair_hints[i].pair == pair)
+            memset(&static_pair_hints[i], 0, sizeof(static_pair_hints[i]));
 }
 
 static void static_pair_hint_set(VPStaticPair *pair, uint32_t vs_token,
                                  uint32_t fs_token, unsigned viewport) {
-    static_pair_hint.pair = pair;
-    static_pair_hint.vs_token = vs_token;
-    static_pair_hint.fs_token = fs_token;
-    static_pair_hint.viewport = viewport;
+    VPStaticPairHint *slot = NULL;
+    for (unsigned i = 0; i < VP_STATIC_PAIR_HINTS; ++i) {
+        VPStaticPairHint *hint = &static_pair_hints[i];
+        if (hint->pair == pair) { slot = hint; break; }
+        if (hint->pair == NULL) {
+            if (slot == NULL || slot->pair != NULL) slot = hint;
+        } else if (slot == NULL ||
+                   (slot->pair != NULL && hint->age < slot->age)) {
+            slot = hint;
+        }
+    }
+    if (slot == NULL) return;
+    slot->pair = pair;
+    slot->vs_token = vs_token;
+    slot->fs_token = fs_token;
+    slot->viewport = viewport;
+    slot->age = ++static_pair_hint_clock;
 }
+/* VP_HOST_TEST_EXTRACT:pair_hint_end */
+static VPStaticPair *static_current_pair;
 static VPStaticStats static_stats;
+/* Resident/index identity changes bump this generation; every shader-plan
+ * cache entry from an older generation is rejected and rebuilt. */
+static uint32_t static_plan_generation;
+static VPGxmShaderPlanCacheEntry static_plan_cache[VP_GXM_SHADER_PLAN_CACHE_ENTRIES];
+static VPGxmShaderPlanCounts static_plan_counts;
+static unsigned static_plan_stage_calls[2];
+static unsigned static_plan_slot_calls[2][VP_GXM_FRAGMENT_SAMPLER_LIMIT];
+static VPGxmSamplerPlanCacheEntry
+    gxm_sampler_plan_cache[VP_GXM_SAMPLER_PLAN_CACHE_ENTRIES];
+static unsigned gxm_sampler_plan_hits, gxm_sampler_plan_misses;
+/* Counters for the mode-3-only substitutions; they remain zero in modes 0-2. */
+static unsigned static_shared_pair_hits, static_shared_uniform_reuses;
+static unsigned static_shared_blend_reuses;
+static int gxm_shared_prepare_active(void) {
+    return __atomic_load_n(&vp_engine_shared_prepare_enabled,
+                           __ATOMIC_ACQUIRE) != 0u;
+}
+static void static_plan_invalidate(void) {
+    static_plan_generation++;
+}
 static int static_index_load(const char *dir);
 static int static_preload_observed(void);
 static int static_register_bringup(unsigned token);
@@ -331,16 +419,28 @@ static int gxm_log_ensure(void) {
  * later lines are counted as suppressed by the helper. Write/flush failures
  * fail closed and are also reported once. */
 static void glog(const char *format, ...) {
+    uint64_t fc = vp_gxm_frame_cost_log_begin();
     va_list args;
     int state = gxm_log_ensure();
     int rc;
-    if (state == -2) return; /* half-initialized; do not read its fields */
+    if (state == -2) {
+        vp_gxm_frame_cost_category_end(VP_FRAME_COST_LOG, fc);
+        return; /* half-initialized; do not read its fields */
+    }
     va_start(args, format);
     rc = vp_log_sink_vprintf(&gxm_log_sink, format, args);
     va_end(args);
     if (rc < 0 && rc != VP_LOG_SINK_NOT_READY)
         gxm_log_report_failure(rc, 1u);
+    vp_gxm_frame_cost_category_end(VP_FRAME_COST_LOG, fc);
 }
+
+static VPWorkLogStats gxm_work_log_stats;
+#define glog_work(...) do { \
+    if (vp_work_log_emit(&gxm_work_log_stats, \
+            __atomic_load_n(&vp_engine_work_log_reduce_enabled, __ATOMIC_ACQUIRE))) \
+        glog(__VA_ARGS__); \
+} while (0)
 
 int vp_gxm_log_get_stats(VPLogSinkStats *out) {
     if (out == NULL) return -1;
@@ -460,6 +560,7 @@ static void gpu_free(void *ptr) {
  * game binds as a render target or samples as tex0. The colour buffer is also
  * exposed as a linear texture so a later pass can consume an earlier pass's
  * output without copying or decoding guest block-linear memory. */
+/* VP_HOST_TEST_EXTRACT:clear_surface_begin */
 typedef struct {
     int used;
     uint64_t va;
@@ -490,7 +591,15 @@ typedef struct {
      * target. Marker-gated; materialized before sampling/present/readback. */
     unsigned clear_pending;
     uint32_t clear_pending_color;
+    /* Mode-6 fast path: the pending clear was recorded after the worker
+     * submitted the open scene through a non-synchronous boundary. A later
+     * CPU/GPU transfer materialization must first prove every pending scene
+     * complete and keep this tag on failure. In-scene GPU clears consume it
+     * under the same-context submission order. The tag survives a mode
+     * 6 -> 5 switch so an already deferred clear keeps its drain. */
+    unsigned clear_pending_async;
 } VPGxmSurface;
+/* VP_HOST_TEST_EXTRACT:clear_surface_end */
 
 typedef struct {
     unsigned width;
@@ -556,6 +665,11 @@ static int gxm_render_resolution_ensure(void) {
              gxm_render_resolution_height == 360u ? "360p" : "540p",
              native.width, native.height);
     }
+    if (vp_guest_pixel_font_native_enabled() && gxm_render_resolution_height!=540u) {
+        glog("NATIVE_FONT_REJECT reason=requires-540p-render-grid\n");
+        gxm_render_resolution_state=2;
+        return -1;
+    }
     return 0;
 }
 
@@ -565,6 +679,11 @@ static unsigned render_extent(unsigned width, unsigned height, unsigned extent) 
     if (extent == width) return native.width;
     if (extent == height) return native.height;
     return extent;
+}
+
+float vp_gxm_native_font_scale(void) {
+    if (gxm_render_resolution_ensure()) return 0.0f;
+    return (float)gxm_render_resolution_height/720.0f;
 }
 
 static VPGxmSurface *surface_find(uint64_t va) {
@@ -791,6 +910,41 @@ static int frame_context_reject(const char *entry);
  * deferred scene pipeline. Waiting a value implies completion of every earlier
  * scene because the GPU consumes scenes in submission order. */
 static uint32_t gxm_notify_seq;
+/* VP_HOST_TEST_EXTRACT:notify_begin */
+/* Values are monotonic and skip zero when the 32-bit sequence wraps: zero is
+ * the region's initial/unset value, never a submitted notification. */
+static uint32_t gxm_notify_next(uint32_t value) {
+    value++;
+    if (value == 0u) value++;
+    return value;
+}
+
+/* Serial-number comparison for values separated by less than 2^31. At most one
+ * scene per arena is outstanding, so the pending set stays far inside that
+ * window; this must not be used as a general timestamp comparison. */
+static int gxm_notify_newer(uint32_t value, uint32_t reference) {
+    uint32_t distance = value - reference;
+    return distance != 0u && distance < UINT32_C(0x80000000);
+}
+
+/* True when waiting for completed proves pending has also completed. This is
+ * the exact complement of gxm_notify_newer, so newest selection and retirement
+ * always agree. */
+static int gxm_notify_reached(uint32_t completed, uint32_t pending) {
+    return !gxm_notify_newer(pending, completed);
+}
+
+/* Acquire observation of the notification word. Vita GCC uses the atomic
+ * builtin; the MSVC host test relies on x86 load ordering, which is acquire
+ * for ordinary cached loads. */
+static uint32_t gxm_notify_observe(volatile unsigned *address) {
+#if defined(_MSC_VER)
+    return *(volatile uint32_t *)address;
+#else
+    return __atomic_load_n(address, __ATOMIC_ACQUIRE);
+#endif
+}
+/* VP_HOST_TEST_EXTRACT:notify_end */
 static int gxm_scene_pipeline_enabled(void);
 static void gxm_pending_scene_retire_upto(uint32_t value);
 
@@ -830,6 +984,37 @@ static uint64_t gxm_clear_fusion_deferred, gxm_clear_fusion_in_scene;
 static uint64_t gxm_clear_fusion_blue;
 static uint64_t gxm_clear_fusion_materialized;
 static uint64_t gxm_clear_fusion_combined;
+/* A/B mode 6 clear-defer experiment. Cumulative worker-only counters; the
+ * debug log prints them at the existing static-draw cadence and never per
+ * clear. The pending tag itself lives on each VPGxmSurface. */
+static uint64_t gxm_clear_defer_tries;
+static uint64_t gxm_clear_defer_accepts;
+static uint64_t gxm_clear_defer_fallbacks;
+static uint64_t gxm_clear_defer_scene_submits;
+static uint64_t gxm_clear_defer_submit_failures;
+static uint64_t gxm_clear_defer_coalesced;
+static uint64_t gxm_clear_defer_materialize_calls;
+static uint64_t gxm_clear_defer_materialize_failures;
+static uint64_t gxm_clear_defer_in_scene;
+static int gxm_clear_defer_seen;
+static int gxm_clear_defer_reported = -1;
+
+/* Published before the root entry, read here on the worker. A mode switch only
+ * changes admission for new clear requests; existing per-surface async tags
+ * stay protective regardless of this value. */
+static int gxm_clear_defer_enabled(void) {
+    int enabled = __atomic_load_n(&vp_engine_clear_defer_enabled,
+                                  __ATOMIC_ACQUIRE) != 0u;
+    if (enabled) gxm_clear_defer_seen = 1;
+    if (enabled != gxm_clear_defer_reported) {
+        /* Default runs stay silent; only an actual transition (including the
+         * 6 -> 5 switch after a deferred clear existed) is reported. */
+        if (enabled || gxm_clear_defer_seen)
+            glog("VP_GXM_CLEAR_DEFER enabled=%d\n", enabled);
+        gxm_clear_defer_reported = enabled;
+    }
+    return enabled;
+}
 
 /* Marker state is read once. The default components are re-resolved only when
  * static mode or the self-test override changes, so the per-draw path stays a
@@ -879,11 +1064,56 @@ static int gxm_clear_fusion_enabled(void) {
  * zero unless the play-perf marker gates the timestamps on. */
 static uint64_t gxm_endscene_calls, gxm_endscene_us;
 static uint64_t gxm_notify_wait_calls, gxm_notify_wait_us;
+static VPGpuWaitProfile gxm_wait_profile;
+static unsigned gxm_wait_reclaim_active;
+static unsigned gxm_wait_snapshot;
+static uint64_t gxm_notify_poll_hits, gxm_notify_real_waits;
 static uint64_t gxm_finish_calls, gxm_finish_us;
 static uint64_t gxm_pending_complete_calls, gxm_pending_wait_us;
+/* A combined drain submits the current scene first and proves all older
+ * pending scenes complete with one wait for the newest value. */
+static uint64_t gxm_combined_drains;
+static uint64_t gxm_deferred_scenes;
+/* Direct decoder-owned texture counters (deep mode only). */
+static uint64_t gxm_direct_binds, gxm_direct_bytes_avoided;
+static uint64_t gxm_direct_retains;
+static uint64_t gxm_direct_bind_failures;
+static int gxm_direct_seen;
+static VPTextureRegions gxm_texture_region_arena;
+static uint64_t gxm_texture_kernel_allocs, gxm_texture_kernel_frees;
+/* Tentative declarations used by the early statistics logger; the
+ * authoritative definitions live in the extracted direct/pending sections. */
+static uint64_t gxm_direct_releases;
+static uint64_t gxm_direct_quarantined;
+static unsigned gxm_pending_scene_count;
 /* Age since EndScene, not blocking; the worker may have encoded a whole scene
  * while the deferred scene ran. Kept only for overlap diagnostics. */
 static uint64_t gxm_pipeline_waits, gxm_pipeline_age_us, gxm_pipeline_age_max;
+
+static void gxm_wait_profile_log(uint64_t now, uint64_t frames) {
+    if (gxm_profile_state != 1) return;
+    unsigned snapshot = ++gxm_wait_snapshot;
+    for (unsigned i = 0u; i < VP_GPU_WAIT_CAUSES; ++i) {
+        const VPGpuWaitCause *c = &gxm_wait_profile.causes[i];
+        glog("VP_GPU_WAIT snap=%u t_us=%llu frames=%llu row=%u rows=%u "
+             "cause=%s calls=%llu real=%llu polls=%llu failures=%llu "
+             "block_us=%llu pending_sum=%llu draws=%llu sync=%llu "
+             "b0=%llu b1=%llu b2=%llu b3=%llu b4=%llu\n",
+             snapshot, (unsigned long long)now, (unsigned long long)frames,
+             i, (unsigned)VP_GPU_WAIT_CAUSES, vp_gpu_wait_names[i],
+             (unsigned long long)c->calls, (unsigned long long)c->real_waits,
+             (unsigned long long)c->polls, (unsigned long long)c->failures,
+             (unsigned long long)c->block_us, (unsigned long long)c->pending_sum,
+             (unsigned long long)c->draws, (unsigned long long)c->synchronous,
+             (unsigned long long)c->buckets[0], (unsigned long long)c->buckets[1],
+             (unsigned long long)c->buckets[2], (unsigned long long)c->buckets[3],
+             (unsigned long long)c->buckets[4]);
+    }
+    glog("VP_GPU_WAIT_TOTAL snap=%u t_us=%llu frames=%llu real=%llu "
+         "block_us=%llu\n", snapshot, (unsigned long long)now,
+         (unsigned long long)frames, (unsigned long long)gxm_notify_wait_calls,
+         (unsigned long long)gxm_notify_wait_us);
+}
 
 /* Bounded draw timing. Fields are split exactly at the synchronous boundaries
  * this backend owns: CPU preparation, BeginScene, state/encode, sceGxmDraw,
@@ -917,8 +1147,309 @@ static uint64_t gxm_perf_present_frames, gxm_perf_present_sum, gxm_perf_present_
 static uint64_t gxm_perf_present_last_at, gxm_perf_present_interval_sum;
 static uint64_t gxm_perf_present_interval_max, gxm_perf_present_interval_count;
 static uint64_t gxm_perf_present_buckets[VP_GXM_PERF_BUCKETS];
+/* Cumulative whole-frame intervals, distinct from the Present call duration.
+ * Difference two reports from the same scene to exclude boot/loading. */
+static uint32_t gxm_perf_frame_intervals[512];
 static uint64_t gxm_perf_global_ok, gxm_perf_global_fail, gxm_perf_global_skip;
 static unsigned gxm_last_draw_class = 2u; /* 0 colour, 1 depth-only, 2 noop */
+
+/* ---- Bounded frame-cost decomposition -----------------------------------
+ *
+ * Only the single GXM worker records spans. The play-perf marker is not used:
+ * frame-cost.enable is an independent gate, and frame-cost-mode.txt is polled
+ * at decoder-entry boundaries at most every 500 ms. Mode 0 keeps the exact
+ * same boundary clock and file polling cadence but performs no span clocks, so
+ * the two modes can be compared descriptively. A missing/illegal control file
+ * is a recorded control error, never a silent fallback. No span is opened on a
+ * non-worker thread or while the profile is disabled. */
+#define VP_FRAME_COST_MARKER_PATH "ux0:data/mhgu-vita-port/frame-cost.enable"
+#define VP_FRAME_COST_MODE_PATH "ux0:data/mhgu-vita-port/frame-cost-mode.txt"
+#define VP_FRAME_COST_POLL_US 500000ull
+
+static VPFrameCostProfile gxm_frame_cost_profile;
+static int gxm_frame_cost_marker = -1;   /* -1 unknown, 0 absent, 1 present */
+static int gxm_frame_cost_mode;          /* applied control mode */
+static int gxm_frame_cost_enabled;       /* spans active (mode 1) */
+static int gxm_frame_cost_failed;        /* sticky control error */
+static unsigned gxm_frame_cost_epoch;
+static unsigned gxm_frame_cost_seq;
+static int gxm_frame_cost_reported_mode = -1;
+static int gxm_frame_cost_reported_failed = -1;
+static uint64_t gxm_frame_cost_last_poll_us;
+static uint64_t gxm_frame_cost_poll_clocks;
+static uint64_t gxm_frame_cost_boundaries;
+static int gxm_frame_resource_audit;
+static uint64_t gxm_frame_resource_start_frame;
+static void gxm_frame_cost_details(uint64_t now, uint64_t frames, unsigned seq);
+static void gxm_texture_memory_log(uint64_t now, uint64_t frames);
+
+int vp_gxm_frame_cost_active(void) {
+    return gxm_frame_cost_enabled;
+}
+
+int vp_gxm_frame_cost_resource_audit(uint64_t *frame) {
+    if (frame) *frame = gxm_perf_present_frames;
+    return gxm_frame_cost_enabled && gxm_frame_resource_audit &&
+        gxm_perf_present_frames - gxm_frame_resource_start_frame < 16u;
+}
+
+uint64_t vp_gxm_frame_cost_log_begin(void) {
+    /* Reporting an empty stack must not create a new root which reports
+     * itself. Ordinary logging inside work remains a nested measured cost. */
+    if (!gxm_frame_cost_enabled || !gxm_frame_cost_profile.depth) return 0u;
+    return vp_gxm_frame_cost_category_begin(VP_FRAME_COST_LOG);
+}
+
+uint64_t vp_gxm_frame_cost_now(void) {
+    if (!gxm_frame_cost_enabled) return 0u;
+    gxm_frame_cost_profile.clock_calls++;
+    return sceKernelGetProcessTimeWide();
+}
+
+uint64_t vp_gxm_frame_cost_category_begin(unsigned category) {
+    if (!gxm_frame_cost_enabled || !vp_gxm_worker_is_current()) return 0u;
+    uint64_t now = vp_gxm_frame_cost_now();
+    if (now != 0u &&
+        !vp_frame_cost_span_begin(&gxm_frame_cost_profile, category, now))
+        return 0u;
+    return now;
+}
+
+void vp_gxm_frame_cost_category_end(unsigned category, uint64_t started_us) {
+    if (started_us == 0u) return;
+    uint64_t now = vp_gxm_frame_cost_now();
+    int root = gxm_frame_cost_profile.depth == 1u;
+    int rc = vp_frame_cost_span_end(&gxm_frame_cost_profile, category, now);
+    if (!rc && root)
+        glog("VP_FRAME_COST_ROOT schema=%u epoch=%u cat=%s entry_us=%llu "
+             "t_us=%llu frames=%llu\n", VP_FRAME_COST_SCHEMA,
+             gxm_frame_cost_epoch, vp_frame_cost_category_names[category],
+             (unsigned long long)started_us, (unsigned long long)now,
+             (unsigned long long)gxm_perf_present_frames);
+}
+
+static uint64_t gxm_frame_cost_errors(void) {
+    return vp_frame_cost_error_count(&gxm_frame_cost_profile) +
+           (gxm_frame_cost_failed ? 1u : 0u);
+}
+
+static void gxm_frame_cost_log_point(uint64_t now, uint64_t frames,
+                                     const char *reason) {
+    glog("VP_FRAME_COST_POINT schema=%u epoch=%u mode=%d t_us=%llu "
+         "frames=%llu clocks=%llu poll_clocks=%llu boundaries=%llu "
+         "control_error=%d reason=%s\n",
+         VP_FRAME_COST_SCHEMA, gxm_frame_cost_epoch, gxm_frame_cost_mode,
+         (unsigned long long)now, (unsigned long long)frames,
+         (unsigned long long)gxm_frame_cost_profile.clock_calls,
+         (unsigned long long)gxm_frame_cost_poll_clocks,
+         (unsigned long long)gxm_frame_cost_boundaries,
+         gxm_frame_cost_failed ? 1 : 0, reason);
+}
+
+/* Emit one complete snapshot: BEGIN, every fixed category row, END. All lines
+ * carry the same schema/seq/epoch/mode/t_us/frames identity. A snapshot with an
+ * open span is refused and recorded as incomplete instead of being presented
+ * as a closed interval. */
+static void gxm_frame_cost_log_snapshot(uint64_t now, uint64_t frames,
+                                        const char *reason) {
+    VPFrameCostProfile copy;
+    unsigned seq, row;
+    uint64_t errors;
+
+    if (!gxm_frame_cost_enabled) return;
+    if (gxm_frame_cost_profile.depth != 0u) {
+        gxm_frame_cost_profile.incomplete_snapshot++;
+        glog("VP_FRAME_COST_SNAPSHOT_SKIP schema=%u epoch=%u t_us=%llu "
+             "frames=%llu depth=%u reason=span-active\n",
+             VP_FRAME_COST_SCHEMA, gxm_frame_cost_epoch,
+             (unsigned long long)now, (unsigned long long)frames,
+             gxm_frame_cost_profile.depth);
+        return;
+    }
+    copy = gxm_frame_cost_profile;
+    seq = ++gxm_frame_cost_seq;
+    errors = gxm_frame_cost_errors();
+    glog("VP_FRAME_COST_SNAPSHOT_BEGIN schema=%u seq=%u epoch=%u mode=1 "
+         "t_us=%llu frames=%llu rows=%u depth=%u errors=%llu mismatch=%llu "
+         "overflow=%llu underflow=%llu clock_regress=%llu missing_time=%llu "
+         "incomplete=%llu control_error=%d clocks=%llu poll_clocks=%llu "
+         "boundaries=%llu reason=%s\n",
+         VP_FRAME_COST_SCHEMA, seq, gxm_frame_cost_epoch,
+         (unsigned long long)now, (unsigned long long)frames,
+         VP_FRAME_COST_CATEGORY_COUNT, copy.depth,
+         (unsigned long long)errors, (unsigned long long)copy.mismatch,
+         (unsigned long long)copy.overflow, (unsigned long long)copy.underflow,
+         (unsigned long long)copy.clock_regression,
+         (unsigned long long)copy.missing_time,
+         (unsigned long long)copy.incomplete_snapshot,
+         gxm_frame_cost_failed ? 1 : 0,
+         (unsigned long long)copy.clock_calls,
+         (unsigned long long)gxm_frame_cost_poll_clocks,
+         (unsigned long long)gxm_frame_cost_boundaries, reason);
+    for (row = 0u; row < VP_FRAME_COST_CATEGORY_COUNT; ++row) {
+        const VPFrameCostCategory *c = &copy.categories[row];
+        glog("VP_FRAME_COST_SNAPSHOT_ROW schema=%u seq=%u epoch=%u mode=1 "
+             "t_us=%llu frames=%llu row=%u cat=%s calls=%llu incl_us=%llu "
+             "self_us=%llu max_us=%llu root_calls=%llu root_incl_us=%llu\n",
+             VP_FRAME_COST_SCHEMA, seq, gxm_frame_cost_epoch,
+             (unsigned long long)now, (unsigned long long)frames, row,
+             vp_frame_cost_category_names[row],
+             (unsigned long long)c->calls,
+             (unsigned long long)c->inclusive_us,
+             (unsigned long long)c->self_us,
+             (unsigned long long)c->max_us,
+             (unsigned long long)c->root_calls,
+             (unsigned long long)c->root_inclusive_us);
+    }
+    gxm_frame_cost_details(now, frames, seq);
+    glog("VP_FRAME_COST_SNAPSHOT_END schema=%u seq=%u epoch=%u mode=1 "
+         "t_us=%llu frames=%llu rows=%u errors=%llu\n",
+         VP_FRAME_COST_SCHEMA, seq, gxm_frame_cost_epoch,
+         (unsigned long long)now, (unsigned long long)frames,
+         VP_FRAME_COST_CATEGORY_COUNT, (unsigned long long)errors);
+}
+
+static void gxm_frame_cost_start_epoch(uint64_t now, uint64_t frames,
+                                       const char *source) {
+    gxm_frame_cost_epoch++;
+    gxm_frame_cost_seq = 0u;
+    gxm_frame_cost_poll_clocks = 0u;
+    gxm_frame_cost_boundaries = 0u;
+    vp_frame_cost_profile_reset(&gxm_frame_cost_profile);
+    gxm_frame_cost_enabled = 1;
+    gxm_frame_resource_start_frame = frames;
+    glog("VP_FRAME_COST_EPOCH action=start schema=%u epoch=%u mode=1 "
+         "t_us=%llu frames=%llu source=%s\n",
+         VP_FRAME_COST_SCHEMA, gxm_frame_cost_epoch,
+         (unsigned long long)now, (unsigned long long)frames, source);
+}
+
+static void gxm_frame_cost_stop_epoch(uint64_t now, uint64_t frames,
+                                      const char *reason) {
+    if (!gxm_frame_cost_enabled) return;
+    /* Record the final closed interval before disabling span clocks. */
+    gxm_frame_cost_log_snapshot(now, frames, reason);
+    gxm_frame_cost_enabled = 0;
+    glog("VP_FRAME_COST_EPOCH action=stop schema=%u epoch=%u mode=0 "
+         "t_us=%llu frames=%llu reason=%s\n",
+         VP_FRAME_COST_SCHEMA, gxm_frame_cost_epoch,
+         (unsigned long long)now, (unsigned long long)frames, reason);
+}
+
+/* -1 = missing/unreadable, -2 = parse error, 0 = valid mode. */
+static int gxm_frame_cost_read_mode(unsigned *mode) {
+    char text[64];
+    size_t count;
+    int extra;
+    FILE *file = fopen(VP_FRAME_COST_MODE_PATH, "rb");
+    if (file == NULL) return -1;
+    count = fread(text, 1u, sizeof(text), file);
+    extra = fgetc(file);
+    fclose(file);
+    if (extra != EOF) return -2;
+    return vp_frame_cost_parse_mode(text, count, mode) == 0 ? 0 : -2;
+}
+
+static void gxm_frame_cost_apply(unsigned requested_mode, int control_error,
+                                 uint64_t now, uint64_t frames,
+                                 const char *source) {
+    if (control_error) {
+        gxm_frame_cost_mode = 0;
+        if (!gxm_frame_cost_failed) {
+            gxm_frame_cost_failed = 1;
+            glog("VP_FRAME_COST_CONTROL source=%s error=%s action=disable-data "
+                 "epoch=%u t_us=%llu frames=%llu\n", source,
+                 control_error == -1 ? "mode-file-missing" : "mode-invalid",
+                 gxm_frame_cost_epoch, (unsigned long long)now,
+                 (unsigned long long)frames);
+            gxm_frame_cost_stop_epoch(now, frames, "control-error");
+            gxm_frame_cost_log_point(now, frames, "control-error");
+        }
+        return;
+    }
+    /* A control error invalidates this process's closure data. Keep polling
+     * (so the condition stays observable) but never resume spans. */
+    if (gxm_frame_cost_failed) {
+        if (gxm_frame_cost_reported_failed != 1) {
+            gxm_frame_cost_reported_failed = 1;
+            gxm_frame_cost_log_point(now, frames, "control-error-sticky");
+        }
+        return;
+    }
+    if (requested_mode == (unsigned)gxm_frame_cost_mode) {
+        if (gxm_frame_cost_reported_mode != (int)requested_mode) {
+            gxm_frame_cost_reported_mode = (int)requested_mode;
+            gxm_frame_cost_log_point(now, frames,
+                                     requested_mode == 1 ? "mode-1" : "mode-0");
+        }
+        return;
+    }
+    if (gxm_frame_cost_mode == 1)
+        gxm_frame_cost_stop_epoch(now, frames, "mode-change");
+    gxm_frame_cost_mode = (int)requested_mode;
+    if (requested_mode == 1) {
+        gxm_frame_cost_start_epoch(now, frames, source);
+    } else {
+        gxm_frame_cost_log_point(now, frames, "mode-0");
+    }
+    gxm_frame_cost_reported_mode = (int)requested_mode;
+}
+
+/* Called once at the start of every complete decoder-entry boundary, while the
+ * span stack is empty. This is the only place that reads frame-cost control
+ * files or takes the boundary clock. */
+void vp_gxm_frame_cost_worker_boundary(void) {
+    FILE *marker;
+    uint64_t now;
+    unsigned requested = 0u;
+    int read_rc;
+
+    if (gxm_frame_cost_marker == 0) return;
+    if (gxm_frame_cost_profile.depth != 0u) {
+        /* Mode switches only happen with a closed span stack. This cannot be
+         * a normal decoder-entry boundary; refuse instead of splitting a
+         * cumulative epoch in the middle of a span. */
+        glog("VP_FRAME_COST_CONTROL action=defer-boundary depth=%u\n",
+             gxm_frame_cost_profile.depth);
+        return;
+    }
+    if (gxm_frame_cost_marker < 0) {
+        marker = fopen(VP_FRAME_COST_MARKER_PATH, "rb");
+        gxm_frame_cost_marker = marker != NULL;
+        if (marker != NULL) fclose(marker);
+        glog("VP_FRAME_COST_MARKER enabled=%d path=%s\n",
+             gxm_frame_cost_marker, VP_FRAME_COST_MARKER_PATH);
+        if (!gxm_frame_cost_marker) return; /* no polling, no clock */
+        FILE *resource = fopen("ux0:data/mhgu-vita-port/frame-resource-audit.enable", "rb");
+        gxm_frame_resource_audit = resource != NULL;
+        if (resource) fclose(resource);
+    }
+
+    /* The marker is present. Take the boundary clock even in mode 0 so both
+     * modes pay the same polling structure; file reads stay bounded to the
+     * 500 ms boundary cadence. */
+    now = sceKernelGetProcessTimeWide();
+    gxm_frame_cost_poll_clocks++;
+    gxm_frame_cost_boundaries++;
+    if (gxm_frame_cost_last_poll_us != 0u &&
+        now - gxm_frame_cost_last_poll_us < VP_FRAME_COST_POLL_US)
+        return;
+    gxm_frame_cost_last_poll_us = now;
+    marker = fopen(VP_FRAME_COST_MARKER_PATH, "rb");
+    if (marker == NULL) {
+        gxm_frame_cost_marker = 0;
+        gxm_frame_cost_stop_epoch(now, gxm_perf_present_frames, "marker-removed");
+        gxm_frame_cost_mode = 0;
+        gxm_frame_cost_log_point(now, gxm_perf_present_frames, "marker-removed");
+        return;
+    }
+    fclose(marker);
+    read_rc = gxm_frame_cost_read_mode(&requested);
+    gxm_frame_cost_apply(read_rc == 0 ? requested : 0u, read_rc,
+                         now, gxm_perf_present_frames,
+                         VP_FRAME_COST_MODE_PATH);
+}
+
 
 /* Draw refusal census. Every frame_draw_internal_body failure records the last
  * stage marker it passed, so a run identifies which section refused the draw
@@ -1256,6 +1787,49 @@ static struct {
     uint64_t prj_us, reserve_us, uniform_us, policy_us;
 } gxm_batch_encode_perf[2];
 
+/* Capture these existing successful-batch counters at exactly the same
+ * endpoints as the nested profile. They are a second, nested view, never
+ * additional frame costs. Failed/legacy draws remain in gxm-draw instead. */
+static void gxm_frame_cost_details(uint64_t now, uint64_t frames, unsigned seq) {
+    for (unsigned kind = 0; kind < 2u; ++kind) {
+#define FC_VALUE(field) (unsigned long long)gxm_batch_encode_perf[kind].field
+        glog("VP_FRAME_COST_GXM schema=%u seq=%u epoch=%u mode=1 t_us=%llu frames=%llu "
+             "kind=%u draws=%llu prep_us=%llu begin_us=%llu encode_us=%llu draw_us=%llu "
+             "setup_us=%llu vertex_us=%llu index_us=%llu texture_us=%llu "
+             "nested_flush_us=%llu nested_pending_us=%llu nested_notify_us=%llu "
+             "nested_finish_us=%llu validate_us=%llu pair_us=%llu feedback_us=%llu "
+             "admit_us=%llu resolve_us=%llu pair_flush_us=%llu admit_flush_us=%llu "
+             "prj_us=%llu reserve_us=%llu uniform_us=%llu policy_us=%llu\n",
+             VP_FRAME_COST_SCHEMA, seq, gxm_frame_cost_epoch, (unsigned long long)now, (unsigned long long)frames,
+             kind, FC_VALUE(draws), FC_VALUE(prep_us), FC_VALUE(begin_us), FC_VALUE(encode_us),
+             FC_VALUE(draw_us), FC_VALUE(setup_us), FC_VALUE(vertex_us), FC_VALUE(index_us),
+             FC_VALUE(texture_us), FC_VALUE(nested_flush_us), FC_VALUE(nested_pending_us),
+             FC_VALUE(nested_notify_us), FC_VALUE(nested_finish_us), FC_VALUE(validate_us),
+             FC_VALUE(pair_us), FC_VALUE(feedback_us), FC_VALUE(admit_us), FC_VALUE(resolve_us),
+             FC_VALUE(pair_flush_us), FC_VALUE(admit_flush_us), FC_VALUE(prj_us),
+             FC_VALUE(reserve_us), FC_VALUE(uniform_us), FC_VALUE(policy_us));
+#undef FC_VALUE
+    }
+    VPGuestFramePerf guest;
+    vp_guest_frame_perf(&guest);
+    glog("VP_FRAME_COST_TEXTURE schema=%u seq=%u epoch=%u mode=1 t_us=%llu frames=%llu "
+         "requests=%llu hits=%llu misses=%llu rgba8_us=%llu fp16_us=%llu blocks_us=%llu "
+         "cube_us=%llu other_us=%llu rgba8_bytes=%llu fp16_bytes=%llu blocks_bytes=%llu "
+         "cube_bytes=%llu other_bytes=%llu miss_changed=%llu miss_absent=%llu "
+         "miss_gpu_only=%llu compare_bytes=%llu compare_calls=%llu\n", VP_FRAME_COST_SCHEMA, seq, gxm_frame_cost_epoch,
+         (unsigned long long)now, (unsigned long long)frames,
+         (unsigned long long)guest.tex_requests, (unsigned long long)guest.tex_hits,
+         (unsigned long long)guest.tex_misses,
+         (unsigned long long)guest.tex_family_us[0], (unsigned long long)guest.tex_family_us[1],
+         (unsigned long long)guest.tex_family_us[2], (unsigned long long)guest.tex_family_us[3],
+         (unsigned long long)guest.tex_family_us[4], (unsigned long long)guest.tex_family_bytes[0],
+         (unsigned long long)guest.tex_family_bytes[1], (unsigned long long)guest.tex_family_bytes[2],
+         (unsigned long long)guest.tex_family_bytes[3], (unsigned long long)guest.tex_family_bytes[4],
+         (unsigned long long)guest.tex_miss_changed, (unsigned long long)guest.tex_miss_absent,
+         (unsigned long long)guest.tex_miss_gpu_only, (unsigned long long)guest.tex_compare_bytes,
+         (unsigned long long)guest.tex_compare_calls);
+}
+
 /* Scene-class completion census (B86 exploration). A scene is one EndScene;
  * the class decides which attachment family paid for its GPU completion. The
  * synchronous path measures start/notification/Finish exactly; the deferred
@@ -1334,6 +1908,7 @@ static unsigned gxm_upload_capacity = VP_UPLOAD_CACHE_BYTES;
 static int gxm_upload_capacity_state = -1;
 static unsigned gxm_upload_stamp;
 static uint64_t gxm_upload_hits, gxm_upload_copies, gxm_upload_saved_bytes;
+static uint64_t gxm_upload_fill_bytes;
 /* Owned-source association probes that resolved without a byte comparison.
  * Each lookup site is counted; these are not unique payloads and must not be
  * compared with the exact-compare hit counters. */
@@ -1517,6 +2092,8 @@ static void gxm_perf_present(uint64_t fn_us, uint64_t now) {
         interval = now - gxm_perf_present_last_at;
         gxm_perf_present_interval_sum += interval;
         gxm_perf_present_interval_count++;
+        unsigned bucket=interval/1000u<511u ? (unsigned)(interval/1000u):511u;
+        gxm_perf_frame_intervals[bucket]++;
         if (interval > gxm_perf_present_interval_max)
             gxm_perf_present_interval_max = interval;
     }
@@ -1541,6 +2118,39 @@ static void gxm_perf_present(uint64_t fn_us, uint64_t now) {
              (unsigned long long)gxm_perf_global_ok,
              (unsigned long long)gxm_perf_global_fail,
              (unsigned long long)gxm_perf_global_skip);
+    if ((gxm_perf_present_frames % 32u) == 0u) {
+        gxm_wait_profile_log(now, gxm_perf_present_frames);
+        /* Frame-cost snapshots use this exact existing reporting point. The
+         * profile must be closed here; otherwise the snapshot is refused. */
+        gxm_frame_cost_log_snapshot(now, gxm_perf_present_frames, "periodic");
+        gxm_texture_memory_log(now, gxm_perf_present_frames);
+        {
+            VPWorkLogStats svc_stats;
+            VPWorkLogStats gxm_stats;
+            vp_guest_work_log_stats(&svc_stats);
+            vp_work_log_snapshot(&gxm_work_log_stats, &gxm_stats);
+            glog("VP_WORK_LOG_STATS frames=%llu t_us=%llu reduce=%u "
+                 "gxm_emitted=%u gxm_suppressed=%u svc_emitted=%u svc_suppressed=%u\n",
+                 (unsigned long long)gxm_perf_present_frames,
+                 (unsigned long long)now,
+                 __atomic_load_n(&vp_engine_work_log_reduce_enabled, __ATOMIC_ACQUIRE),
+                 gxm_stats.emitted, gxm_stats.suppressed,
+                 svc_stats.emitted, svc_stats.suppressed);
+        }
+        glog("VP_GXM_FRAME_INTERVALS t_us=%llu count=%llu sum_us=%llu width_us=1000\n",
+            (unsigned long long)now,(unsigned long long)gxm_perf_present_interval_count,
+            (unsigned long long)gxm_perf_present_interval_sum);
+        /* Keep every line below the bounded log sink's formatting limit. */
+        for (unsigned base=0u;base<512u;base+=64u) {
+            char histogram[768];
+            unsigned used=0u;
+            for (unsigned i=0;i<64u;i++)
+                used+=(unsigned)snprintf(histogram+used,sizeof(histogram)-used,"%s%u",
+                    i?",":"",gxm_perf_frame_intervals[base+i]);
+            glog("VP_GXM_FRAME_BUCKETS t_us=%llu offset=%u hist=%s\n",
+                (unsigned long long)now,base,histogram);
+        }
+    }
     if ((gxm_perf_present_frames % 16u) == 0u) {
         /* Whole-frame budget from existing cumulative counters.
          *
@@ -2197,10 +2807,13 @@ static int depth_clear_materialize_pending(VPGxmDepthEntry *e,
 static int surface_clear_gpu(VPGxmSurface *s, uint32_t color);
 /* Defined with the display blit; draws the solid clear into an open scene. */
 static int frame_clear_in_scene(VPGxmSurface *dst);
+/* Defined next to frame_clear_in_scene; clears the pending colour tags after a
+ * successful in-scene GPU clear. */
+static void surface_clear_consumed_in_scene(VPGxmSurface *s);
 static int frame_blit_gpu(VPGxmSurface *s, void *dst, unsigned x0, unsigned y0,
                           unsigned w, unsigned h, unsigned dst_width,
                           unsigned dst_height, unsigned dst_pitch,
-                          int surface_source);
+                          int bottom_origin, int native_grid);
 
 /* B42 diagnostic: only while the B34 pass capture is due, report which clear
  * branch ran and whether the backing changed, so a dump that still shows
@@ -2227,7 +2840,7 @@ static int surface_gpu_blue_probe(const VPGxmSurface *s, unsigned *max_b) {
     if (buf == NULL) return -1;
     memset(buf, 0, 16u * 16u * 4u);
     rc = frame_blit_gpu((VPGxmSurface *)s, buf, 0u, 0u, s->width, s->height,
-                        16u, 16u, 16u, 1);
+                        16u, 16u, 16u, 1, 0);
     if (rc == 0) {
         const uint8_t *p = (const uint8_t *)buf;
         for (unsigned i = 0; i < 16u * 16u; ++i)
@@ -2321,11 +2934,25 @@ static int surface_clear(VPGxmSurface *s, uint32_t mask, uint32_t color) {    ui
 }
 
 /* Finish a deferred full-colour clear outside an open scene. The surface must
- * not be read or written by any open batch; callers flush first. */
+ * not be read or written by any open batch; callers flush first. A clear that
+ * was recorded through the mode-6 async boundary additionally proves every
+ * pending scene complete before the CPU/GPU transfer writes pixels. A failed
+ * wait returns the original error and leaves the pending colour and its tag
+ * intact; no pixel is written and no GPU reference is released. */
+/* VP_HOST_TEST_EXTRACT:clear_materialize_begin */
 static int surface_clear_materialize(VPGxmSurface *s, const char *why) {
     uint32_t color;
     int rc;
     if (s == NULL || !s->clear_pending) return 0;
+    if (s->clear_pending_async) {
+        gxm_clear_defer_materialize_calls++;
+        rc = gxm_pending_scene_complete("clear-materialize");
+        if (rc < 0) {
+            gxm_clear_defer_materialize_failures++;
+            return rc;
+        }
+        s->clear_pending_async = 0u;
+    }
     color = s->clear_pending_color;
     s->clear_pending = 0;
     gxm_clear_fusion_materialized++;
@@ -2335,6 +2962,7 @@ static int surface_clear_materialize(VPGxmSurface *s, const char *why) {
     rc = surface_clear(s, 0x3cu, color);
     return rc;
 }
+/* VP_HOST_TEST_EXTRACT:clear_materialize_end */
 
 
 static void *host_alloc(void *user, SceSize bytes) { (void)user; return malloc(bytes); }
@@ -2433,8 +3061,10 @@ static int static_index_load(const char *dir) {
     FILE *probe;
     int rc;
 
-    /* A reload can change token/variant/resident identity; no hint survives. */
+    /* A reload can change token/variant/resident identity; no hint or plan
+     * survives. The generation covers entries that are not touched again. */
     static_pair_hint_reset();
+    static_plan_invalidate();
     static_mode = 0;
     static_resources_ready = 0;
     snprintf(path, sizeof(path), "%s/shader-index.bin", dir);
@@ -2793,7 +3423,7 @@ static int init_vertex_uniforms(void *buffer, const SceGxmProgram *program) {
  * this again if it fails: a failed EndScene leaves the context in an explicit
  * failed state rather than silently resetting it. The context is explicit so
  * the local bring-up probe never ends the worker's main scene by accident. */
-static int frame_end_scene_timed(SceGxmContext *context,
+static int frame_end_scene_timed(SceGxmContext *context, const char *why,
                                  uint64_t *out_end, uint64_t *out_notify,
                                  uint64_t *out_finish) {
     SceGxmNotification notification;
@@ -2807,8 +3437,8 @@ static int frame_end_scene_timed(SceGxmContext *context,
         /* Never reset the region while a deferred scene may still be running:
          * values only grow, and a wait for a later value implies every earlier
          * scene completed. */
-        notification.value = ++gxm_notify_seq;
-        if (notification.value == 0u) notification.value = ++gxm_notify_seq;
+        gxm_notify_seq = gxm_notify_next(gxm_notify_seq);
+        notification.value = gxm_notify_seq;
     } else {
         notification.value = 1;
         *region = 0;
@@ -2823,8 +3453,15 @@ static int frame_end_scene_timed(SceGxmContext *context,
     if (out_end != NULL) *out_end = finished;
     if (rc < 0) return rc;
     started = gxm_prof_now();
-    rc = sceGxmNotificationWait(&notification);
+    {
+        uint64_t fc = vp_gxm_frame_cost_category_begin(
+            VP_FRAME_COST_WAIT_NOTIFY);
+        rc = sceGxmNotificationWait(&notification);
+        vp_gxm_frame_cost_category_end(VP_FRAME_COST_WAIT_NOTIFY, fc);
+    }
     finished = gxm_prof_now();
+    vp_gpu_wait_record(&gxm_wait_profile, why, started, finished, 1, rc,
+                       gxm_pending_scene_count, 0u, 1);
     if (started != 0u) {
         gxm_notify_wait_calls++;
         gxm_notify_wait_us += finished - started;
@@ -2834,7 +3471,12 @@ static int frame_end_scene_timed(SceGxmContext *context,
     /* sceGxmFinish returns void on this SDK; the timestamp still measures the
      * complete synchronous wait before any staging buffer may be reused. */
     started = gxm_prof_now();
-    sceGxmFinish(context);
+    {
+        uint64_t fc = vp_gxm_frame_cost_category_begin(
+            VP_FRAME_COST_WAIT_FINISH);
+        sceGxmFinish(context);
+        vp_gxm_frame_cost_category_end(VP_FRAME_COST_WAIT_FINISH, fc);
+    }
     finished = gxm_prof_now();
     if (started != 0u) {
         gxm_finish_calls++;
@@ -2846,7 +3488,7 @@ static int frame_end_scene_timed(SceGxmContext *context,
 }
 
 static int frame_end_scene(SceGxmContext *context) {
-    return frame_end_scene_timed(context, NULL, NULL, NULL);
+    return frame_end_scene_timed(context, "sync-scene", NULL, NULL, NULL);
 }
 
 
@@ -2854,6 +3496,7 @@ static int frame_end_scene(SceGxmContext *context) {
  * failure. There is no teardown/reinitialization path yet, so the flag is
  * intentionally not cleared and no resource is silently recreated. */
 static int frame_poison_context(int rc) {
+    if (vp_texture_direct_active()) vp_texture_direct_fail_submission();
     if (!gxm_scene_poisoned) {
         gxm_scene_poisoned = 1;
         glog("VP_GXM_CONTEXT poison rc=%d action=reject-draw-clear-present "
@@ -2891,6 +3534,9 @@ typedef struct {
 typedef struct {
     int parsed;
     int enabled;
+    unsigned passdump;
+    unsigned live;
+    unsigned live_inputs;
     unsigned delay_ms;
     unsigned max_dumps;
     unsigned max_presents;
@@ -2919,6 +3565,7 @@ static void b34_dump_init(void) {
     fclose(f);
     text[got] = 0;
     b34_dump.enabled = 1;
+    b34_dump.passdump = 1;
     for (char *line = text; line != NULL && *line != 0;) {
         char *end = strchr(line, '\n');
         char *value;
@@ -2971,6 +3618,8 @@ static void b34_live_poll(void) {
         b34_live_generation = sequence;
         b34_live_inputs = inputs;
         b34_dump.enabled = 1;
+        b34_dump.live = 1;
+        b34_dump.live_inputs = inputs;
         b34_dump.delay_ms = 0u;
         b34_dump.max_dumps = b34_dump.dumps + (inputs ? 8u : 0u);
         b34_dump.max_presents = b34_dump.presents + 1u;
@@ -2988,6 +3637,21 @@ static int b34_dump_due(void) {
     now = sceKernelGetProcessTimeWide();
     if (now < b34_dump.start_us) return 0;
     return (now - b34_dump.start_us) / 1000u >= (uint64_t)b34_dump.delay_ms;
+}
+
+/* Only a surface/pass readback requires the synchronous scene path. A
+ * capture-live request with inputs=0 records the present pair only; that read
+ * already happens after gxm_pending_scene_complete("present"). Returning false
+ * here therefore restores the asynchronous pipeline for present-only captures
+ * and after the requested input dumps complete. The explicit old
+ * b34-passdump.enable marker keeps its documented synchronous behaviour. */
+static int b34_dump_surface_capture_active(void) {
+    b34_dump_init();
+    b34_live_poll();
+    if (!b34_dump.enabled) return 0;
+    if (b34_dump.passdump) return 1;
+    return b34_dump.live && b34_dump.live_inputs != 0u &&
+           b34_dump.dumps < b34_dump.max_dumps;
 }
 
 static unsigned b34_dump_note_writes(uint64_t va) {
@@ -3699,12 +4363,14 @@ static void gxm_model_probe_draw(const VPGxmDrawRequest *req) {
     }
     for (unsigned i=0;i<VP_GXM_FRAGMENT_SAMPLER_LIMIT-1u;i++) if (req->extra_textures[i].texels) {
         const VPGxmExtraTexture *t=&req->extra_textures[i];
-        size_t bytes=(size_t)t->width*t->height*4u;
+        size_t bytes=vp_texture_upload_bytes(t->width,t->height,t->tex_format);
         char name[24];
         snprintf(name,sizeof(name),"fragment_tex%u",i+1u);
         gxm_model_probe_bytes(name,t->texels,bytes);
     }
 }
+
+#include "pixel_font_probe.inc"
 
 static void gxm_scene_probe_uniform(const char *stage, unsigned bank,
                                     const VPGxmUniform *b, unsigned floats) {
@@ -3820,7 +4486,32 @@ static int set_texture_extent_uniforms(void *buffer, const SceGxmProgram *progra
                                        const VPGxmDrawRequest *req, int vertex) {
     unsigned slots = vertex ? 3u : VP_GXM_FRAGMENT_SAMPLER_LIMIT;
     for (unsigned slot=0;slot<slots;slot++) {
-        char name[32];
+        char name[40];
+        unsigned format=0u,packed_value=0u;
+        const SceGxmProgramParameter *packed;
+        if (vertex && slot==0u) format=req->vertex_texture.tex_format;
+        else if (!vertex && slot==0u) format=req->tex_format;
+        else if (!vertex) format=req->extra_textures[slot-1u].tex_format;
+        if (format==VP_TEXTURE_UPLOAD_RGBA32F_RG32F) {
+            if (!vertex) {
+                glog("VP_GXM_TEXTURE_PACKED_UNSUPPORTED stage=fs slot=%u\n",slot);
+                return -1;
+            }
+            packed_value=(req->vertex_texture.sampler[0]&7u)==2u ? 2u : 1u;
+        }
+        snprintf(name,sizeof(name),"tex%u_rgba32f_packed",slot);
+        packed=sceGxmProgramFindParameterByName(program,name);
+        if (packed_value && packed==NULL) {
+            glog("VP_GXM_TEXTURE_PACKED_UNIFORM_MISSING stage=%s slot=%u "
+                 "format=0x%x detail=packed-texture-without-selector\n",
+                 vertex?"vs":"fs",slot,format);
+            return -1;
+        }
+        if (packed!=NULL) {
+            float value=(float)packed_value;
+            int rc=sceGxmSetUniformDataF(buffer,packed,0,1,&value);
+            if (rc<0) return rc;
+        }
         snprintf(name,sizeof(name),"tex%u_inv_size",slot);
         const SceGxmProgramParameter *p=sceGxmProgramFindParameterByName(program,name);
         if (!p) continue;
@@ -4171,6 +4862,7 @@ static int depth_func_to_gxm(uint32_t op, SceGxmDepthFunc *out) {
     }
 }
 
+/* VP_HOST_TEST_EXTRACT:blend_ops_begin */
 static int blend_factor_to_gxm(uint32_t factor, SceGxmBlendFactor *out) {
     switch (factor) {
     case 1u: case 0x4000u: *out = SCE_GXM_BLEND_FACTOR_ZERO; return 0;
@@ -4198,7 +4890,9 @@ static int blend_op_to_gxm(uint32_t op, SceGxmBlendFunc *out) {
     default: return -1;
     }
 }
+/* VP_HOST_TEST_EXTRACT:blend_ops_end */
 
+/* VP_HOST_TEST_EXTRACT:color_mask_begin */
 static uint8_t color_mask_to_gxm(uint32_t mask) {
     uint8_t out = 0;
     if ((mask & 0x1u) != 0u) out |= SCE_GXM_COLOR_MASK_R;
@@ -4207,7 +4901,9 @@ static uint8_t color_mask_to_gxm(uint32_t mask) {
     if ((mask & 0x1000u) != 0u) out |= SCE_GXM_COLOR_MASK_A;
     return out;
 }
+/* VP_HOST_TEST_EXTRACT:color_mask_end */
 
+/* VP_HOST_TEST_EXTRACT:blend_build_begin */
 static int build_blend_info(const VPGxmDrawRequest *req, SceGxmBlendInfo *info) {
     SceGxmBlendFunc color_func, alpha_func;
     SceGxmBlendFactor color_src, color_dst, alpha_src, alpha_dst;
@@ -4234,6 +4930,7 @@ static int build_blend_info(const VPGxmDrawRequest *req, SceGxmBlendInfo *info) 
     info->alphaDst = alpha_dst;
     return 0;
 }
+/* VP_HOST_TEST_EXTRACT:blend_build_end */
 
 /* Number of sampler parameters declared by a GXP program. NVN may leave a
  * texture bound from an earlier draw even when the current fragment program
@@ -4389,6 +5086,93 @@ static void static_log_stats(void) {
          static_resident_used,
          VP_GXM_RESIDENT_LIMIT, static_resident_bytes,
          VP_GXM_RESIDENT_BYTES, static_stats.resident_peak_bytes);
+    glog("VP_GXM_SHARED_PREP_STATS enabled=%d shader_plan_hits=%u "
+         "shader_plan_misses=%u shader_plan_builds=%u "
+         "shader_plan_invalidations=%u shader_plan_vs=%u shader_plan_fs=%u "
+         "shader_slots_vs=%u,%u,%u,%u,%u shader_slots_fs=%u,%u,%u,%u,%u "
+         "sampler_plan_hits=%u sampler_plan_misses=%u "
+         "pair_prepared_hits=%u uniform_plan_reuses=%u "
+         "blend_plan_reuses=%u generation=%u\n",
+         gxm_shared_prepare_active(), static_plan_counts.hits,
+         static_plan_counts.misses, static_plan_counts.builds,
+         static_plan_counts.invalidations, static_plan_stage_calls[0],
+         static_plan_stage_calls[1],
+         static_plan_slot_calls[0][0], static_plan_slot_calls[0][1],
+         static_plan_slot_calls[0][2], static_plan_slot_calls[0][3],
+         static_plan_slot_calls[0][4],
+         static_plan_slot_calls[1][0], static_plan_slot_calls[1][1],
+         static_plan_slot_calls[1][2], static_plan_slot_calls[1][3],
+         static_plan_slot_calls[1][4],
+         gxm_sampler_plan_hits, gxm_sampler_plan_misses,
+         static_shared_pair_hits, static_shared_uniform_reuses,
+         static_shared_blend_reuses, static_plan_generation);
+    if (gxm_direct_seen || vp_texture_direct_active()) {
+        glog("VP_GXM_TEXTURE_PIPELINE_STATS active=%d direct_binds=%llu "
+             "direct_bytes_avoided=%llu direct_retains=%llu "
+             "direct_releases=%llu direct_fail=%llu direct_quarantined=%llu "
+             "staging_memcpy_bytes=%llu copy_path_us=%llu upload_fill_bytes=%llu "
+             "deferred_scenes=%llu notif_poll_hits=%llu "
+             "notif_real_waits=%llu notify_calls=%llu combined_drains=%llu "
+             "pending_scenes=%u\n",
+             vp_texture_direct_active(),
+             (unsigned long long)gxm_direct_binds,
+             (unsigned long long)gxm_direct_bytes_avoided,
+             (unsigned long long)gxm_direct_retains,
+             (unsigned long long)gxm_direct_releases,
+             (unsigned long long)gxm_direct_bind_failures,
+             (unsigned long long)gxm_direct_quarantined,
+             (unsigned long long)gxm_tex_bytes,
+             (unsigned long long)gxm_tex_us,
+             (unsigned long long)gxm_upload_fill_bytes,
+             (unsigned long long)gxm_deferred_scenes,
+             (unsigned long long)gxm_notify_poll_hits,
+             (unsigned long long)gxm_notify_real_waits,
+             (unsigned long long)gxm_notify_wait_calls,
+             (unsigned long long)gxm_combined_drains,
+             gxm_pending_scene_count);
+        glog("VP_GXM_TEXTURE_REGION_STATS physical_bytes=%u peak_bytes=%u "
+             "kernel_allocs=%llu kernel_frees=%llu suballocs=%llu "
+             "subfrees=%llu live=%u failed=%u budget=%u memory_mode=%u "
+             "mapped_physical_bytes=%u cached_physical_bytes=%u "
+             "mapped_allocated_bytes=%u cached_allocated_bytes=%u\n",
+             (unsigned)gxm_texture_region_arena.physical_bytes,
+             (unsigned)gxm_texture_region_arena.peak_bytes,
+             (unsigned long long)gxm_texture_kernel_allocs,
+             (unsigned long long)gxm_texture_kernel_frees,
+             (unsigned long long)gxm_texture_region_arena.suballocs,
+             (unsigned long long)gxm_texture_region_arena.subfrees,
+             gxm_texture_region_arena.live, gxm_texture_region_arena.failed,
+             (unsigned)gxm_texture_region_arena.budget,
+             __atomic_load_n(&vp_engine_texture_memory_mode, __ATOMIC_ACQUIRE),
+             (unsigned)gxm_texture_region_arena
+                 .class_physical[VP_TEXTURE_REGION_CLASS_MAPPED],
+             (unsigned)gxm_texture_region_arena
+                 .class_physical[VP_TEXTURE_REGION_CLASS_CPU_CACHED],
+             (unsigned)gxm_texture_region_arena
+                 .class_allocated[VP_TEXTURE_REGION_CLASS_MAPPED],
+             (unsigned)gxm_texture_region_arena
+                 .class_allocated[VP_TEXTURE_REGION_CLASS_CPU_CACHED]);
+    }
+    if (gxm_clear_defer_seen) {
+        unsigned pending_async = 0u;
+        for (unsigned i = 0u; i < VP_GXM_SURFACE_LIMIT; ++i)
+            if (gxm_surfaces[i].used && gxm_surfaces[i].clear_pending_async)
+                pending_async++;
+        glog("VP_GXM_CLEAR_DEFER_STATS enabled=%d tries=%llu accept=%llu "
+             "fallback=%llu submit_fail=%llu scene_submits=%llu "
+             "coalesced=%llu materialize_calls=%llu materialize_fail=%llu "
+             "in_scene=%llu pending_async=%u\n",
+             gxm_clear_defer_reported == 1,
+             (unsigned long long)gxm_clear_defer_tries,
+             (unsigned long long)gxm_clear_defer_accepts,
+             (unsigned long long)gxm_clear_defer_fallbacks,
+             (unsigned long long)gxm_clear_defer_submit_failures,
+             (unsigned long long)gxm_clear_defer_scene_submits,
+             (unsigned long long)gxm_clear_defer_coalesced,
+             (unsigned long long)gxm_clear_defer_materialize_calls,
+             (unsigned long long)gxm_clear_defer_materialize_failures,
+             (unsigned long long)gxm_clear_defer_in_scene, pending_async);
+    }
     static_log_batch_hist();
     glog("VP_GXM_CLEAR_FUSION_STATS deferred=%llu combined_deferred=%llu "
          "in_scene=%llu materialized=%llu blue_first=%llu\n",
@@ -4480,7 +5264,7 @@ static void static_log_stats(void) {
          (unsigned long long)gxm_pipeline_age_us,
          (unsigned long long)gxm_pipeline_age_max);
     for (unsigned class_id = 0u; class_id < VP_SCENE_CLASS_COUNT; ++class_id)
-        glog("VP_GXM_SCENE_CLASS class=%s flushes=%llu draws=%llu "
+        glog_work("VP_GXM_SCENE_CLASS class=%s flushes=%llu draws=%llu "
              "notify_us=%llu finish_us=%llu total_us=%llu max_us=%llu\n",
              gxm_scene_class_names[class_id],
              (unsigned long long)gxm_scene_classes[class_id].flushes,
@@ -4489,12 +5273,12 @@ static void static_log_stats(void) {
              (unsigned long long)gxm_scene_classes[class_id].finish_us,
              (unsigned long long)gxm_scene_classes[class_id].total_us,
              (unsigned long long)gxm_scene_classes[class_id].total_max);
-    glog("VP_GXM_BLEND_CENSUS opaque=%llu blended=%llu\n",
+    glog_work("VP_GXM_BLEND_CENSUS opaque=%llu blended=%llu\n",
          (unsigned long long)gxm_draws_opaque,
          (unsigned long long)gxm_draws_blended);
     uint64_t encode_profile_us = sceKernelGetProcessTimeWide();
     for (unsigned kind = 0u; kind < 2u; ++kind)
-        glog("VP_GXM_BATCH_ENCODE_PERF kind=%s t_us=%llu draws=%llu prep_us=%llu "
+        glog_work("VP_GXM_BATCH_ENCODE_PERF kind=%s t_us=%llu draws=%llu prep_us=%llu "
              "begin_us=%llu encode_us=%llu draw_us=%llu setup_us=%llu "
              "vertex_us=%llu index_us=%llu texture_us=%llu nested_flush_us=%llu "
              "nested_pending_us=%llu nested_notify_us=%llu "
@@ -4528,7 +5312,7 @@ static void static_log_stats(void) {
              (unsigned long long)gxm_batch_encode_perf[kind].reserve_us,
              (unsigned long long)gxm_batch_encode_perf[kind].uniform_us,
              (unsigned long long)gxm_batch_encode_perf[kind].policy_us);
-    glog("VP_GXM_API_PERF submits=%llu notify_sum_us=%llu notify_max_us=%llu "
+    glog_work("VP_GXM_API_PERF submits=%llu notify_sum_us=%llu notify_max_us=%llu "
          "wait_sum_us=%llu wait_max_us=%llu direct_draws=%llu stream_entries=%llu\n",
          (unsigned long long)gxm_api_perf.submits,
          (unsigned long long)gxm_api_perf.notify_sum,
@@ -4537,13 +5321,13 @@ static void static_log_stats(void) {
          (unsigned long long)gxm_api_perf.wait_max,
          (unsigned long long)gxm_api_perf.direct_draws,
          (unsigned long long)gxm_api_perf.stream_entries);
-    glog("VP_GXM_XFER vertex_bytes=%llu vertex_us=%llu "
+    glog_work("VP_GXM_XFER vertex_bytes=%llu vertex_us=%llu "
          "texture_bytes=%llu texture_us=%llu\n",
          (unsigned long long)gxm_xfer_bytes, (unsigned long long)gxm_xfer_us,
          (unsigned long long)gxm_tex_bytes, (unsigned long long)gxm_tex_us);
-    glog("VP_GXM_STRIP_JOIN draws=%llu segments=%llu\n",
+    glog_work("VP_GXM_STRIP_JOIN draws=%llu segments=%llu\n",
          (unsigned long long)gxm_strip_draws, (unsigned long long)gxm_strip_segments);
-    glog("VP_GXM_INDEX_FAST no_restart=%llu remap_copy=%llu ramp_copy=%llu "
+    glog_work("VP_GXM_INDEX_FAST no_restart=%llu remap_copy=%llu ramp_copy=%llu "
          "ramp_bind=%llu desc_hits=%llu desc_misses=%llu\n",
          (unsigned long long)gxm_index_norestart,
          (unsigned long long)gxm_index_remap_copy,
@@ -4551,7 +5335,7 @@ static void static_log_stats(void) {
          (unsigned long long)gxm_index_ramp_bind,
          (unsigned long long)gxm_texture_desc_hits,
          (unsigned long long)gxm_texture_desc_misses);
-    glog("VP_GXM_UPLOAD_CACHE hits=%llu copies=%llu reused_bytes=%llu capacity=%u "
+    glog_work("VP_GXM_UPLOAD_CACHE hits=%llu copies=%llu reused_bytes=%llu capacity=%u "
          "owned_hits=%llu owned_bytes=%llu memo_hits=%llu skip_hits=%llu\n",
          (unsigned long long)gxm_upload_hits, (unsigned long long)gxm_upload_copies,
          (unsigned long long)gxm_upload_saved_bytes, gxm_upload_capacity,
@@ -4592,6 +5376,9 @@ static int static_reflection_build(const SceGxmProgram *program, unsigned stage,
         refl->tex[i] = sceGxmProgramFindParameterByName(program, name);
         snprintf(name, sizeof(name), "tex%u_inv_size", i);
         refl->tex_inv_size[i] = sceGxmProgramFindParameterByName(program, name);
+        snprintf(name, sizeof(name), "tex%u_rgba32f_packed", i);
+        refl->tex_rgba32f_packed[i] =
+            sceGxmProgramFindParameterByName(program, name);
         snprintf(name, sizeof(name), "tex%u_shadow_extent", i);
         refl->shadow_extent[i] = sceGxmProgramFindParameterByName(program, name);
         snprintf(name, sizeof(name), "tex%u_shadow_state", i);
@@ -4678,6 +5465,9 @@ static int static_resident_evict_one(void) {
         free(resident->program);
         memset(resident, 0, sizeof(*resident));
         static_resident_used--;
+        /* A previously declared sampler may become unresolved even though no
+         * memory changed; plans must not keep the old declared/reflection. */
+        static_plan_invalidate();
     }
     return 0;
 }
@@ -4796,6 +5586,9 @@ static int static_resident_ensure(uint32_t stage_index, uint16_t variant_index,
         static_stats.resident_peak_bytes = static_resident_bytes;
     static_stats.gxp_loads++;
     static_stats.registrations++;
+    /* A stage that had no resident (and therefore queried as undeclared) can
+     * now declare samplers. Bump before any later draw can consult a plan. */
+    static_plan_invalidate();
     glog("VP_GXM_STATIC_RESIDENT stage=%u variant=%u bytes=%u resident=%u/%u "
          "total_bytes=%u\n", stage_index, variant_index, resident->bytes,
          static_resident_used, VP_GXM_RESIDENT_LIMIT, static_resident_bytes);
@@ -4886,6 +5679,61 @@ int vp_gxm_shader_resource(unsigned token, unsigned gpu_stage,
     if (vp_resource_layout_texture(&static_resources, resource_stage, slot,
                                    out) < 0)
         return -6;
+    return 0;
+}
+
+/* Plan callbacks deliberately call the original query functions. A plan miss
+ * therefore has exactly the legacy return/failure semantics; each later hit
+ * copies value fields and issues no resident lookup again. The query path and
+ * resident registration are serialized by gpu_execution_gate (the decoder
+ * entry holds it around inline GXM work), so the generation comparison is a
+ * stale-result check, not a lock. */
+static int static_plan_declared(void *user, uint32_t token, unsigned gpu_stage,
+                                unsigned viewport, unsigned slot) {
+    (void)user;
+    return gpu_stage == 0u
+               ? vp_gxm_shader_has_vertex_sampler(token, viewport, slot)
+               : vp_gxm_shader_has_fragment_sampler(token, viewport, slot);
+}
+
+static int static_plan_active(void *user) {
+    (void)user;
+    return vp_gxm_static_resources_active();
+}
+
+static int static_plan_resource(void *user, uint32_t token, unsigned gpu_stage,
+                                unsigned viewport, unsigned slot,
+                                VPResourceTexture *out) {
+    (void)user;
+    return vp_gxm_shader_resource(token, gpu_stage, viewport, slot, out);
+}
+
+static const VPGxmShaderPlanOps static_plan_ops = {
+    NULL, static_plan_declared, static_plan_active, static_plan_resource
+};
+
+int vp_gxm_shader_resource_plan(unsigned token, unsigned gpu_stage,
+                                unsigned viewport_transform,
+                                VPGxmShaderResourcePlan *out) {
+    unsigned stage_index;
+    unsigned slot;
+    if (out == NULL) return -1;
+    memset(out, 0, sizeof(*out));
+    if (gpu_stage != 0u && gpu_stage != 4u) return -1;
+    /* Legacy mode keeps the original per-slot calls: reporting a synthetic
+     * plan here would silently disable the legacy hash-bundle resolution. */
+    if (!static_mode) return -3;
+    if (vp_gxm_shader_plan_cached(static_plan_cache,
+                                  VP_GXM_SHADER_PLAN_CACHE_ENTRIES,
+                                  static_plan_generation, &static_plan_ops,
+                                  token, gpu_stage, viewport_transform, out,
+                                  &static_plan_counts) < 0)
+        return -1;
+    stage_index = gpu_stage == 0u ? 0u : 1u;
+    static_plan_stage_calls[stage_index]++;
+    for (slot = 0; slot < VP_GXM_FRAGMENT_SAMPLER_LIMIT; ++slot)
+        if ((out->declared_mask & (1u << slot)) != 0u)
+            static_plan_slot_calls[stage_index][slot]++;
     return 0;
 }
 
@@ -5107,6 +5955,13 @@ static int static_build_pair(VPStaticPair *pair, const VPStaticResident *vs_res,
     pair->blend[3] = req->blend_alpha_op;
     pair->blend[4] = req->blend_alpha_src;
     pair->blend[5] = req->blend_alpha_dst;
+    /* The validated GXM result and the two ring sizes are properties of this
+     * immutable pair. A later hit may reuse them; release/rebuild clears them
+     * with the rest of the slot, so no address-based identity is involved. */
+    pair->blend_info = *blend;
+    pair->vs_default_uniform_bytes = vs_res->refl.default_uniform_bytes;
+    pair->fs_default_uniform_bytes = fs_res->refl.default_uniform_bytes;
+    pair->fs_face_state = fs_res->refl.face_state != NULL ? 1u : 0u;
     pair->last_use = ++static_clock;
     pair->used = 1;
     memset(&pair->base, 0, sizeof(pair->base));
@@ -5125,6 +5980,7 @@ static int static_build_pair(VPStaticPair *pair, const VPStaticResident *vs_res,
     return 0;
 }
 
+/* VP_HOST_TEST_EXTRACT:pair_match_begin */
 static int static_pair_inputs_match(const VPStaticPair *pair,
                                     const VPGxmDrawRequest *req,
                                     unsigned index_source) {
@@ -5138,6 +5994,7 @@ static int static_pair_inputs_match(const VPStaticPair *pair,
         pair->blend[4] == req->blend_alpha_src &&
         pair->blend[5] == req->blend_alpha_dst;
 }
+/* VP_HOST_TEST_EXTRACT:pair_match_end */
 
 static void static_release_pair(VPStaticPair *pair) {
     if (pair == NULL) return;
@@ -5159,29 +6016,35 @@ static void static_release_pair(VPStaticPair *pair) {
     memset(pair, 0, sizeof(*pair));
 }
 
-/* The hint is only a key back to a slot that was produced by the original
- * resolution path. The full input comparison is the same one the scan uses;
- * resident references held by the used slot keep its programs alive. */
+/* VP_HOST_TEST_EXTRACT:pair_probe_begin */
+/* The hints are only keys back to slots produced by the original resolution
+ * path. Every candidate runs the same full input comparison as the scan;
+ * resident references held by used slots keep their programs alive. */
 static int static_pair_hint_probe(const VPGxmDrawRequest *req,
                                   uint32_t vs_token, uint32_t fs_token,
                                   unsigned viewport, unsigned index_source,
                                   VPGxmProgramPair **out,
                                   VPStaticPair **owner) {
-    VPStaticPair *pair = static_pair_hint.pair;
+    for (unsigned i = 0; i < VP_STATIC_PAIR_HINTS; ++i) {
+        VPStaticPairHint *hint = &static_pair_hints[i];
+        VPStaticPair *pair = hint->pair;
 
-    if (pair == NULL || !pair->used) return 0;
-    if (static_pair_hint.vs_token != vs_token ||
-        static_pair_hint.fs_token != fs_token ||
-        static_pair_hint.viewport != viewport)
-        return 0;
-    if (!static_pair_inputs_match(pair, req, index_source)) return 0;
-    pair->last_use = ++static_clock;
-    static_stats.pair_hits++;
-    static_stats.pair_hint_hits++;
-    *out = &pair->base;
-    *owner = pair;
-    return 1;
+        if (pair == NULL || !pair->used) continue;
+        if (hint->vs_token != vs_token || hint->fs_token != fs_token ||
+            hint->viewport != viewport)
+            continue;
+        if (!static_pair_inputs_match(pair, req, index_source)) continue;
+        pair->last_use = ++static_clock;
+        hint->age = ++static_pair_hint_clock;
+        static_stats.pair_hits++;
+        static_stats.pair_hint_hits++;
+        *out = &pair->base;
+        *owner = pair;
+        return 1;
+    }
+    return 0;
 }
+/* VP_HOST_TEST_EXTRACT:pair_probe_end */
 
 /* Non-mutating cache probe for an already-built pair. Used while a batch is
  * open: a hit only refreshes LRU age and statistics, so no resident or pair
@@ -5210,8 +6073,10 @@ static int static_pair_cached(const VPGxmDrawRequest *req,
                  ? SCE_GXM_INDEX_SOURCE_INDEX_32BIT
                  : SCE_GXM_INDEX_SOURCE_INDEX_16BIT;
     if (static_pair_hint_probe(req, vs_token, fs_token, viewport, index_source,
-                               out, owner))
+                               out, owner)) {
+        if (gxm_shared_prepare_active()) static_shared_pair_hits++;
         return 0;
+    }
     vs_program = vp_static_program_for_token(&static_index, vs_token);
     fs_program = vp_static_program_for_token(&static_index, fs_token);
     if (vs_program == NULL || vs_program->vertex_stage == VP_STATIC_INDEX_STAGE_NONE ||
@@ -5234,7 +6099,12 @@ static int static_pair_cached(const VPGxmDrawRequest *req,
     fs_resident = static_resident_find(fs_program->fragment_stage,
                                        (uint16_t)(fs_variant - static_index.variants));
     if (vs_resident < 0 || fs_resident < 0) return 1;
-    if (build_blend_info(req, &blend) < 0) return 1;
+    /* A matching pair already ran this conversion when it was created; its
+     * stored blend_info is part of the immutable pair. Shared mode therefore
+     * skips the repeated build on a hit. A miss still reaches static_pair_get,
+     * which performs the original conversion and reports its exact failure. */
+    if (!gxm_shared_prepare_active() && build_blend_info(req, &blend) < 0)
+        return 1;
     for (i = 0; i < VP_GXM_STATIC_PAIR_LIMIT; ++i) {
         VPStaticPair *pair = &static_pairs[i];
         if (!pair->used) continue;
@@ -5243,6 +6113,7 @@ static int static_pair_cached(const VPGxmDrawRequest *req,
             static_pair_inputs_match(pair, req, index_source)) {
             pair->last_use = ++static_clock;
             static_stats.pair_hits++;
+            if (gxm_shared_prepare_active()) static_shared_pair_hits++;
             /* Established only after the original resolution matched. */
             static_pair_hint_set(pair, vs_token, fs_token, viewport);
             *out = &pair->base;
@@ -5337,6 +6208,7 @@ static int static_pair_get(const VPGxmDrawRequest *req, VPGxmProgramPair **out,
                                     pair->last_use) == VP_PAIR_CACHE_SCAN_HIT) {
             pair->last_use = ++static_clock;
             static_stats.pair_hits++;
+            if (gxm_shared_prepare_active()) static_shared_pair_hits++;
             static_pair_hint_set(pair, vs_token, fs_token, viewport);
             *out = &pair->base;
             *owner = pair;
@@ -5392,8 +6264,31 @@ static int static_set_texture_extent(void *buffer, const VPStaticReflection *ref
     unsigned slots = vertex ? 3u : VP_GXM_FRAGMENT_SAMPLER_LIMIT;
     for (slot = 0; slot < slots; ++slot) {
         const SceGxmProgramParameter *p = refl->tex_inv_size[slot];
+        const SceGxmProgramParameter *packed = refl->tex_rgba32f_packed[slot];
         unsigned width = 0u, height = 0u;
+        unsigned format = 0u, packed_value = 0u;
         float inverse[2];
+        if (vertex && slot == 0u) format = req->vertex_texture.tex_format;
+        else if (!vertex && slot == 0u) format = req->tex_format;
+        else if (!vertex) format = req->extra_textures[slot - 1u].tex_format;
+        if (format == VP_TEXTURE_UPLOAD_RGBA32F_RG32F) {
+            if (!vertex) {
+                glog("VP_GXM_STATIC_PACKED_UNSUPPORTED slot=%u\n", slot);
+                return -1;
+            }
+            packed_value = (req->vertex_texture.sampler[0]&7u)==2u ? 2u : 1u;
+        }
+        if (packed_value != 0u && packed == NULL) {
+            glog("VP_GXM_STATIC_PACKED_UNIFORM_MISSING stage=%s slot=%u "
+                 "format=0x%x detail=packed-texture-without-selector\n",
+                 vertex ? "vs" : "fs", slot, format);
+            return -1;
+        }
+        if (packed != NULL) {
+            float value = (float)packed_value;
+            if (sceGxmSetUniformDataF(buffer, packed, 0, 1, &value) < 0)
+                return -1;
+        }
         if (p == NULL) continue;
         if (vertex && slot == 0u) {
             width = req->vertex_texture.width;
@@ -5443,6 +6338,78 @@ typedef struct {
  * guest may free its pushbuffer, vertices and textures as soon as the worker
  * submission returns. Descriptors and their staging pages live until the
  * arena's completion notification. */
+/* VP_HOST_TEST_EXTRACT:direct_refs_begin */
+#define VP_GXM_DIRECT_TEXTURE_MAX (VP_GXM_FRAGMENT_SAMPLER_LIMIT + 1u)
+#define VP_GXM_DIRECT_QUARANTINE_MAX 64u
+typedef struct {
+    unsigned count;
+    VPTexturePoolToken token[VP_GXM_DIRECT_TEXTURE_MAX];
+} VPGxmDirectRefs;
+static VPTexturePoolToken gxm_direct_quarantine[VP_GXM_DIRECT_QUARANTINE_MAX];
+static unsigned gxm_direct_quarantine_count;
+static uint64_t gxm_direct_quarantined;
+static uint64_t gxm_direct_releases;
+
+static int gxm_direct_refs_add(VPGxmDirectRefs *refs, VPTexturePoolToken token) {
+    if (refs == NULL || refs->count >= VP_GXM_DIRECT_TEXTURE_MAX) return -1;
+    refs->token[refs->count++] = token;
+    return 0;
+}
+
+static unsigned gxm_direct_refs_release(VPGxmDirectRefs *refs) {
+    unsigned released;
+    if (refs == NULL) return 0u;
+    released = refs->count;
+    for (unsigned i = 0; i < refs->count; ++i) {
+        vp_texture_direct_release_gpu(refs->token[i]);
+        gxm_direct_releases++;
+    }
+    refs->count = 0u;
+    return released;
+}
+
+/* A failed EndScene/notification cannot prove the GPU stopped reading these
+ * payloads. Move the tokens out of the entry before any memset/reset so they
+ * stay retained; the process is poisoned and the pool must not reuse them. */
+static unsigned gxm_direct_refs_quarantine(VPGxmDirectRefs *refs) {
+    unsigned moved = 0u;
+    if (refs == NULL) return 0u;
+    for (unsigned i = 0; i < refs->count; ++i) {
+        gxm_direct_quarantined++;
+        if (gxm_direct_quarantine_count < VP_GXM_DIRECT_QUARANTINE_MAX)
+            gxm_direct_quarantine[gxm_direct_quarantine_count++] =
+                refs->token[i];
+        /* A dropped token still leaves the slot's gpu_refs incremented: the
+         * payload is leaked, never reused or released by mistake. */
+        moved++;
+    }
+    refs->count = 0u;
+    return moved;
+}
+
+/* Production rollback policy shared by the draw-failure paths and its host
+ * regression. A draw that never reached sceGxmDraw can always release. A draw
+ * that did reach it may release only after the scene completion was proven
+ * (EndScene + notification + Finish all succeeded). */
+typedef enum {
+    VP_GXM_DIRECT_ROLLBACK_RELEASE = 0,
+    VP_GXM_DIRECT_ROLLBACK_QUARANTINE = 1
+} VPGxmDirectRollback;
+static VPGxmDirectRollback gxm_direct_rollback_decision(
+        int draw_consumed, int scene_completion_proven) {
+    return draw_consumed && !scene_completion_proven
+               ? VP_GXM_DIRECT_ROLLBACK_QUARANTINE
+               : VP_GXM_DIRECT_ROLLBACK_RELEASE;
+}
+static void gxm_direct_rollback_refs(VPGxmDirectRefs *refs,
+                                     VPGxmDirectRollback decision) {
+    if (decision == VP_GXM_DIRECT_ROLLBACK_QUARANTINE)
+        gxm_direct_refs_quarantine(refs);
+    else
+        gxm_direct_refs_release(refs);
+}
+/* VP_HOST_TEST_EXTRACT:direct_refs_end */
+
 typedef struct {
     int used;
     VPGxmDrawRequest req;
@@ -5477,8 +6444,14 @@ typedef struct {
     SceGxmTexture extra_texture[VP_GXM_FRAGMENT_SAMPLER_LIMIT - 1u];
     SceGxmTexture extra_surface_texture[VP_GXM_FRAGMENT_SAMPLER_LIMIT - 1u];
     SceGxmTexture vertex_texture;
+    /* Decoder-owned direct bindings retained for this draw's GPU lifetime.
+     * Released only after a proven scene completion (or quarantined on an
+     * unknown failure). */
+    VPGxmDirectRefs direct;
+    unsigned direct_consumed;
 } VPGxmBatchEntry;
 
+/* VP_HOST_TEST_EXTRACT:clear_reason_enum_begin */
 enum {
     GXM_BATCH_REASON_SUBMIT = 0,
     GXM_BATCH_REASON_LIMIT,
@@ -5494,8 +6467,16 @@ enum {
     GXM_BATCH_REASON_RESOURCE,
     GXM_BATCH_REASON_FAILURE,
     GXM_BATCH_REASON_LEGACY,
+    /* Mode-6 clear defer: submit the open scene and record the clear without
+     * proving the scene complete. The recorded surface tag carries that
+     * obligation to the next materialization point. Deliberately absent from
+     * gxm_batch_reason_needs_sync. */
+    GXM_BATCH_REASON_CLEAR_DEFER,
     GXM_BATCH_REASON_COUNT
 };
+/* VP_HOST_TEST_EXTRACT:clear_reason_enum_end */
+_Static_assert(GXM_BATCH_REASON_COUNT <= VP_GXM_BATCH_REASON_LIMIT,
+               "batch reason histogram capacity");
 
 typedef struct {
     VPBatchPolicy policy;
@@ -5559,6 +6540,8 @@ static unsigned gxm_batch_arena;
 static int gxm_batch_arena_ready;
 
 static int gxm_scene_pipeline_state = -1;
+static int gxm_pipeline_capture_sync = -1;
+static unsigned gxm_pipeline_capture_logs;
 static int gxm_scene_pipeline_enabled(void) {
     if (gxm_scene_pipeline_state < 0) {
         FILE *marker = fopen("ux0:data/mhgu-vita-port/scene-pipeline.disable", "rb");
@@ -5710,11 +6693,48 @@ static void gxm_extra_consume_log(unsigned draw_index, unsigned slot,
              gxm_extra_rejects);
 }
 
+/* Native Alpha8 is a U8 linear texture with rows aligned to eight texels.
+ * The payload includes that padding and the source pointer must
+ * satisfy SCE_GXM_TEXTURE_ALIGNMENT. Every copy destination used here is at
+ * least as aligned by construction: gpu_alloc/upload pages are page-aligned
+ * and gxm_batch_entry_alloc advances in 16-byte steps, so checking the decoded
+ * payload covers both the direct binding and the bytes that are copied. Cube
+ * views and every other byte count are explicit refusals rather than a
+ * fallback to a four-byte representation. */
+static int gxm_alpha8_linear_check(unsigned format, unsigned cube,
+                                   unsigned width, unsigned height,
+                                   size_t bytes, const void *backing,
+                                   unsigned draw_index, const char *stage) {
+    static unsigned reject_logs;
+    if (!vp_texture_mask8_upload(format)) return 0;
+    if (cube || width == 0u || height == 0u || width > 4096u ||
+        height > 4096u || (size_t)width > SIZE_MAX / height ||
+        bytes != vp_texture_upload_bytes(width,height,format) || backing == NULL ||
+        (((uintptr_t)backing & (SCE_GXM_TEXTURE_ALIGNMENT - 1u)) != 0u)) {
+        if (reject_logs++ < 16u)
+            glog("VP_GXM_ALPHA8_LAYOUT_REJECT idx=%u stage=%s %ux%u bytes=%u "
+                 "backing=%p detail=cube-size-stride-or-alignment\n",
+                 draw_index, stage, width, height, (unsigned)bytes, backing);
+        return -1;
+    }
+    static unsigned bind_logs[2];
+    if (bind_logs[format==VP_TEXTURE_UPLOAD_ALPHA8]++<8u)
+        glog("VP_GXM_MASK8_BIND stage=%s format=0x%x size=%ux%u bytes=%u backing=%p\n",
+            stage,format,width,height,(unsigned)bytes,backing);
+    return 0;
+}
+
 /* Single mapping from the checked upload identity to GXM. The enum semantics
  * were confirmed in the actual VitaSDK gxm.h: SWIZZLE1_R is (R,0,0,1),
  * SWIZZLE2_GR is (R,G,0,1), and UBC4/SBC4/UBC5/SBC5 select unsigned/signed
- * block formats. Unknown bits, signedness and swizzle combinations are
- * refusals rather than channel-replication guesses. */
+ * block formats. SCE_GXM_TEXTURE_FORMAT_U8_R111 is BASE_FORMAT_U8 |
+ * SWIZZLE1_R111 = (1,1,1,R), exactly the reviewed (7,7,7,2) selector tuple
+ * already mapped to BC4 variant code 7. Unknown bits, signedness and swizzle
+ * combinations are refusals rather than channel-replication guesses. */
+/* VP_HOST_TEST_EXTRACT:frame_texture_format_begin */
+_Static_assert((SCE_GXM_TEXTURE_SWIZZLE1_R111 >> 12) ==
+               (unsigned)VP_TEXTURE_BC4_SWIZZLE_R111,
+               "U8_R111 must match the reviewed (7,7,7,2) selector mapping");
 static int frame_gxm_texture_format(unsigned upload,SceGxmTextureFormat *out) {
     static const SceGxmTextureFormat ubc4[8]={
         SCE_GXM_TEXTURE_FORMAT_UBC4_R,
@@ -5758,6 +6778,18 @@ static int frame_gxm_texture_format(unsigned upload,SceGxmTextureFormat *out) {
         *out=SCE_GXM_TEXTURE_FORMAT_F16F16F16F16_ABGR;
         return 0;
     }
+    if (upload==VP_TEXTURE_UPLOAD_RGBA32F_RG32F) {
+        *out=SCE_GXM_TEXTURE_FORMAT_F32F32_GR;
+        return 0;
+    }
+    if (upload==VP_TEXTURE_UPLOAD_ALPHA8) {
+        *out=SCE_GXM_TEXTURE_FORMAT_U8_R111;
+        return 0;
+    }
+    if (upload==VP_TEXTURE_UPLOAD_R8) {
+        *out=SCE_GXM_TEXTURE_FORMAT_U8_R;
+        return 0;
+    }
     if (upload==0x24u) { *out=SCE_GXM_TEXTURE_FORMAT_UBC1_ABGR; return 0; }
     if (upload==0x124u) { *out=SCE_GXM_TEXTURE_FORMAT_UBC1_1BGR; return 0; }
     if (upload==0x26u) { *out=SCE_GXM_TEXTURE_FORMAT_UBC3_ABGR; return 0; }
@@ -5780,6 +6812,7 @@ static int frame_gxm_texture_format(unsigned upload,SceGxmTextureFormat *out) {
     }
     return -1;
 }
+/* VP_HOST_TEST_EXTRACT:frame_texture_format_end */
 
 /* Maxwell TSC address modes 0..4 map onto GXM sampler modes. Mode 3 is
  * clamp-to-border. The VitaSDK exposes no GXM border-colour setter, so the
@@ -5808,10 +6841,43 @@ static void gxm_note_addr_border(unsigned raw_u, unsigned raw_v,
          raw_u, raw_v, tsc[4], tsc[5], tsc[6], tsc[7]);
 }
 
+/* All frame_draw_internal calls run on the single GXM worker; the precheck and
+ * the later apply therefore share this cache without another lock. The key is
+ * the full sampler word pair plus primary-vs-mip kind. */
+static const VPGxmSamplerPlan *gxm_sampler_plan_for(
+        unsigned kind, const uint32_t sampler[2]) {
+    return vp_gxm_sampler_plan_cache_get(gxm_sampler_plan_cache,
+                                         VP_GXM_SAMPLER_PLAN_CACHE_ENTRIES,
+                                         kind, sampler[0], sampler[1],
+                                         &gxm_sampler_plan_hits,
+                                         &gxm_sampler_plan_misses);
+}
+
 static int frame_apply_extra_sampler(SceGxmTexture *texture,
                                      const VPGxmExtraTexture *extra,
                                      unsigned draw_index, unsigned slot) {
     SceGxmTextureAddrMode u_mode, v_mode;
+    if (gxm_shared_prepare_active()) {
+        const VPGxmSamplerPlan *plan =
+            gxm_sampler_plan_for(VP_GXM_SAMPLER_PLAN_MIP, extra->sampler);
+        if (plan == NULL || plan->rc < 0) {
+            glog("VP_GXM_FRAME_DRAW idx=%u unsupported tex%u sampler=%08x,%08x\n",
+                draw_index, slot, extra->sampler[0], extra->sampler[1]);
+            return -2;
+        }
+        gxm_note_addr_border(plan->raw_u, plan->raw_v, extra->tsc_words,
+                             draw_index);
+        sceGxmTextureSetMinFilter(texture, plan->min_filter
+            ? SCE_GXM_TEXTURE_FILTER_LINEAR : SCE_GXM_TEXTURE_FILTER_POINT);
+        sceGxmTextureSetMagFilter(texture, plan->mag_filter
+            ? SCE_GXM_TEXTURE_FILTER_LINEAR : SCE_GXM_TEXTURE_FILTER_POINT);
+        sceGxmTextureSetMipFilter(texture, plan->mip_filter
+            ? SCE_GXM_TEXTURE_MIP_FILTER_ENABLED
+            : SCE_GXM_TEXTURE_MIP_FILTER_DISABLED);
+        sceGxmTextureSetUAddrMode(texture, (SceGxmTextureAddrMode)plan->addr_u);
+        sceGxmTextureSetVAddrMode(texture, (SceGxmTextureAddrMode)plan->addr_v);
+        return 0;
+    }
     if ((extra->sampler[1]&3u)<1u || (extra->sampler[1]&3u)>2u ||
         ((extra->sampler[1]>>4)&3u)<1u || ((extra->sampler[1]>>4)&3u)>2u ||
         gxm_texture_addr_mode(extra->sampler[0],&u_mode)<0 ||
@@ -5840,6 +6906,26 @@ static int frame_apply_extra_sampler(SceGxmTexture *texture,
 static int gxm_apply_primary_sampler(SceGxmTexture *texture,
                                      const VPGxmDrawRequest *req) {
     SceGxmTextureAddrMode u_mode, v_mode;
+    if (gxm_shared_prepare_active()) {
+        const VPGxmSamplerPlan *plan =
+            gxm_sampler_plan_for(VP_GXM_SAMPLER_PLAN_PRIMARY, req->sampler);
+        if (plan == NULL || plan->rc < 0) {
+            glog("VP_GXM_SAMPLER unsupported primary hash=0x%x raw=%08x,%08x\n",
+                 req->hash,req->sampler[0],req->sampler[1]);
+            return -2;
+        }
+        gxm_note_addr_border(plan->raw_u, plan->raw_v, req->tex_tsc,
+                             req->draw_index);
+        /* Primary deliberately does not set a mip filter; only the extra and
+         * vertex paths apply their planned mip state. */
+        sceGxmTextureSetMagFilter(texture, plan->mag_filter
+            ? SCE_GXM_TEXTURE_FILTER_LINEAR : SCE_GXM_TEXTURE_FILTER_POINT);
+        sceGxmTextureSetMinFilter(texture, plan->min_filter
+            ? SCE_GXM_TEXTURE_FILTER_LINEAR : SCE_GXM_TEXTURE_FILTER_POINT);
+        sceGxmTextureSetUAddrMode(texture, (SceGxmTextureAddrMode)plan->addr_u);
+        sceGxmTextureSetVAddrMode(texture, (SceGxmTextureAddrMode)plan->addr_v);
+        return 0;
+    }
     if ((req->sampler[1]&3u)<1u || (req->sampler[1]&3u)>2u ||
         ((req->sampler[1]>>4)&3u)<1u || ((req->sampler[1]>>4)&3u)>2u ||
         gxm_texture_addr_mode(req->sampler[0],&u_mode)<0 ||
@@ -6254,20 +7340,22 @@ static void gxm_stage_sha_hex(unsigned stage_index, char *out, size_t out_size) 
  * pinned scene target and depth entry; extra GPU producers and depth views
  * are only read, not reallocated, until the scene finishes.
  */
+/* VP_HOST_TEST_EXTRACT:clear_reason_name_begin */
 static const char *gxm_batch_reason_name(unsigned reason) {
     static const char *const names[GXM_BATCH_REASON_COUNT] = {
         "submit-end", "limit", "budget", "scope", "rt-change", "depth-change",
         "mode-change", "ineligible", "clear", "present", "readback",
-        "resource", "failure", "legacy"
+        "resource", "failure", "legacy", "clear-defer"
     };
     return reason < GXM_BATCH_REASON_COUNT ? names[reason] : "unknown";
 }
+/* VP_HOST_TEST_EXTRACT:clear_reason_name_end */
 
 /* Aggregate batch-shape evidence. The per-flush log is sampled, so these
  * counters are the authoritative histogram for the whole run. */
 static void static_log_batch_hist(void) {
     unsigned i;
-    glog("VP_GXM_STATE_CACHE sets=%llu skipped=%llu\n",
+    glog_work("VP_GXM_STATE_CACHE sets=%llu skipped=%llu\n",
          (unsigned long long)gxm_state_sets,
          (unsigned long long)gxm_state_skips);
     glog("VP_GXM_BATCH_HIST size=");
@@ -6442,6 +7530,7 @@ static int gxm_batch_enabled(void) {
     return enabled;
 }
 
+/* VP_HOST_TEST_EXTRACT:pair_uniform_begin */
 static size_t gxm_batch_align_size(size_t bytes) {
     if (bytes == 0u) return 0u;
     if (bytes > (size_t)-1 - 15u) return (size_t)-1;
@@ -6456,6 +7545,26 @@ static size_t gxm_batch_add_size(size_t total, size_t bytes) {
         return (size_t)-1;
     return total + aligned;
 }
+
+/* Uniform-ring bytes for one pair from the immutable sizes captured at pair
+ * creation. The extra fragment buffer depends on this draw's live cull/face
+ * state and still uses the same saturating addition as the original path. */
+static size_t static_pair_uniform_bytes(const VPStaticPair *pair,
+                                        const VPGxmDrawRequest *req) {
+    size_t total = 0u;
+    if (pair == NULL || req == NULL) return 0u;
+    if (pair->vs_program != NULL)
+        total = gxm_batch_add_size(total, pair->vs_default_uniform_bytes);
+    if (pair->fs_program != NULL) {
+        total = gxm_batch_add_size(total, pair->fs_default_uniform_bytes);
+        if (pair->fs_face_state != 0u && !req->cull_enable &&
+            (req->cull_face == 0x404u || req->cull_face == 0x405u ||
+             req->cull_face == 0x408u))
+            total = gxm_batch_add_size(total, pair->fs_default_uniform_bytes);
+    }
+    return total;
+}
+/* VP_HOST_TEST_EXTRACT:pair_uniform_end */
 
 static VPTextureSnapshotKey gxm_snapshot_key(uint64_t va, unsigned w,
     unsigned h, unsigned format, unsigned cube, unsigned mips) {
@@ -6564,6 +7673,9 @@ static VPGxmUpload *gxm_upload_prepare(const VPTextureSnapshotKey *key,
         return entry;
     }
     /* Only populate between scenes. An open-scene miss uses owned staging. */
+    if (!gxm_upload_memory && !vp_texture_direct_active() &&
+        !gxm_batch.scene_open)
+        gxm_upload_memory = gpu_alloc(gxm_upload_capacity, 0, NULL);
     if (!gxm_upload_memory || gxm_batch.scene_open || !source || !bytes ||
         bytes > gxm_upload_capacity) return NULL;
     unsigned pages = (bytes + VP_UPLOAD_PAGE_BYTES - 1u) / VP_UPLOAD_PAGE_BYTES;
@@ -6580,6 +7692,7 @@ static VPGxmUpload *gxm_upload_prepare(const VPTextureSnapshotKey *key,
         if (entry && run == pages) {
             void *data = gxm_upload_memory + first * VP_UPLOAD_PAGE_BYTES;
             memcpy(data, source, bytes);
+            gxm_upload_fill_bytes += bytes;
             memset(gxm_upload_pages + first, 1, pages);
             *entry = (VPGxmUpload){{*key, data, bytes, owned_source}, first,
                                   pages, ++gxm_upload_stamp, 1u, 0u};
@@ -6667,6 +7780,72 @@ static int gxm_snapshot_memo_lookup(const VPTextureSnapshotKey *key,
         }
     }
     return 0;
+}
+
+/* Deep direct-binding contract. The payload bytes produced by the decoder are
+ * exactly the bytes the copy path would memcpy into its own GXM backing, so a
+ * direct binding is only allowed when the same descriptor format and byte
+ * count validate. Primary textures are never cubes in the existing primary
+ * descriptor path. */
+static int gxm_direct_candidate(const void *texels, unsigned owned,
+                                unsigned width, unsigned height,
+                                unsigned format, unsigned cube,
+                                unsigned mip_count, int primary,
+                                SceGxmTextureFormat *fmt_out,
+                                size_t *bytes_out) {
+    SceGxmTextureFormat fmt;
+    size_t bytes;
+    if (!vp_texture_direct_active() || !owned || texels == NULL ||
+        width == 0u || height == 0u)
+        return 0;
+    if (primary && cube) return 0;
+    if (frame_gxm_texture_format(format, &fmt) < 0) return 0;
+    bytes = cube ? vp_texture_cube_upload_bytes_mips(width, height, mip_count)
+                 : vp_texture_upload_bytes(width, height, format);
+    if (bytes == 0u || !vp_texture_direct_compatible(texels, bytes)) return 0;
+    if (cube && (mip_count == 0u ||
+                 mip_count > vp_texture_cube_mip_count(width, height)))
+        return 0;
+    if (fmt_out != NULL) *fmt_out = fmt;
+    if (bytes_out != NULL) *bytes_out = bytes;
+    return 1;
+}
+
+static void *gxm_batch_texture_copy(VPGxmBatchEntry *entry,
+    const VPTextureSnapshotKey *key, const void *source, size_t bytes,
+    const void *owned_source);
+
+/* Direct sources are retained through the decoder's live-slot identity, never
+ * through an address range. A failed retain is an internal contract failure:
+ * in deep mode the draw fails explicitly instead of silently copying. */
+static void *gxm_batch_texture_bind(VPGxmBatchEntry *entry,
+    const VPTextureSnapshotKey *key, const void *source, size_t bytes,
+    const void *owned_source, int direct_eligible) {
+    if (direct_eligible) {
+        VPTexturePoolToken token;
+        if (!vp_texture_direct_active() ||
+            !vp_texture_direct_retain_gpu(source, &token)) {
+            gxm_direct_bind_failures++;
+            glog("VP_GXM_DIRECT_BIND_FAIL bytes=%u action=draw-fail\n",
+                 (unsigned)bytes);
+            vp_texture_direct_fail_submission();
+            return NULL;
+        }
+        if (gxm_direct_refs_add(&entry->direct, token) < 0) {
+            vp_texture_direct_release_gpu(token);
+            gxm_direct_bind_failures++;
+            glog("VP_GXM_DIRECT_BIND_FAIL bytes=%u reason=token-limit\n",
+                 (unsigned)bytes);
+            vp_texture_direct_fail_submission();
+            return NULL;
+        }
+        gxm_direct_binds++;
+        gxm_direct_retains++;
+        gxm_direct_bytes_avoided += bytes;
+        gxm_direct_seen = 1;
+        return (void *)source;
+    }
+    return gxm_batch_texture_copy(entry, key, source, bytes, owned_source);
 }
 
 static void *gxm_batch_texture_copy(VPGxmBatchEntry *entry,
@@ -6773,6 +7952,12 @@ static size_t gxm_batch_uniform_for(const VPGxmDrawRequest *req,
                                     const VPStaticPair *pair) {
     size_t total = 0u;
     if (pair == NULL) return 0u;
+    /* Mode 3 uses the pair's immutable sizes; this skips the repeated
+     * resident reflection reads without changing the live face condition. */
+    if (gxm_shared_prepare_active()) {
+        static_shared_uniform_reuses++;
+        return static_pair_uniform_bytes(pair, req);
+    }
     if (pair->vs_program != NULL)
         total = gxm_batch_add_size(total,
             static_residents[pair->vs_resident].refl.default_uniform_bytes);
@@ -6833,7 +8018,10 @@ static size_t gxm_batch_reserve_for(const VPGxmDrawRequest *req,
     }
     if (req->texture_source != VP_GXM_EXTRA_SOURCE_DEPTH &&
         req->texels != NULL && req->tex_width != 0u && req->tex_height != 0u &&
-        (req->texture_va == 0u || surface_find(req->texture_va) == NULL))
+        (req->texture_va == 0u || surface_find(req->texture_va) == NULL) &&
+        !gxm_direct_candidate(req->texels, req->texels_owned,
+            req->tex_width, req->tex_height, req->tex_format, 0u, 1u, 1,
+            NULL, NULL))
     {
         VPTextureSnapshotKey key = gxm_snapshot_key(req->texture_va,
             req->tex_width, req->tex_height, req->tex_format, 0u, 1u);
@@ -6848,6 +8036,10 @@ static size_t gxm_batch_reserve_for(const VPGxmDrawRequest *req,
         size_t bytes;
         if (extra->source != VP_GXM_EXTRA_SOURCE_CPU ||
             extra->texels == NULL || extra->width == 0u || extra->height == 0u)
+            continue;
+        if (gxm_direct_candidate(extra->texels, extra->texels_owned,
+                extra->width, extra->height, extra->tex_format, extra->cube,
+                extra->cube ? extra->mip_count : 1u, 0, NULL, NULL))
             continue;
         bytes = extra->cube
             ? vp_texture_cube_upload_bytes_mips(extra->width, extra->height,
@@ -6867,7 +8059,10 @@ static size_t gxm_batch_reserve_for(const VPGxmDrawRequest *req,
          * texels; a GPU-classified descriptor may still carry its CPU snapshot.
          * Reserve the same bytes the copy will consume. */
         if (extra->source != VP_GXM_EXTRA_SOURCE_DEPTH &&
-            extra->texels != NULL && extra->width != 0u && extra->height != 0u) {
+            extra->texels != NULL && extra->width != 0u && extra->height != 0u &&
+            !gxm_direct_candidate(extra->texels, extra->texels_owned,
+                extra->width, extra->height, extra->tex_format, extra->cube,
+                extra->cube ? extra->mip_count : 1u, 0, NULL, NULL)) {
             size_t bytes = extra->cube
                 ? vp_texture_cube_upload_bytes_mips(extra->width, extra->height,
                                                     extra->mip_count)
@@ -6899,8 +8094,6 @@ static int gxm_batch_ensure_staging(void) {
     }
     gxm_batch_staging_sets[gxm_batch_arena][gxm_batch.staging_page] = gxm_batch.staging;
     gxm_batch.staging_used = 0u;
-    if (gxm_upload_memory == NULL)
-        gxm_upload_memory = gpu_alloc(gxm_upload_capacity, 0, NULL);
     glog("VP_GXM_BATCH staging_ready bytes=%u draws=%u arena=%u\n",
          (unsigned)gxm_batch.staging_size, VP_BATCH_MAX_DRAWS, gxm_batch_arena);
     return 0;
@@ -6945,9 +8138,14 @@ static void *gxm_batch_entry_alloc(VPGxmBatchEntry *entry, size_t bytes,
     return entry->staging_page + at;
 }
 
-static void gxm_batch_discard_current(void) {
+/* The decision parameter comes from gxm_direct_rollback_decision: release is
+ * only legal when no draw was issued or scene completion was proven; otherwise
+ * the leases are quarantined and stay retained. */
+static void gxm_batch_discard_current_impl(VPGxmDirectRollback decision) {
     VPGxmBatchEntry *entry = gxm_batch_current_entry;
     if (entry == NULL) return;
+    if (entry->direct.count != 0u)
+        gxm_direct_rollback_refs(&entry->direct, decision);
     if (entry->staging_base <= gxm_batch.staging_used)
         gxm_batch.staging_used = entry->staging_base;
     if (entry->uniform_bytes <= gxm_batch.uniform_bytes)
@@ -6959,8 +8157,28 @@ static void gxm_batch_discard_current(void) {
     gxm_batch_current_entry = NULL;
 }
 
+static void gxm_batch_discard_current(void) {
+    gxm_batch_discard_current_impl(VP_GXM_DIRECT_ROLLBACK_RELEASE);
+}
+
+static void gxm_batch_discard_current_decision(int draw_consumed,
+                                               int scene_completion_proven) {
+    gxm_batch_discard_current_impl(
+        gxm_direct_rollback_decision(draw_consumed,
+                                     scene_completion_proven));
+}
+
 static void gxm_batch_reset_scene_state(void) {
     gxm_batch_arena_init();
+    /* A reset that still owns a current entry is a failure path (successful
+     * flushes publish and clear the pointer first). The entry may have issued
+     * part of a two-pass draw, so retain its direct leases in quarantine; a
+     * later memset or arena reuse must never silently drop them. */
+    if (gxm_batch_current_entry != NULL) {
+        if (gxm_batch_current_entry->direct.count != 0u)
+            gxm_direct_refs_quarantine(&gxm_batch_current_entry->direct);
+        gxm_batch_current_entry = NULL;
+    }
     /* The memo points into this arena's staging; no entry may survive a reset
      * even though the current call order always re-runs the reserve first. */
     gxm_snapshot_memo_count = 0u;
@@ -6991,7 +8209,6 @@ static void gxm_batch_reset_scene_state(void) {
     gxm_batch.render_height = 0u;
     gxm_batch.scope = 0u;
     gxm_batch.opened_us = 0u;
-    gxm_batch_current_entry = NULL;
 }
 
 /* Publish one encoded draw only after the scene's EndScene/notification/Finish
@@ -7086,7 +8303,7 @@ static void gxm_batch_publish_entry(VPGxmBatchEntry *entry) {
                  gxm_depth_view_consumes, gxm_depth_view_binds);
     }
     if (commit_logs < 48u || (commit_logs % 256u) == 0u)
-        glog("VP_GXM_BATCH_COMMIT idx=%u hash=0x%x depth_only=%d target=0x%llx "
+        glog_work("VP_GXM_BATCH_COMMIT idx=%u hash=0x%x depth_only=%d target=0x%llx "
              "mask=0x%x commit=0x%x n=%u\n", req->draw_index, req->hash,
              entry->depth_only ? 1 : 0,
              (unsigned long long)(entry->target != NULL ? entry->target->va : 0u),
@@ -7094,7 +8311,9 @@ static void gxm_batch_publish_entry(VPGxmBatchEntry *entry) {
     commit_logs++;
 }
 
+/* VP_HOST_TEST_EXTRACT:pending_state_begin */
 /* One notification address per arena: NotificationWait tests equality. */
+#define VP_GXM_PENDING_DIRECT_MAX (128u * VP_GXM_DIRECT_TEXTURE_MAX)
 typedef struct {
     int used;
     unsigned arena;
@@ -7104,21 +8323,40 @@ typedef struct {
     unsigned pin_count;
     unsigned cls;
     unsigned char pins[VP_UPLOAD_CACHE_SLOTS];
+    unsigned direct_count;
+    VPTexturePoolToken direct[VP_GXM_PENDING_DIRECT_MAX];
 } VPGxmPendingScene;
 static VPGxmPendingScene gxm_pending_scenes[VP_GXM_BATCH_ARENAS];
 static unsigned gxm_pending_scene_count;
+/* VP_HOST_TEST_EXTRACT:pending_state_end */
 
 static int gxm_scene_pipeline_active(void) {
+    int capture;
     if (!gxm_scene_pipeline_enabled()) return 0;
     if (gxm_batch_test_mode >= 0) return 0;
-    b34_dump_init();
-    if (b34_dump.enabled) return 0;
-    return 1;
+    /* Capture state is the only diagnostic condition that changes the scene
+     * mode. A present-only capture (inputs=0) keeps the pipeline asynchronous
+     * because its readback happens after the present drain; pass-level input
+     * dumps force the synchronous path while they are due. */
+    capture = b34_dump_surface_capture_active();
+    if (capture != gxm_pipeline_capture_sync) {
+        gxm_pipeline_capture_sync = capture;
+        if (gxm_pipeline_capture_logs++ < 16u)
+            glog("VP_GXM_PIPELINE_CAPTURE sync=%d passdump=%u "
+                 "live_inputs=%u dumps=%u/%u presents=%u/%u "
+                 "detail=surface-capture-only\n",
+                 capture, b34_dump.passdump, b34_dump.live_inputs,
+                 b34_dump.dumps, b34_dump.max_dumps, b34_dump.presents,
+                 b34_dump.max_presents);
+    }
+    return capture ? 0 : 1;
 }
 
 /* Reasons after which the caller mutates guest-visible resources or reads GPU
  * output on the CPU. Those must not return while a submitted scene is still
- * executing. */
+ * executing. CLEAR_DEFER is intentionally not listed: it only submits the
+ * open scene, and the per-surface tag keeps the completion obligation. */
+/* VP_HOST_TEST_EXTRACT:clear_reason_sync_begin */
 static int gxm_batch_reason_needs_sync(unsigned reason) {
     switch (reason) {
     case GXM_BATCH_REASON_SUBMIT:
@@ -7133,6 +8371,7 @@ static int gxm_batch_reason_needs_sync(unsigned reason) {
         return 0;
     }
 }
+/* VP_HOST_TEST_EXTRACT:clear_reason_sync_end */
 
 static void gxm_pending_scene_record(unsigned arena, uint32_t value,
                                      uint64_t submit_us, unsigned draws,
@@ -7146,6 +8385,7 @@ static void gxm_pending_scene_record(unsigned arena, uint32_t value,
     pending->submit_us = submit_us;
     pending->draws = draws;
     pending->cls = cls;
+    pending->direct_count = 0u;
     for (unsigned i = 0; i < VP_UPLOAD_CACHE_SLOTS; ++i) {
         if (!gxm_uploads[i].pinned) continue;
         gxm_uploads[i].pending++;
@@ -7154,20 +8394,45 @@ static void gxm_pending_scene_record(unsigned arena, uint32_t value,
     }
 }
 
-/* Wait only before an arena is reused or CPU-visible work requires it. */
-static int gxm_pending_scene_complete_arena(unsigned arena, const char *why) {
-    VPGxmPendingScene *pending = &gxm_pending_scenes[arena];
+/* VP_HOST_TEST_EXTRACT:pending_functions_begin */
+/* Wait for one pending scene. A failure poisons the context and returns the
+ * original error without retiring the scene or releasing its upload pins: the
+ * failed wait does not prove the GPU stopped reading them. */
+static int gxm_pending_scene_wait(VPGxmPendingScene *pending, const char *why) {
     SceGxmNotification notification;
+    volatile unsigned *address;
     uint64_t started, finished, blocked = 0u, now = 0u;
     int rc;
+    int real_wait;
 
-    if (!pending->used) return 0;
-    notification.address = sceGxmGetNotificationRegion() + 1u + arena;
+    address = sceGxmGetNotificationRegion() + 1u + pending->arena;
+    notification.address = address;
     notification.value = pending->notify_value;
     started = gxm_prof_now();
-    rc = sceGxmNotificationWait(&notification);
+    /* The SDK wait is an equality wait on this address. Once the acquire load
+     * already observes the pending value, no further SVC can block and the
+     * duplicate call is skipped. Pending scenes are retired on success and an
+     * arena is drained before reuse, so the value cannot belong to an older
+     * generation of the same arena. */
+    if (vp_texture_direct_active() &&
+        gxm_notify_observe(address) == pending->notify_value) {
+        gxm_notify_poll_hits++;
+        rc = 0;
+        real_wait = 0;
+    } else {
+        uint64_t fc = vp_gxm_frame_cost_category_begin(
+            VP_FRAME_COST_WAIT_NOTIFY);
+        gxm_notify_real_waits++;
+        rc = sceGxmNotificationWait(&notification);
+        vp_gxm_frame_cost_category_end(VP_FRAME_COST_WAIT_NOTIFY, fc);
+        real_wait = 1;
+    }
     finished = gxm_prof_now();
-    if (started != 0u) {
+    vp_gpu_wait_record(&gxm_wait_profile,
+                       gxm_wait_reclaim_active ? "texture-pool" : why,
+                       started, finished, real_wait, rc,
+                       gxm_pending_scene_count, pending->draws, 0);
+    if (started != 0u && real_wait) {
         blocked = finished - started;
         gxm_notify_wait_calls++;
         gxm_notify_wait_us += blocked;
@@ -7208,60 +8473,147 @@ static int gxm_pending_scene_complete_arena(unsigned arena, const char *why) {
                  (unsigned long long)gxm_pipeline_age_us,
                  (unsigned long long)gxm_pipeline_age_max);
     }
+    return 0;
+}
+
+static void gxm_pending_scene_retire_one(VPGxmPendingScene *pending) {
+    if (pending == NULL || !pending->used) return;
     for (unsigned i = 0; i < VP_UPLOAD_CACHE_SLOTS; ++i)
         if (pending->pins[i] && gxm_uploads[i].pending)
             gxm_uploads[i].pending--;
+    /* Direct leases belong to the GPU work proven complete by the successful
+     * notification wait that led here. A failed wait never reaches this. */
+    for (unsigned i = 0; i < pending->direct_count; ++i) {
+        vp_texture_direct_release_gpu(pending->direct[i]);
+        gxm_direct_releases++;
+    }
+    pending->direct_count = 0u;
     memset(pending, 0, sizeof(*pending));
     gxm_pending_scene_count--;
-    return 0;
 }
 
-static int gxm_pending_scene_complete(const char *why) {
-    for (unsigned arena = 0; arena < VP_GXM_BATCH_ARENAS; ++arena) {
-        int rc = gxm_pending_scene_complete_arena(arena, why);
-        if (rc < 0) return rc;
-    }
-    return 0;
-}
-
-/* Retire a pending scene whose notification value was already waited by a
- * newer synchronous EndScene. Values grow in submission order, so v >= the
- * scene's value proves it completed. */
+/* Retire every pending scene whose notification the completed value proves
+ * finished. The comparison is the same serial-number test used to choose the
+ * newest scene, so a wrapped value cannot release a newer scene early. */
 static void gxm_pending_scene_retire_upto(uint32_t value) {
     for (unsigned arena = 0; arena < VP_GXM_BATCH_ARENAS; ++arena) {
         VPGxmPendingScene *pending = &gxm_pending_scenes[arena];
-        if (!pending->used || pending->notify_value > value) continue;
-        for (unsigned i = 0; i < VP_UPLOAD_CACHE_SLOTS; ++i)
-            if (pending->pins[i] && gxm_uploads[i].pending)
-                gxm_uploads[i].pending--;
-        memset(pending, 0, sizeof(*pending));
-        gxm_pending_scene_count--;
+        if (!pending->used || !gxm_notify_reached(value, pending->notify_value))
+            continue;
+        gxm_pending_scene_retire_one(pending);
     }
 }
 
+/* Wait only before an arena is reused or CPU-visible work requires it. */
+static int gxm_pending_scene_complete_arena(unsigned arena, const char *why) {
+    VPGxmPendingScene *pending = &gxm_pending_scenes[arena];
+    int rc;
+
+    if (!pending->used) return 0;
+    rc = gxm_pending_scene_wait(pending, why);
+    if (rc < 0) return rc;
+    gxm_pending_scene_retire_one(pending);
+    return 0;
+}
+
+/* Drain every pending scene. Scenes share one context and are submitted in
+ * notification order, so waiting for the newest pending value proves every
+ * older scene completed. The per-arena wait remains for arena reuse. */
+static int gxm_pending_scene_complete(const char *why) {
+    int newest = -1;
+    int rc;
+
+    for (unsigned arena = 0; arena < VP_GXM_BATCH_ARENAS; ++arena) {
+        VPGxmPendingScene *pending = &gxm_pending_scenes[arena];
+        if (!pending->used) continue;
+        if (newest < 0 ||
+            gxm_notify_newer(pending->notify_value,
+                             gxm_pending_scenes[newest].notify_value))
+            newest = (int)arena;
+    }
+    if (newest < 0) return 0;
+    rc = gxm_pending_scene_wait(&gxm_pending_scenes[newest], why);
+    if (rc < 0) return rc;
+    gxm_pending_scene_retire_upto(gxm_pending_scenes[newest].notify_value);
+    return 0;
+}
+/* VP_HOST_TEST_EXTRACT:pending_functions_end */
+
+/* Direct-lease handoff helpers. A successful synchronous scene already waited
+ * for GPU completion; a deferred scene keeps its leases in the pending record
+ * until the notification wait proves completion. */
+static void gxm_batch_release_direct_entries(unsigned arena, unsigned draws) {
+    if (arena >= VP_GXM_BATCH_ARENAS) return;
+    if (draws > VP_BATCH_MAX_DRAWS) draws = VP_BATCH_MAX_DRAWS;
+    for (unsigned i = 0; i < draws; ++i)
+        gxm_direct_refs_release(&gxm_batch_entry_sets[arena][i].direct);
+}
+
+static void gxm_batch_quarantine_direct_entries(unsigned arena, unsigned draws) {
+    if (arena >= VP_GXM_BATCH_ARENAS) return;
+    if (draws > VP_BATCH_MAX_DRAWS) draws = VP_BATCH_MAX_DRAWS;
+    for (unsigned i = 0; i < draws; ++i)
+        gxm_direct_refs_quarantine(&gxm_batch_entry_sets[arena][i].direct);
+}
+
+/* Move every direct token out of the arena's committed entries before the
+ * arena can be reused. The pending capacity is exactly draws *
+ * VP_GXM_DIRECT_TEXTURE_MAX; an unexpected overflow quarantines the remaining
+ * tokens rather than letting a later memento drop them. */
+static int gxm_batch_move_direct_to_pending(unsigned arena, unsigned draws,
+                                            VPGxmPendingScene *pending) {
+    if (arena >= VP_GXM_BATCH_ARENAS || pending == NULL) return -1;
+    if (draws > VP_BATCH_MAX_DRAWS) draws = VP_BATCH_MAX_DRAWS;
+    for (unsigned i = 0; i < draws; ++i) {
+        VPGxmDirectRefs *refs = &gxm_batch_entry_sets[arena][i].direct;
+        for (unsigned j = 0; j < refs->count; ++j) {
+            if (pending->direct_count >= VP_GXM_PENDING_DIRECT_MAX) {
+                gxm_direct_refs_quarantine(refs);
+                glog("VP_GXM_DIRECT_PENDING_OVERFLOW arena=%u draws=%u "
+                     "action=quarantine\n", arena, draws);
+                return -1;
+            }
+            pending->direct[pending->direct_count++] = refs->token[j];
+        }
+        refs->count = 0u;
+    }
+    return 0;
+}
+
 /* Complete a scene whose draws were all encoded successfully. Called on
- * submission end and on every API/resource boundary. */
-static int gxm_batch_flush_worker(unsigned reason) {
+ * submission end and on every API/resource boundary. The outer wrapper is the
+ * single span owner; every early return in the implementation is balanced. */
+static int gxm_batch_flush_worker_impl(unsigned reason) {
     uint64_t t_start, t_end = 0u, t_notify = 0u, t_finished = 0u;
     unsigned pending, committed, i;
     int rc;
     int pipeline;
     int deferred = 0;
+    int needs_sync;
+    int combine;
     uint32_t deferred_value = 0u;
 
     if (reason >= GXM_BATCH_REASON_COUNT) reason = GXM_BATCH_REASON_RESOURCE;
     gxm_batch_arena_init();
     pipeline = gxm_scene_pipeline_active();
+    needs_sync = gxm_batch_reason_needs_sync(reason);
+    combine = vp_texture_direct_active();
     gxm_batch.reason_counts[reason]++;
     static_stats.batch_reason_hist[reason]++;
-    if (gxm_pending_scene_count && (!pipeline || gxm_batch_reason_needs_sync(reason))) {
+    /* In pipeline mode a CPU boundary submits the current scene first and then
+     * proves every earlier scene with one wait for the newest notification.
+     * An empty scene has nothing to submit, so it still drains here. */
+    if (gxm_pending_scene_count &&
+        (!pipeline || (needs_sync && (!combine || !gxm_batch.scene_open)))) {
         /* CPU-visible boundaries drain pending work before touching backing. */
-        int wait_rc = gxm_pending_scene_complete("flush");
+        int wait_rc = gxm_pending_scene_complete(gxm_batch_reason_name(reason));
         if (wait_rc < 0) {
             unsigned dropped = vp_batch_policy_abort(&gxm_batch.policy,
                                                      &gxm_batch.stats);
             static_stats.batch_failed += dropped;
             gxm_perf_global_fail += dropped;
+            gxm_batch_quarantine_direct_entries(gxm_batch_arena,
+                                                gxm_batch.count);
             glog("VP_GXM_PIPELINE_FAIL reason=%s pending_wait=%d dropped=%u\n",
                  gxm_batch_reason_name(reason), wait_rc, dropped);
             gxm_batch_reset_scene_state();
@@ -7277,6 +8629,8 @@ static int gxm_batch_flush_worker(unsigned reason) {
             gxm_scene_poisoned = 1;
             glog("VP_GXM_BATCH_STATE_FAIL reason=%s pending_without_scene=%u\n",
                  gxm_batch_reason_name(reason), dropped);
+            gxm_batch_quarantine_direct_entries(gxm_batch_arena,
+                                                gxm_batch.count);
             gxm_batch_reset_scene_state();
             return -1;
         }
@@ -7285,7 +8639,7 @@ static int gxm_batch_flush_worker(unsigned reason) {
     }
     pending = gxm_batch.policy.open ? gxm_batch.policy.draws : 0u;
     if (pending != gxm_batch.count) {
-        int cleanup = frame_end_scene_timed(gxm_context, &t_end, &t_notify,
+        int cleanup = frame_end_scene_timed(gxm_context, "failure", &t_end, &t_notify,
                                             &t_finished);
         gxm_scene_poisoned = 1;
         vp_batch_policy_abort(&gxm_batch.policy, &gxm_batch.stats);
@@ -7294,6 +8648,9 @@ static int gxm_batch_flush_worker(unsigned reason) {
         glog("VP_GXM_BATCH_STATE_FAIL reason=%s pending=%u entries=%u "
              "cleanup_rc=%d action=poison-no-publish\n",
              gxm_batch_reason_name(reason), pending, gxm_batch.count, cleanup);
+        /* cleanup may have ended the scene; without a successful completion
+         * the GPU-held leases stay quarantined. */
+        gxm_batch_quarantine_direct_entries(gxm_batch_arena, gxm_batch.count);
         gxm_batch_reset_scene_state();
         return -1;
     }
@@ -7303,8 +8660,8 @@ static int gxm_batch_flush_worker(unsigned reason) {
         SceGxmNotification notification;
         notification.address = sceGxmGetNotificationRegion() + 1u + gxm_batch_arena;
         *notification.address = 0u;
-        notification.value = ++gxm_notify_seq;
-        if (notification.value == 0u) notification.value = ++gxm_notify_seq;
+        gxm_notify_seq = gxm_notify_next(gxm_notify_seq);
+        notification.value = gxm_notify_seq;
         rc = sceGxmEndScene(gxm_context, NULL, &notification);
         t_end = gxm_prof_now();
         if (t_start != 0u) {
@@ -7318,7 +8675,8 @@ static int gxm_batch_flush_worker(unsigned reason) {
             deferred_value = notification.value;
         }
     } else {
-        rc = frame_end_scene_timed(gxm_context, &t_end, &t_notify, &t_finished);
+        rc = frame_end_scene_timed(gxm_context, gxm_batch_reason_name(reason),
+                                   &t_end, &t_notify, &t_finished);
     }
     if (rc < 0) {
         frame_poison_context(rc);
@@ -7329,10 +8687,18 @@ static int gxm_batch_flush_worker(unsigned reason) {
         glog("VP_GXM_BATCH_FLUSH_FAIL reason=%s pending=%u end_rc=%d "
              "action=poison-no-publish dropped=%u\n",
              gxm_batch_reason_name(reason), pending, rc, pending);
+        /* EndScene failed: the GPU may have consumed some of these textures.
+         * Never release the direct leases on an unproven boundary. */
+        gxm_batch_quarantine_direct_entries(gxm_batch_arena, pending);
         gxm_batch_reset_scene_state();
         return rc;
     }
     gxm_batch_perf.flushes++;
+    if (!deferred) {
+        /* frame_end_scene_timed already waited for the notification and
+         * sceGxmFinish, so every direct payload is safe to release. */
+        gxm_batch_release_direct_entries(gxm_batch_arena, pending);
+    }
     {
         uint64_t end_us = t_end - t_start, notify_us = t_notify - t_end;
         uint64_t finish_us = t_finished - t_notify;
@@ -7365,7 +8731,8 @@ static int gxm_batch_flush_worker(unsigned reason) {
         gxm_batch_publish_entry(&gxm_batch.entries[i]);
         /* Captures disable the asynchronous pipeline; their readback is
          * synchronized and represents the target after the whole scene. */
-        if (!gxm_batch.entries[i].depth_only && gxm_batch.entries[i].target != NULL)
+        if (!deferred && !gxm_batch.entries[i].depth_only &&
+            gxm_batch.entries[i].target != NULL)
             b34_dump_surface("batch-flush",
                              gxm_batch.entries[i].target,
                              &gxm_batch.entries[i].req, NULL);
@@ -7399,24 +8766,300 @@ static int gxm_batch_flush_worker(unsigned reason) {
                  gxm_batch.stats.max_bytes, gxm_batch.flush_logs);
     }
     gxm_batch.flush_logs++;
-    if (deferred)
+    if (deferred) {
         gxm_pending_scene_record(gxm_batch_arena, deferred_value, t_end,
                                  committed,
                                  gxm_scene_class_of(gxm_batch.render_width,
                                                     gxm_batch.render_height,
                                                     gxm_batch.depth_only));
+        gxm_deferred_scenes++;
+        if (gxm_batch_move_direct_to_pending(
+                gxm_batch_arena, committed,
+                &gxm_pending_scenes[gxm_batch_arena]) < 0) {
+            frame_poison_context(-1);
+            gxm_batch_reset_scene_state();
+            return -1;
+        }
+    }
     if (pipeline) {
         unsigned next = (gxm_batch_arena + 1u) % VP_GXM_BATCH_ARENAS;
-        rc = gxm_pending_scene_complete_arena(next, "arena-reuse");
-        if (rc < 0) return rc;
+        if (combine && deferred && needs_sync) {
+            /* The combined wait below covers this arena as well because GPU
+             * scenes complete in submission order. */
+            gxm_combined_drains++;
+        } else {
+            rc = gxm_pending_scene_complete_arena(next, "arena-reuse");
+            if (rc < 0) return rc;
+        }
         gxm_batch_arena_set(next);
     }
     gxm_batch_reset_scene_state();
-    if (deferred && gxm_batch_reason_needs_sync(reason)) {
-        rc = gxm_pending_scene_complete("flush-sync");
+    if (deferred && needs_sync) {
+        /* One wait for the newest notification proves every earlier scene,
+         * including the current one submitted above. */
+        rc = gxm_pending_scene_complete(gxm_batch_reason_name(reason));
         if (rc < 0) return rc;
     }
     return 0;
+}
+
+static int gxm_batch_flush_worker(unsigned reason) {
+    uint64_t fc = vp_gxm_frame_cost_category_begin(VP_FRAME_COST_GXM_FLUSH);
+    int rc = gxm_batch_flush_worker_impl(reason);
+    vp_gxm_frame_cost_category_end(VP_FRAME_COST_GXM_FLUSH, fc);
+    return rc;
+}
+
+/* ---- Deep texture-pool GPU backing and drain --------------------------- */
+
+typedef struct {
+    void *base;
+    SceUID uid;
+    int mapped;
+} VPGxmTextureRegion;
+static VPGxmTextureRegion gxm_texture_regions[VP_TEXTURE_REGION_CHUNKS];
+
+/* Class 0 is the decoded GPU payload: uncached main memory mapped for GPU
+ * read. Class 1 suballocates the existing cached C heap: the emulator's large
+ * guest arena leaves no space for new USER_RW blocks after boot. It never
+ * maps these CPU-only snapshots or binds them to a texture unit. */
+static void *gxm_texture_chunk_create(void *user, size_t bytes,
+                                      unsigned allocation_class) {
+    unsigned slot;
+    SceUID uid;
+    void *base = NULL;
+    int mapped = allocation_class == VP_TEXTURE_REGION_CLASS_MAPPED;
+    (void)user;
+    if (allocation_class >= VP_TEXTURE_REGION_CLASSES) return NULL;
+    for (slot = 0; slot < VP_TEXTURE_REGION_CHUNKS; ++slot)
+        if (!gxm_texture_regions[slot].base) break;
+    if (slot == VP_TEXTURE_REGION_CHUNKS) return NULL;
+    if (!mapped) {
+        SceKernelMemBlockInfo info;
+        int rc;
+        base = memalign(VP_TEXTURE_REGION_PAGE, bytes);
+        if (!base) {
+            glog("VP_TEX_POOL_ALLOC_FAIL bytes=%u class=%u mapped=0 "
+                 "kind=cached-heap\n", (unsigned)bytes, allocation_class);
+            return NULL;
+        }
+        memset(&info, 0, sizeof(info));
+        info.size = sizeof(info);
+        rc = sceKernelGetMemBlockInfoByAddr(base, &info);
+        if (rc < 0 || info.type != SCE_KERNEL_MEMBLOCK_TYPE_USER_RW) {
+            glog("VP_TEX_POOL_HEAP_TYPE_FAIL rc=%d type=0x%x bytes=%u\n",
+                 rc, (unsigned)info.type, (unsigned)bytes);
+            free(base);
+            return NULL;
+        }
+        glog("VP_TEX_POOL_BACKING class=1 mapped=0 kind=cached-heap "
+             "type=0x%x bytes=%u\n", (unsigned)info.type, (unsigned)bytes);
+        gxm_texture_regions[slot] = (VPGxmTextureRegion){base, -1, 0};
+        return base;
+    }
+    uid = sceKernelAllocMemBlock("vpTexPool",
+        SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, bytes, NULL);
+    if (uid < 0) {
+        glog("VP_TEX_POOL_ALLOC_FAIL bytes=%u class=%u mapped=%d rc=%d kind=chunk\n",
+             (unsigned)bytes, allocation_class, mapped, uid);
+        return NULL;
+    }
+    gxm_texture_kernel_allocs++;
+    if (sceKernelGetMemBlockBase(uid, &base) < 0 || !base ||
+        (mapped && sceGxmMapMemory(base, bytes, SCE_GXM_MEMORY_ATTRIB_READ) < 0)) {
+        if (sceKernelFreeMemBlock(uid) == 0) gxm_texture_kernel_frees++;
+        return NULL;
+    }
+    gxm_texture_regions[slot] = (VPGxmTextureRegion){base, uid, mapped};
+    return base;
+}
+
+static int gxm_texture_chunk_release(void *user, void *base) {
+    (void)user;
+    for (unsigned slot = 0; slot < VP_TEXTURE_REGION_CHUNKS; ++slot) {
+        VPGxmTextureRegion *region = &gxm_texture_regions[slot];
+        int rc;
+        if (region->base != base) continue;
+        if (region->mapped) {
+            /* No lease names this payload. Remove persistent driver bindings
+             * before unmapping, including currently inactive sampler units. */
+            for (unsigned unit = 0; unit < SCE_GXM_MAX_TEXTURE_UNITS; ++unit) {
+                rc = sceGxmSetFragmentTexture(gxm_context, unit, &gxm_texture);
+                if (rc < 0) return rc;
+                rc = sceGxmSetVertexTexture(gxm_context, unit, &gxm_texture);
+                if (rc < 0) return rc;
+            }
+            rc = sceGxmUnmapMemory(base);
+            if (rc < 0) return rc;
+        }
+        if (region->mapped) {
+            rc = sceKernelFreeMemBlock(region->uid);
+            if (rc < 0) return rc;
+            gxm_texture_kernel_frees++;
+        } else {
+            free(region->base);
+        }
+        memset(region, 0, sizeof(*region));
+        return 0;
+    }
+    return -1;
+}
+
+int vp_gxm_texture_regions_init(size_t budget_bytes) {
+    return vp_texture_regions_configure(&gxm_texture_region_arena, budget_bytes,
+        NULL, gxm_texture_chunk_create, gxm_texture_chunk_release);
+}
+
+void *vp_gxm_texture_region_create(void *user, size_t bytes,
+                                   unsigned allocation_class) {
+    (void)user;
+    return vp_texture_regions_alloc(&gxm_texture_region_arena, bytes,
+                                    allocation_class);
+}
+
+int vp_gxm_texture_region_release(void *user, void *base) {
+    (void)user;
+    return vp_texture_regions_free(&gxm_texture_region_arena, base);
+}
+
+void vp_gxm_texture_region_stats(VPGxmTextureRegionStats *out) {
+    if (out == NULL) return;
+    memset(out, 0, sizeof(*out));
+    out->budget_bytes = gxm_texture_region_arena.budget;
+    out->physical_bytes = gxm_texture_region_arena.physical_bytes;
+    out->peak_bytes = gxm_texture_region_arena.peak_bytes;
+    out->mapped_physical_bytes =
+        gxm_texture_region_arena.class_physical[VP_TEXTURE_REGION_CLASS_MAPPED];
+    out->cached_physical_bytes =
+        gxm_texture_region_arena.class_physical[VP_TEXTURE_REGION_CLASS_CPU_CACHED];
+    out->mapped_allocated_bytes =
+        gxm_texture_region_arena.class_allocated[VP_TEXTURE_REGION_CLASS_MAPPED];
+    out->cached_allocated_bytes =
+        gxm_texture_region_arena.class_allocated[VP_TEXTURE_REGION_CLASS_CPU_CACHED];
+    out->kernel_allocs = gxm_texture_kernel_allocs;
+    out->kernel_frees = gxm_texture_kernel_frees;
+    out->suballocs = gxm_texture_region_arena.suballocs;
+    out->subfrees = gxm_texture_region_arena.subfrees;
+    out->live = gxm_texture_region_arena.live;
+    out->failed = gxm_texture_region_arena.failed;
+}
+
+int vp_gxm_texture_regions_reset(void) {
+    return vp_texture_regions_reset(&gxm_texture_region_arena);
+}
+
+/* Same 32-present endpoint as the frame-cost snapshot. All byte counts are
+ * actual allocations or mapped bytes, never the configured budget presented as
+ * occupancy. Sampled only while the deep pipeline is applied; the budget field
+ * is the explicit configuration so a reader can compare it with the measured
+ * physical bytes. */
+static void gxm_texture_memory_log(uint64_t now, uint64_t frames) {
+    VPGuestTextureMemoryPerf perf;
+    VPGxmTextureRegionStats regions;
+    SceKernelFreeMemorySizeInfo memory;
+    int memory_rc;
+
+    vp_guest_texture_memory_perf(&perf);
+    if (!perf.applied) return;
+    vp_gxm_texture_region_stats(&regions);
+    memset(&memory, 0, sizeof(memory));
+    memory.size = sizeof(memory);
+    memory_rc = sceKernelGetFreeMemorySize(&memory);
+    glog("VP_TEX_MEMORY_METRICS frames=%llu t_us=%llu memory_mode=%u split=%d "
+         "budget=%u raw_class=%u raw_cached=%d raw_mapped=%d decoded_mapped=%d "
+         "raw_cached_bytes=%u raw_cached_alloc_bytes=%u "
+         "decoded_mapped_bytes=%u decoded_mapped_alloc_bytes=%u "
+         "physical_bytes=%u peak_bytes=%u region_kernel_allocs=%llu "
+         "region_kernel_frees=%llu region_live=%u region_failed=%u "
+         "pool_used_bytes=%u pool_peak_used_bytes=%u pool_live=%u "
+         "pool_peak_live=%u pool_evictions=%llu pool_alloc_map=%llu "
+         "pool_free_map=%llu pressure=%llu nomem=%llu gpu_refs=%u cpu_pins=%u "
+         "user_free_rc=%d user_free=%u cdram_free=%u\n",
+         (unsigned long long)frames, (unsigned long long)now,
+         perf.memory_mode, perf.memory_mode == 2u ? 1 : 0,
+         (unsigned)perf.budget_bytes, perf.raw_class,
+         perf.memory_mode == 2u ? 1 : 0, perf.memory_mode == 2u ? 0 : 1, 1,
+         (unsigned)regions.cached_physical_bytes,
+         (unsigned)regions.cached_allocated_bytes,
+         (unsigned)regions.mapped_physical_bytes,
+         (unsigned)regions.mapped_allocated_bytes,
+         (unsigned)regions.physical_bytes, (unsigned)regions.peak_bytes,
+         (unsigned long long)regions.kernel_allocs,
+         (unsigned long long)regions.kernel_frees, regions.live, regions.failed,
+         (unsigned)perf.used_bytes, (unsigned)perf.peak_used_bytes,
+         perf.live_slots, perf.peak_live_slots,
+         (unsigned long long)perf.evictions,
+         (unsigned long long)perf.alloc_map_calls,
+         (unsigned long long)perf.free_map_calls,
+         (unsigned long long)perf.pressure_events,
+         (unsigned long long)perf.nomem_events, perf.gpu_refs, perf.cpu_pins,
+         memory_rc, (unsigned)memory.size_user, (unsigned)memory.size_cdram);
+}
+
+int vp_gxm_texture_copy_cache_reset(void) {
+    if (!gxm_upload_memory) return 0;
+    for (unsigned i = 0; i < VP_UPLOAD_CACHE_SLOTS; ++i)
+        if (gxm_uploads[i].pending || gxm_uploads[i].pinned) return -1;
+    for (unsigned i = 0; i < block_count; ++i) {
+        if (blocks[i].ptr != gxm_upload_memory) continue;
+        for (unsigned unit = 0; unit < SCE_GXM_MAX_TEXTURE_UNITS; ++unit) {
+            int rc = sceGxmSetFragmentTexture(gxm_context, unit, &gxm_texture);
+            if (rc < 0) return rc;
+            rc = sceGxmSetVertexTexture(gxm_context, unit, &gxm_texture);
+            if (rc < 0) return rc;
+        }
+        int rc = sceGxmUnmapMemory(gxm_upload_memory);
+        if (rc < 0) return rc;
+        rc = sceKernelFreeMemBlock(blocks[i].id);
+        if (rc < 0) return rc;
+        for (unsigned j = i + 1u; j < block_count; ++j)
+            blocks[j - 1u] = blocks[j];
+        block_count--;
+        gxm_upload_memory = NULL;
+        memset(gxm_uploads, 0, sizeof(gxm_uploads));
+        memset(gxm_upload_pages, 0, sizeof(gxm_upload_pages));
+        gxm_snapshot_memo_count = 0u;
+        glog("VP_GXM_UPLOAD_CACHE_RELEASE bytes=%u reason=direct-pipeline\n",
+             gxm_upload_capacity);
+        return 0;
+    }
+    return -1;
+}
+
+void vp_gxm_texture_descriptor_cache_reset(void) {
+    memset(gxm_texture_desc_cache, 0, sizeof(gxm_texture_desc_cache));
+}
+
+static int gxm_texture_pipeline_reclaim_worker(void) {
+    int rc;
+    if (gxm_scene_poisoned) return -1;
+    /* Inline on the GXM worker: no second worker wait can deadlock here. The
+     * RESOURCE boundary submits the open scene and waits for the newest
+     * notification, which also proves every older deferred scene. */
+    gxm_wait_reclaim_active = 1u;
+    rc = gxm_batch_flush_worker(GXM_BATCH_REASON_RESOURCE);
+    gxm_wait_reclaim_active = 0u;
+    if (rc < 0) return rc;
+    rc = gxm_pending_scene_complete("texture-pool");
+    if (rc < 0) return rc;
+    return 0;
+}
+
+static void gxm_texture_pipeline_reclaim_cb(void *opaque) {
+    int *rc = (int *)opaque;
+    *rc = gxm_texture_pipeline_reclaim_worker();
+}
+
+int vp_gxm_texture_pipeline_reclaim(void) {
+    if (vp_gxm_worker_is_current())
+        return gxm_texture_pipeline_reclaim_worker();
+    {
+        int rc = 0;
+        int exec_rc = vp_gxm_worker_execute(gxm_texture_pipeline_reclaim_cb,
+                                            &rc);
+        if (exec_rc < 0) return exec_rc;
+        return rc;
+    }
 }
 
 /* A draw-local refusal happened after earlier draws were already encoded into
@@ -7430,14 +9073,20 @@ static int gxm_batch_finish_aborted_worker(const char *why, int draw_rc) {
 
     if (gxm_pending_scene_count) {
         rc = gxm_pending_scene_complete("abort");
-        if (rc < 0) return rc;
+        if (rc < 0) {
+            /* The earlier pending scene could not be proven complete; the
+             * open scene's direct leases must stay retained. */
+            gxm_batch_quarantine_direct_entries(gxm_batch_arena,
+                                                gxm_batch.count);
+            return rc;
+        }
     }
     if (!gxm_batch.scene_open) {
         gxm_batch_discard_current();
         return 0;
     }
     pending = gxm_batch.policy.open ? gxm_batch.policy.draws : 0u;
-    rc = frame_end_scene_timed(gxm_context, &t_end, &t_notify, &t_finished);
+    rc = frame_end_scene_timed(gxm_context, "abort", &t_end, &t_notify, &t_finished);
     if (rc < 0) {
         frame_poison_context(rc);
         vp_batch_policy_abort(&gxm_batch.policy, &gxm_batch.stats);
@@ -7446,9 +9095,12 @@ static int gxm_batch_finish_aborted_worker(const char *why, int draw_rc) {
         gxm_perf_global_fail += pending;
         glog("VP_GXM_BATCH_ABORT reason=%s draw_rc=%d pending=%u end_rc=%d "
              "action=poison-no-publish\n", why, draw_rc, pending, rc);
+        gxm_batch_quarantine_direct_entries(gxm_batch_arena, pending);
         gxm_batch_reset_scene_state();
         return -1;
     }
+    /* frame_end_scene_timed waited for GPU completion above. */
+    gxm_batch_release_direct_entries(gxm_batch_arena, pending);
     for (i = 0; i < gxm_batch.count; ++i)
         gxm_batch_publish_entry(&gxm_batch.entries[i]);
     committed = vp_batch_policy_commit(&gxm_batch.policy, &gxm_batch.stats);
@@ -7822,6 +9474,7 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
     /* Diagnostic cull/depth override must be known before a fully masked draw
      * is classified: with depth write forced off it is a side-effect-free
      * no-op rather than a refused depth write. */
+    pixel_font_probe_draw(req);
     if (req->hash == 0xf8u) {
         static int f8_state_override = -1;
         if (f8_state_override < 0) {
@@ -8192,7 +9845,12 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
         return gxm_extra_reject(req->draw_index, e + 1u, "feedback-alias",
                                 extra, req->target_va);
     }
-    if (build_blend_info(req, &blend) < 0) return -2;
+    if (static_mode && static_pair != NULL && gxm_shared_prepare_active()) {
+        /* Pair hits already ran and stored this conversion, and the pair's
+         * creation check covered the same six guest enums plus color mask. */
+        blend = static_pair->blend_info;
+        static_shared_blend_reuses++;
+    } else if (build_blend_info(req, &blend) < 0) return -2;
     /* Census only: Maxwell factor 1 is ZERO and 2 is ONE, so ONE/ZERO is the
      * opaque colour-blend case. */
     if (req->blend_color_src == 2u && req->blend_color_dst == 1u)
@@ -8222,14 +9880,25 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
             gxm_batch_pre_reject_why = 1u;
         }
         if (fs_refl->tex[0] != NULL) {
-            SceGxmTextureAddrMode u_mode, v_mode;
-            if ((req->sampler[1] & 3u) < 1u || (req->sampler[1] & 3u) > 2u ||
-                ((req->sampler[1] >> 4) & 3u) < 1u ||
-                ((req->sampler[1] >> 4) & 3u) > 2u ||
-                gxm_texture_addr_mode(req->sampler[0], &u_mode) < 0 ||
-                gxm_texture_addr_mode(req->sampler[0] >> 3, &v_mode) < 0) {
-                pre_reject = 1;
-                gxm_batch_pre_reject_why = 2u;
+            if (gxm_shared_prepare_active()) {
+                /* Same cached plan the apply below will use; this only decides
+                 * batch membership, it does not bind or modify any texture. */
+                const VPGxmSamplerPlan *plan = gxm_sampler_plan_for(
+                    VP_GXM_SAMPLER_PLAN_PRIMARY, req->sampler);
+                if (plan == NULL || plan->rc < 0) {
+                    pre_reject = 1;
+                    gxm_batch_pre_reject_why = 2u;
+                }
+            } else {
+                SceGxmTextureAddrMode u_mode, v_mode;
+                if ((req->sampler[1] & 3u) < 1u || (req->sampler[1] & 3u) > 2u ||
+                    ((req->sampler[1] >> 4) & 3u) < 1u ||
+                    ((req->sampler[1] >> 4) & 3u) > 2u ||
+                    gxm_texture_addr_mode(req->sampler[0], &u_mode) < 0 ||
+                    gxm_texture_addr_mode(req->sampler[0] >> 3, &v_mode) < 0) {
+                    pre_reject = 1;
+                    gxm_batch_pre_reject_why = 2u;
+                }
             }
         }
         if (pre_reject) {
@@ -8370,6 +10039,8 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
                 VPGxmBatchEntry *entry =
                     &gxm_batch.entries[gxm_batch.policy.draws];
                 size_t base = gxm_batch.staging_used;
+                if (entry->used && entry->direct.count != 0u)
+                    gxm_direct_refs_quarantine(&entry->direct);
                 memset(entry, 0, sizeof(*entry));
                 entry->used = 1;
                 entry->reserve_bytes = batch_reserve;
@@ -8888,12 +10559,22 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
             frame_release_fs(frame_fs, frame_fs_owned);
             return -2;
         }
+        if (gxm_alpha8_linear_check(req->tex_format, 0u, req->tex_width,
+                req->tex_height, texture_bytes, req->texels,
+                req->draw_index, "fragment-primary") < 0) {
+            gxm_stage9_note(VP_GXM_S9_PRIMARY_BYTES, req->draw_index);
+            frame_release_fs(frame_fs, frame_fs_owned);
+            return -2;
+        }
         if (batch_entry != NULL) {
             VPTextureSnapshotKey key = gxm_snapshot_key(req->texture_va,
                 req->tex_width, req->tex_height, req->tex_format, 0u, 1u);
-            void *tex_mem = gxm_batch_texture_copy(batch_entry, &key,
+            int direct_eligible = gxm_direct_candidate(
+                req->texels, req->texels_owned, req->tex_width,
+                req->tex_height, req->tex_format, 0u, 1u, 1, NULL, NULL);
+            void *tex_mem = gxm_batch_texture_bind(batch_entry, &key,
                 req->texels, texture_bytes,
-                req->texels_owned ? req->texels : NULL);
+                req->texels_owned ? req->texels : NULL, direct_eligible);
             if (tex_mem == NULL) {
                 frame_release_fs(frame_fs, frame_fs_owned);
                 return -1;
@@ -9180,6 +10861,14 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
             frame_release_fs(frame_fs, frame_fs_owned);
             return rc;
         }
+        if (gxm_alpha8_linear_check(extra->tex_format, extra->cube,
+                extra->width, extra->height, texture_bytes, extra->texels,
+                req->draw_index, "fragment-extra") < 0) {
+            rc=gxm_extra_reject(req->draw_index,e+1u,"alpha8-layout",extra,
+                                req->target_va);
+            frame_release_fs(frame_fs, frame_fs_owned);
+            return rc;
+        }
         {
             SceGxmTextureFormat fmt;
             if (frame_gxm_texture_format(extra->tex_format,&fmt)<0) {
@@ -9192,9 +10881,14 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
                 VPTextureSnapshotKey key = gxm_snapshot_key(extra->va,
                     extra->width, extra->height, extra->tex_format, extra->cube,
                     mip_count);
-                void *tex_mem = gxm_batch_texture_copy(batch_entry, &key,
+                int direct_eligible = gxm_direct_candidate(
+                    extra->texels, extra->texels_owned, extra->width,
+                    extra->height, extra->tex_format, extra->cube, mip_count,
+                    0, NULL, NULL);
+                void *tex_mem = gxm_batch_texture_bind(batch_entry, &key,
                     extra->texels, texture_bytes,
-                    extra->texels_owned ? extra->texels : NULL);
+                    extra->texels_owned ? extra->texels : NULL,
+                    direct_eligible);
                 SceGxmTexture *tex = &batch_entry->extra_texture[e];
                 if (tex_mem == NULL) {
                     frame_release_fs(frame_fs, frame_fs_owned);
@@ -9322,6 +11016,13 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
                 frame_release_fs(frame_fs, frame_fs_owned);
                 return -2;
             }
+            if (gxm_alpha8_linear_check(extra->tex_format, extra->cube,
+                    extra->width, extra->height, texture_bytes, extra->texels,
+                    req->draw_index, "vertex") < 0) {
+                gxm_stage9_note(VP_GXM_S9_VERTEX_TEX, req->draw_index);
+                frame_release_fs(frame_fs, frame_fs_owned);
+                return -2;
+            }
             SceGxmTextureFormat fmt;
             if (frame_gxm_texture_format(extra->tex_format,&fmt)<0) {
                 glog("VP_GXM_FRAME_DRAW idx=%u unsupported vertex tex0 format "
@@ -9336,26 +11037,35 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
                 ? &batch_entry->vertex_texture : &gxm_vertex_texture;
             int vertex_desc_hit = 0;
             const void *vertex_desc_backing = NULL;
+            /* The logical extent stays in request/uniform space; GXM sees the
+             * physical 2x width of the lossless RG32F split. */
+            unsigned desc_width = extra->tex_format==VP_TEXTURE_UPLOAD_RGBA32F_RG32F
+                ? extra->width*2u : extra->width;
             if (batch_entry != NULL) {
                 VPTextureSnapshotKey key = gxm_snapshot_key(extra->va,
                     extra->width, extra->height, extra->tex_format, extra->cube,
                     mip_count);
-                void *tex_mem = gxm_batch_texture_copy(batch_entry, &key,
+                int direct_eligible = gxm_direct_candidate(
+                    extra->texels, extra->texels_owned, extra->width,
+                    extra->height, extra->tex_format, extra->cube, mip_count,
+                    0, NULL, NULL);
+                void *tex_mem = gxm_batch_texture_bind(batch_entry, &key,
                     extra->texels, texture_bytes,
-                    extra->texels_owned ? extra->texels : NULL);
+                    extra->texels_owned ? extra->texels : NULL,
+                    direct_eligible);
                 if (tex_mem == NULL) {
                     frame_release_fs(frame_fs, frame_fs_owned);
                     return -1;
                 }
                 vertex_desc_backing = tex_mem;
-                if (!gxm_texture_desc_lookup(tex_mem, extra->width,
+                if (!gxm_texture_desc_lookup(tex_mem, desc_width,
                         extra->height, fmt, extra->cube, mip_count,
                         VP_GXM_TEXTURE_DESC_EXTRA, extra->sampler, vtex)) {
                     rc=extra->cube ?
                         sceGxmTextureInitCube(vtex,tex_mem,
                             fmt,extra->width,extra->height,mip_count) :
                         sceGxmTextureInitLinear(vtex,tex_mem,
-                            fmt,extra->width,extra->height,1);
+                            fmt,desc_width,extra->height,1);
                     if (rc<0) {
                         frame_release_fs(frame_fs, frame_fs_owned);
                         return rc;
@@ -9363,7 +11073,7 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
                 } else vertex_desc_hit = 1;
                 batch_entry->vertex_cpu_texture = 1;
             } else {
-                if (!gxm_vertex_texture_mem || gxm_vertex_texture_width!=extra->width ||
+                if (!gxm_vertex_texture_mem || gxm_vertex_texture_width!=desc_width ||
                     gxm_vertex_texture_height!=extra->height ||
                     gxm_vertex_texture_format!=extra->tex_format ||
                     gxm_vertex_texture_cube!=extra->cube ||
@@ -9382,12 +11092,12 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
                         sceGxmTextureInitCube(&gxm_vertex_texture,gxm_vertex_texture_mem,
                             fmt,extra->width,extra->height,mip_count) :
                         sceGxmTextureInitLinear(&gxm_vertex_texture,gxm_vertex_texture_mem,
-                            fmt,extra->width,extra->height,1);
+                            fmt,desc_width,extra->height,1);
                     if (rc<0) {
                         frame_release_fs(frame_fs, frame_fs_owned);
                         return rc;
                     }
-                    gxm_vertex_texture_width=extra->width;
+                    gxm_vertex_texture_width=desc_width;
                     gxm_vertex_texture_height=extra->height;
                     gxm_vertex_texture_format=extra->tex_format;
                     gxm_vertex_texture_cube=extra->cube;
@@ -9403,31 +11113,65 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
             }
             if (!vertex_desc_hit) {
                 SceGxmTextureAddrMode u_mode, v_mode;
-                if ((extra->sampler[1]&3u)<1u || (extra->sampler[1]&3u)>2u ||
-                    ((extra->sampler[1]>>4)&3u)<1u || ((extra->sampler[1]>>4)&3u)>2u ||
-                    gxm_texture_addr_mode(extra->sampler[0],&u_mode)<0 ||
-                    gxm_texture_addr_mode(extra->sampler[0]>>3,&v_mode)<0) {
-                    glog("VP_GXM_FRAME_DRAW idx=%u unsupported vertex tex0 sampler=%08x,%08x\n",
-                         req->draw_index,extra->sampler[0],extra->sampler[1]);
-                    gxm_stage9_note(VP_GXM_S9_VERTEX_TEX, req->draw_index);
-                    frame_release_fs(frame_fs, frame_fs_owned);
-                    return -2;
+                if (gxm_shared_prepare_active()) {
+                    const VPGxmSamplerPlan *plan = gxm_sampler_plan_for(
+                        VP_GXM_SAMPLER_PLAN_MIP, extra->sampler);
+                    if (plan == NULL || plan->rc < 0) {
+                        glog("VP_GXM_FRAME_DRAW idx=%u unsupported vertex tex0 "
+                             "sampler=%08x,%08x\n", req->draw_index,
+                             extra->sampler[0], extra->sampler[1]);
+                        gxm_stage9_note(VP_GXM_S9_VERTEX_TEX, req->draw_index);
+                        frame_release_fs(frame_fs, frame_fs_owned);
+                        return -2;
+                    }
+                    gxm_note_addr_border(plan->raw_u, plan->raw_v,
+                                         extra->tsc_words, req->draw_index);
+                    sceGxmTextureSetMinFilter(vtex, plan->min_filter
+                        ? SCE_GXM_TEXTURE_FILTER_LINEAR
+                        : SCE_GXM_TEXTURE_FILTER_POINT);
+                    sceGxmTextureSetMagFilter(vtex, plan->mag_filter
+                        ? SCE_GXM_TEXTURE_FILTER_LINEAR
+                        : SCE_GXM_TEXTURE_FILTER_POINT);
+                    /* The lossless RG32F vertex layout cannot carry a mip
+                     * chain; that format condition still overrides the guest
+                     * mip code exactly as in the legacy path. */
+                    sceGxmTextureSetMipFilter(vtex,
+                        extra->tex_format != VP_TEXTURE_UPLOAD_RGBA32F_RG32F &&
+                        plan->mip_filter ?
+                            SCE_GXM_TEXTURE_MIP_FILTER_ENABLED :
+                            SCE_GXM_TEXTURE_MIP_FILTER_DISABLED);
+                    sceGxmTextureSetUAddrMode(vtex,
+                        (SceGxmTextureAddrMode)plan->addr_u);
+                    sceGxmTextureSetVAddrMode(vtex,
+                        (SceGxmTextureAddrMode)plan->addr_v);
+                } else {
+                    if ((extra->sampler[1]&3u)<1u || (extra->sampler[1]&3u)>2u ||
+                        ((extra->sampler[1]>>4)&3u)<1u || ((extra->sampler[1]>>4)&3u)>2u ||
+                        gxm_texture_addr_mode(extra->sampler[0],&u_mode)<0 ||
+                        gxm_texture_addr_mode(extra->sampler[0]>>3,&v_mode)<0) {
+                        glog("VP_GXM_FRAME_DRAW idx=%u unsupported vertex tex0 sampler=%08x,%08x\n",
+                             req->draw_index,extra->sampler[0],extra->sampler[1]);
+                        gxm_stage9_note(VP_GXM_S9_VERTEX_TEX, req->draw_index);
+                        frame_release_fs(frame_fs, frame_fs_owned);
+                        return -2;
+                    }
+                    gxm_note_addr_border(extra->sampler[0]&7u, (extra->sampler[0]>>3)&7u,
+                                         extra->tsc_words, req->draw_index);
+                    sceGxmTextureSetMinFilter(vtex,
+                        ((extra->sampler[1]>>4)&3u)==2u?SCE_GXM_TEXTURE_FILTER_LINEAR:
+                                                          SCE_GXM_TEXTURE_FILTER_POINT);
+                    sceGxmTextureSetMagFilter(vtex,
+                        (extra->sampler[1]&3u)==2u?SCE_GXM_TEXTURE_FILTER_LINEAR:
+                                                    SCE_GXM_TEXTURE_FILTER_POINT);
+                    sceGxmTextureSetMipFilter(vtex,
+                        extra->tex_format!=VP_TEXTURE_UPLOAD_RGBA32F_RG32F &&
+                        ((extra->sampler[1]>>6)&3u)!=0u ? SCE_GXM_TEXTURE_MIP_FILTER_ENABLED :
+                                                           SCE_GXM_TEXTURE_MIP_FILTER_DISABLED);
+                    sceGxmTextureSetUAddrMode(vtex,u_mode);
+                    sceGxmTextureSetVAddrMode(vtex,v_mode);
                 }
-                gxm_note_addr_border(extra->sampler[0]&7u, (extra->sampler[0]>>3)&7u,
-                                     extra->tsc_words, req->draw_index);
-                sceGxmTextureSetMinFilter(vtex,
-                    ((extra->sampler[1]>>4)&3u)==2u?SCE_GXM_TEXTURE_FILTER_LINEAR:
-                                                      SCE_GXM_TEXTURE_FILTER_POINT);
-                sceGxmTextureSetMagFilter(vtex,
-                    (extra->sampler[1]&3u)==2u?SCE_GXM_TEXTURE_FILTER_LINEAR:
-                                                SCE_GXM_TEXTURE_FILTER_POINT);
-                sceGxmTextureSetMipFilter(vtex,
-                    ((extra->sampler[1]>>6)&3u)!=0u ? SCE_GXM_TEXTURE_MIP_FILTER_ENABLED :
-                                                       SCE_GXM_TEXTURE_MIP_FILTER_DISABLED);
-                sceGxmTextureSetUAddrMode(vtex,u_mode);
-                sceGxmTextureSetVAddrMode(vtex,v_mode);
                 if (batch_entry != NULL)
-                    gxm_texture_desc_store(vertex_desc_backing, extra->width,
+                    gxm_texture_desc_store(vertex_desc_backing, desc_width,
                         extra->height, fmt, extra->cube, mip_count,
                         VP_GXM_TEXTURE_DESC_EXTRA, extra->sampler, vtex);
             }
@@ -9467,10 +11211,7 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
             target->clear_pending && req->color_mask != 0u) {
             rc = frame_clear_in_scene(target);
             if (rc >= 0) {
-                target->clear_pending = 0u;
-                target->color_clear_mask |= 0x3cu;
-                target->cleared_count++;
-                gxm_clear_fusion_in_scene++;
+                surface_clear_consumed_in_scene(target);
                 if (req->color_mask == 0x100u) gxm_clear_fusion_blue++;
                 /* The clear changed programs, streams and viewport; the game
                  * draw must re-apply every cached piece of state. */
@@ -9944,6 +11685,9 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
             if (rc < 0) goto frame_fail;
             frame_set_cull(face_pass_cull[face_pass]);
         }
+        /* A restart draw can issue several commands before a later segment
+         * fails. Retain its payload until completion even on that failure. */
+        if (batch_entry != NULL) batch_entry->direct_consumed = 1u;
         if (strip_joined) {
             rc = index_count ? sceGxmDraw(gxm_context, prim, index_format, index_source, index_count) : 0;
             if (rc >= 0 && index_count) { gxm_strip_draws++; gxm_strip_segments += joined_segments; }
@@ -9973,6 +11717,9 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
                  req->draw_index, rc, face_pass);
             goto frame_fail;
         }
+        /* At least one draw command was issued into this pass. Even a later
+         * pass failure therefore makes the direct leases GPU-visible. */
+        if (batch_entry != NULL) batch_entry->direct_consumed = 1u;
     }
     gxm_draw_stage = 12u;
     t_drawn=gxm_prof_now();
@@ -10001,6 +11748,9 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
             depth_only ? 0u : 1u, req->color_mask,
             depth_binding.enabled ? 1u : 0u);
         batch_entry->t_encoded = t_drawn;
+        /* Every sceGxmDraw call above succeeded; the direct payloads are now
+         * potentially read by the GPU until the scene notification. */
+        batch_entry->direct_consumed = 1u;
         decision = vp_batch_policy_admit(
             &gxm_batch.policy, req->batch_scope, depth_only,
             req->target_va, req->target_width, req->target_height,
@@ -10021,8 +11771,10 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
                  "reserve=%u action=poison\n", req->draw_index, decision,
                  gxm_batch.policy.draws, (unsigned)batch_reserve);
             gxm_scene_poisoned = 1;
+            /* The aborted worker releases this draw's leases only when its
+             * EndScene/wait proved completion; otherwise it quarantines them
+             * through reset_scene_state. */
             (void)gxm_batch_finish_aborted_worker("push-fail", -1);
-            gxm_batch_discard_current();
             return -1;
         }
         gxm_batch.count = gxm_batch.policy.draws;
@@ -10055,7 +11807,7 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
             gxm_finish_us - nested_finish_before;
         req->batch_encoded = 1u;
         if (gxm_batch.flush_logs < 48u || (gxm_batch.policy.draws % 16u) == 0u)
-            glog("VP_GXM_BATCH_ENCODE idx=%u hash=0x%x slot=%u draws=%u "
+            glog_work("VP_GXM_BATCH_ENCODE idx=%u hash=0x%x slot=%u draws=%u "
                  "reserve=%u depth_only=%d scope=%llu\n",
                  req->draw_index, req->hash, gxm_batch.count - 1u,
                  gxm_batch.count, (unsigned)batch_reserve, depth_only,
@@ -10064,7 +11816,8 @@ static int frame_draw_internal_body(VPGxmDrawRequest *req) {    VPGxmProgramPair
     }
     {
         gxm_draw_stage = 13u;
-        rc = frame_end_scene_timed(gxm_context, &t_end, &t_notify, &t_finished);
+        rc = frame_end_scene_timed(gxm_context, "sync-scene",
+                                   &t_end, &t_notify, &t_finished);
         if (rc < 0) {
             /* The scene is no longer safely owned: never retry EndScene. */
             scene_state = 2;
@@ -10321,7 +12074,8 @@ frame_fail:
             int batch_rc = 0;
             if (gxm_batch.scene_open)
                 batch_rc = gxm_batch_finish_aborted_worker("frame-fail", draw_rc);
-            gxm_batch_discard_current();
+            /* The aborted worker owns the current entry's rollback: release
+             * after a proven completion, quarantine otherwise. */
             if (batch_rc < 0 && draw_rc >= 0) draw_rc = batch_rc;
             frame_release_fs(frame_fs, frame_fs_owned);
             return draw_rc;
@@ -10354,6 +12108,7 @@ frame_fail:
 
 static int frame_draw_internal(VPGxmDrawRequest *req) {
     int rc;
+    uint64_t fc = vp_gxm_frame_cost_category_begin(VP_FRAME_COST_GXM_DRAW);
     /* Owned-source associations persist across draws; the decoder retires them
      * at the actual rewrite/free event (vp_gxm_texture_owned_retire). */
     gxm_draw_trace(req);
@@ -10375,7 +12130,8 @@ static int frame_draw_internal(VPGxmDrawRequest *req) {
          * the preparation path. Roll back only this draw's reserved staging;
          * earlier pending draws stay in the scene and are committed later. */
         if (gxm_batch_current_entry != NULL) {
-            gxm_batch_discard_current();
+            gxm_batch_discard_current_decision(
+                gxm_batch_current_entry->direct_consumed, 0);
             req->batch_fallback = 1u;
             static_stats.batch_sync_fallbacks++;
         }
@@ -10385,16 +12141,129 @@ static int frame_draw_internal(VPGxmDrawRequest *req) {
             (void)gxm_batch_flush_worker(GXM_BATCH_REASON_FAILURE);
         }
     }
+    vp_gxm_frame_cost_category_end(VP_FRAME_COST_GXM_DRAW, fc);
     return rc;
 }
 
-static int frame_clear_internal(VPGxmClearRequest *req) {
+/* Pure mode-6 admission predicate. All inputs are explicit so the host tests
+ * exercise the same decision the worker makes. Every false return keeps the
+ * original synchronous clear path. A surface that does not already exist with
+ * the same VA, size and format, or whose colour backing is missing, is never
+ * admitted. */
+/* VP_HOST_TEST_EXTRACT:clear_defer_admit_begin */
+static int clear_defer_admit(const VPGxmClearRequest *req,
+                             unsigned surface_width, unsigned surface_height,
+                             uint32_t surface_format, int color_mem_present,
+                             int surface_pending, int defer_enabled,
+                             int worker_ready, int scene_poisoned,
+                             int test_active, int capture_active,
+                             int pipeline_active, int fusion_enabled,
+                             int dump_due) {
+    VPClearFusionPlan plan;
+    if (!defer_enabled || !worker_ready || scene_poisoned || test_active ||
+        capture_active || !pipeline_active)
+        return 0;
+    /* Full RGBA in the low six mask bits, no depth/stencil bit and no
+     * unexpected caller bits. Combined depth clears are out of scope. */
+    if ((req->mask & ~VP_CLEAR_FUSION_COLOR_MASK) != 0u) return 0;
+    if (!vp_clear_fusion_full_colour(req->mask)) return 0;
+    if (!color_mem_present) return 0;
+    if (surface_width != req->width || surface_height != req->height ||
+        surface_format != req->format)
+        return 0;
+    plan = vp_clear_fusion_plan(1, fusion_enabled, color_mem_present,
+                                surface_pending, req->mask, dump_due, 0u);
+    return plan.defer_colour;
+}
+/* VP_HOST_TEST_EXTRACT:clear_defer_admit_end */
+
+/* Shared record step for both deferred-clear paths. The latest full colour
+ * wins; `async` records whether a scene was submitted without a completion
+ * proof at this boundary. An older async tag is never dropped by a later
+ * record: only a proven materialization or an in-scene GPU clear consumes it,
+ * so a mode switch or a coalescing clear cannot weaken the drain requirement. */
+/* VP_HOST_TEST_EXTRACT:clear_defer_record_begin */
+static void surface_clear_defer_record(VPGxmSurface *s, uint32_t color,
+                                       unsigned async) {
+    s->clear_pending = 1u;
+    s->clear_pending_color = color;
+    s->clear_pending_async = s->clear_pending_async || async;
+    gxm_clear_fusion_deferred++;
+}
+/* VP_HOST_TEST_EXTRACT:clear_defer_record_end */
+
+/* Worker lookup for the fast path. The surface metadata is read before any
+ * scene is submitted; a missing/mismatched surface or any diagnostic gate
+ * keeps the original path. */
+static int clear_defer_candidate(const VPGxmClearRequest *req,
+                                 VPGxmSurface **out) {
+    VPGxmSurface *s = NULL;
+    int enabled = gxm_clear_defer_enabled();
+    *out = NULL;
+    if (!enabled) return 0;
+    gxm_clear_defer_tries++;
+    s = surface_find(req->target_va);
+    if (!clear_defer_admit(req,
+                           s != NULL ? s->width : 0u,
+                           s != NULL ? s->height : 0u,
+                           s != NULL ? s->format : 0u,
+                           s != NULL && s->color_mem != NULL,
+                           s != NULL && s->clear_pending != 0u,
+                           enabled, gxm_ready, gxm_scene_poisoned,
+                           gxm_batch_test_active(),
+                           b34_dump_surface_capture_active(),
+                           gxm_scene_pipeline_active(),
+                           gxm_clear_fusion_enabled(), b34_dump_due())) {
+        gxm_clear_defer_fallbacks++;
+        return 0;
+    }
+    *out = s;
+    return 1;
+}
+
+/* Submit the open scene through the dedicated non-synchronous boundary, then
+ * record the admitted clear. The flush may fail; the request then keeps the
+ * original error and no clear state changes. */
+/* VP_HOST_TEST_EXTRACT:clear_defer_submit_begin */
+static int clear_defer_submit_and_record(VPGxmClearRequest *req,
+                                         VPGxmSurface *s, int scene_open) {
+    int rc;
+    if (scene_open) {
+        rc = gxm_batch_flush_worker(GXM_BATCH_REASON_CLEAR_DEFER);
+        if (rc < 0) {
+            gxm_clear_defer_submit_failures++;
+            return rc;
+        }
+        gxm_clear_defer_scene_submits++;
+    }
+    if (s->clear_pending) gxm_clear_defer_coalesced++;
+    surface_clear_defer_record(s, req->color, 1u);
+    gxm_clear_defer_accepts++;
+    return 0;
+}
+/* VP_HOST_TEST_EXTRACT:clear_defer_submit_end */
+
+static int frame_clear_internal_impl(VPGxmClearRequest *req, int allow_defer) {
     static unsigned clear_disabled_logs;
     VPGxmSurface *s;
+    VPGxmSurface *defer_surface = NULL;
     int wait_rc;
 
-    /* A clear writes guest-visible memory; no deferred scene may still read or
-     * write the same attachment. */
+    /* Mode 6 keeps the whole original clear machinery but, for a strictly
+     * admitted full-colour clear of an already matching surface, submits the
+     * open scene through the non-synchronous CLEAR_DEFER boundary and records
+     * only the pending colour. Every other request keeps the synchronous
+     * flush + pending drain below. */
+    if (allow_defer && clear_defer_candidate(req, &defer_surface))
+        return clear_defer_submit_and_record(req, defer_surface,
+                                             gxm_batch.scene_open);
+    /* All surface mutation runs on this worker. Admission above found an
+     * existing, matching colour-only surface; no allocation or depth work is
+     * needed on that branch. Every other clear keeps the original boundary. */
+    if (gxm_batch.scene_open) {
+        wait_rc = gxm_batch_flush_worker(GXM_BATCH_REASON_CLEAR);
+        if (wait_rc < 0) return wait_rc;
+    }
     wait_rc = gxm_pending_scene_complete("clear");
     if (wait_rc < 0) return wait_rc;
     VPGxmDepthBinding depth_binding;
@@ -10498,9 +12367,7 @@ static int frame_clear_internal(VPGxmClearRequest *req) {
          * its first in-scene draw. Sampling, present, readback and finish
          * materialize it. A depth/stencil clear in the same request is not
          * deferred and is recorded below. */
-        s->clear_pending = 1u;
-        s->clear_pending_color = req->color;
-        gxm_clear_fusion_deferred++;
+        surface_clear_defer_record(s, req->color, 0u);
         if (clear_plan.apply_depth) gxm_clear_fusion_combined++;
         if (gxm_clear_fusion_deferred <= 16u ||
             (gxm_clear_fusion_deferred % 256u) == 0u)
@@ -10540,6 +12407,16 @@ static int frame_clear_internal(VPGxmClearRequest *req) {
                  depth_fit_width, depth_fit_height, rc);
         if (rc == 0) b34_dump_surface("clear", s, NULL, req);
     }
+    return rc;
+}
+
+/* Original clear entry. The self test and any non-worker caller never admit
+ * the mode-6 asynchronous record; only the worker dispatch below passes
+ * allow_defer. */
+static int frame_clear_internal(VPGxmClearRequest *req) {
+    uint64_t fc = vp_gxm_frame_cost_category_begin(VP_FRAME_COST_GXM_CLEAR);
+    int rc = frame_clear_internal_impl(req, 0);
+    vp_gxm_frame_cost_category_end(VP_FRAME_COST_GXM_CLEAR, fc);
     return rc;
 }
 
@@ -10678,7 +12555,8 @@ static void *gxm_blit_vertices,*gxm_blit_indices;
  * or resource is substituted. Double-buffered scanout remains GPU-owned. */
 static int frame_blit_gpu(VPGxmSurface *s,void *dst,unsigned x0,unsigned y0,
                           unsigned w,unsigned h,unsigned dst_width,
-                          unsigned dst_height,unsigned dst_pitch,int bottom_origin) {
+                          unsigned dst_height,unsigned dst_pitch,int bottom_origin,
+                          int native_grid) {
     SceGxmColorSurface color;
     SceGxmRenderTarget *target=target_for(dst_width,dst_height);
     const SceGxmProgramParameter *p;
@@ -10690,7 +12568,9 @@ static int frame_blit_gpu(VPGxmSurface *s,void *dst,unsigned x0,unsigned y0,
      * image, so the canonical mapping is unswapped; the swap is only the
      * opt-in bottom-origin display mode. Native Vita stays unverified. */
     if (bottom_origin) { float swap=v0; v0=v1; v1=swap; }
-    const float vertices[16]={0,1,u0,v0,1,1,u1,v0,0,0,u0,v1,1,0,u1,v1};
+    float top=1.0f,bottom=0.0f;
+    if (native_grid) { top=1.0f-2.0f/544.0f;bottom=2.0f/544.0f; }
+    const float vertices[16]={0,top,u0,v0,1,top,u1,v0,0,bottom,u0,v1,1,bottom,u1,v1};
     const uint16_t indices[4]={0,1,2,3};
     void *ub=NULL;
     if (gxm_scene_poisoned) return frame_context_reject("present-gpu");
@@ -10706,6 +12586,18 @@ static int frame_blit_gpu(VPGxmSurface *s,void *dst,unsigned x0,unsigned y0,
     if (rc<0) return rc;
     rc=sceGxmBeginScene(gxm_context,0,target,NULL,NULL,NULL,&color,NULL);
     if (rc<0) return rc;
+    if (native_grid) {
+        VPGxmSurface background={0};
+        background.color_mem=dst;
+        background.render_width=dst_width;background.render_height=dst_height;
+        background.clear_pending_color=0xff000000u;
+        rc=frame_clear_in_scene(&background);
+        if (rc<0) {
+            int end=frame_end_scene(gxm_context);
+            if (end<0) frame_poison_context(end);
+            return rc;
+        }
+    }
     /* Negate in float: -dst_height on an unsigned value wraps to ~2^32 and
      * turns the viewport into a 2^32-high (sub-pixel quad) region. */
     sceGxmSetViewport(gxm_context,(float)dst_width*0.5f,(float)dst_width*0.5f,
@@ -10732,13 +12624,18 @@ static int frame_blit_gpu(VPGxmSurface *s,void *dst,unsigned x0,unsigned y0,
     p=sceGxmProgramFindParameterByName(gxm_fs_program,"fs_cbuf3");
     if (rc>=0 && p) rc=sceGxmSetUniformDataF(ub,p,0,4,gain);
     p=sceGxmProgramFindParameterByName(gxm_fs_program,"tex0");
+    SceGxmTexture texture=s->texture;
+    if (native_grid) {
+        sceGxmTextureSetMinFilter(&texture,SCE_GXM_TEXTURE_FILTER_POINT);
+        sceGxmTextureSetMagFilter(&texture,SCE_GXM_TEXTURE_FILTER_POINT);
+    }
     if (rc>=0 && p) rc=sceGxmSetFragmentTexture(gxm_context,
-        sceGxmProgramParameterGetResourceIndex(p),&s->texture);
+        sceGxmProgramParameterGetResourceIndex(p),&texture);
     if (rc>=0) rc=sceGxmSetVertexStream(gxm_context,0,gxm_blit_vertices);
     if (rc>=0) rc=sceGxmDraw(gxm_context,SCE_GXM_PRIMITIVE_TRIANGLE_STRIP,
         SCE_GXM_INDEX_FORMAT_U16,gxm_blit_indices,4);
     {
-        int end = frame_end_scene(gxm_context);
+        int end = frame_end_scene_timed(gxm_context, "sync-blit", NULL, NULL, NULL);
         if (end < 0) {
             frame_poison_context(end);
             glog("VP_GXM_PRESENT scene_unwind rc=%d draw_rc=%d context_failed=1\n",
@@ -10762,7 +12659,7 @@ static int surface_clear_gpu(VPGxmSurface *s, uint32_t color) {
             SCE_GXM_TEXTURE_FORMAT_A8B8G8R8, 8u, 8u, 1u);
     if (rc < 0) return rc;
     return frame_blit_gpu(&source, s->color_mem, 0u, 0u, 8u, 8u,
-                          s->render_width, s->render_height, s->render_width, 0);
+                        s->render_width, s->render_height, s->render_width, 0, 0);
 }
 
 /* Encode the deferred solid clear into the scene the caller already opened for
@@ -10777,6 +12674,21 @@ static int surface_clear_gpu(VPGxmSurface *s, uint32_t color) {
 static void *gxm_clear_pixels[VP_GXM_BATCH_ARENAS];
 static void *gxm_clear_vertices[VP_GXM_BATCH_ARENAS];
 static void *gxm_clear_indices[VP_GXM_BATCH_ARENAS];
+
+/* The in-scene GPU clear is encoded after every earlier submitted scene of
+ * this context, so it consumes both the pending colour and its async tag
+ * without a CPU wait. The metadata update is shared by all in-scene consumers
+ * so the tag can never be cleared in one place but missed in another. */
+/* VP_HOST_TEST_EXTRACT:clear_in_scene_consume_begin */
+static void surface_clear_consumed_in_scene(VPGxmSurface *s) {
+    if (s->clear_pending_async) gxm_clear_defer_in_scene++;
+    s->clear_pending = 0u;
+    s->clear_pending_async = 0u;
+    s->color_clear_mask |= VP_CLEAR_FUSION_COLOR_MASK;
+    s->cleared_count++;
+    gxm_clear_fusion_in_scene++;
+}
+/* VP_HOST_TEST_EXTRACT:clear_in_scene_consume_end */
 
 static int frame_clear_in_scene(VPGxmSurface *dst) {
     VPGxmSurface source;
@@ -10910,10 +12822,20 @@ static int frame_present_internal(uint64_t va) {
         if (f) fclose(f);
         glog("VP_GPU_PRESENT_ORIGIN bottom=%d\n",gxm_gpu_present_bottom_origin);
     }
+    if (vp_guest_pixel_font_native_enabled() && !gxm_gpu_present) {
+        glog("NATIVE_FONT_REJECT reason=requires-gpu-present\n");
+        return -4;
+    }
     if (gxm_gpu_present) {
+        int native_grid=vp_guest_pixel_font_native_enabled();
+        if (native_grid && (gxm_render_resolution_height!=540u || gxm_gpu_present_bottom_origin)) return -4;
         rc=frame_blit_gpu(s,dst,x0,y0,w,h,VP_GXM_WIDTH,VP_GXM_HEIGHT,VP_GXM_PITCH,
-                          gxm_gpu_present_bottom_origin);
+                          gxm_gpu_present_bottom_origin,native_grid);
         if (rc<0) return rc;
+        static unsigned native_notes;
+        if (native_grid && native_notes++<4u)
+            glog("NATIVE_FONT_SCANOUT source=%ux%u rect=%u,%u,%u,%u output=960x544 content=960x540 offset=0,2 filter=point\n",
+                 s->render_width,s->render_height,x0,y0,w,h);
     } else {
     for (y = 0; y < VP_GXM_HEIGHT; y++) {
         unsigned sy = (y0 + (y * h) / VP_GXM_HEIGHT) * s->render_height / s->height;
@@ -11227,12 +13149,17 @@ static unsigned gxm_worker_process(void) {
         gxm_api_perf.stream_entries++;
         execute(gxm_execute_user);
     } else if (gxm_pending_clear != NULL) {
-        int flush_rc = 0;
         work_kind = 1;
         VPGxmClearRequest *clear = gxm_pending_clear;
-        if (gxm_batch.scene_open)
-            flush_rc = gxm_batch_flush_worker(GXM_BATCH_REASON_CLEAR);
-        clear->rc = flush_rc < 0 ? flush_rc : frame_clear_internal(clear);
+        /* All clear requests (external worker dispatch and the worker-local
+         * route) share one admission decision. A refused request keeps the
+         * original synchronous clear boundary inside frame_clear_internal. */
+        {
+            uint64_t fc = vp_gxm_frame_cost_category_begin(
+                VP_FRAME_COST_GXM_CLEAR);
+            clear->rc = frame_clear_internal_impl(clear, 1);
+            vp_gxm_frame_cost_category_end(VP_FRAME_COST_GXM_CLEAR, fc);
+        }
         gxm_pending_clear = NULL;
     } else if (gxm_pending_finish) {
         int flush_rc = 0;
@@ -11274,6 +13201,7 @@ static unsigned gxm_worker_process(void) {
             uint64_t draw_finished, draw_elapsed;
             unsigned perf_kind;
             req->rc = frame_draw_internal(req);
+            uint64_t tail_fc = vp_gxm_frame_cost_category_begin(VP_FRAME_COST_WORKER_TAIL);
             draw_finished = gxm_prof_now();
             draw_elapsed = draw_finished - draw_started;
             if (req->batch_encoded) {
@@ -11321,6 +13249,7 @@ static unsigned gxm_worker_process(void) {
                     static_log_stats();
             }
             }
+            vp_gxm_frame_cost_category_end(VP_FRAME_COST_WORKER_TAIL, tail_fc);
             gxm_pending = NULL;
         } else {
             int flush_rc = 0;

@@ -1,0 +1,124 @@
+{
+  "schema": 1,
+  "module": "main",
+  "source_sha256": "b3935415499549adaf4c0e89822831daa175cfd456a7990791c79be3997645ef",
+  "build_id": "fb08f1d20fd1204fe7070672777f869b00000000000000000000000000000000",
+  "marker": "ux0:data/mhgu-vita-port/engine-full.enable",
+  "ab_marker": "ux0:data/mhgu-vita-port/engine-full-ab.enable",
+  "ab_control_file": "ux0:data/mhgu-vita-port/engine-full-mode.txt",
+  "default_enabled": false,
+  "exclusive_with": [
+    "engine-layout.enable",
+    "engine-submit-probe.enable"
+  ],
+  "functions": [
+    {
+      "offset": "0xbbe9c8",
+      "bytes": 7004,
+      "sha256": "32a31fb8ec825cfab9c184d0864fab8411c12b41c93767fd26e9a8f5399b3b67"
+    },
+    {
+      "offset": "0xbc0e98",
+      "bytes": 1328,
+      "sha256": "57a40e584db356275bd74acc66213efda539a6f1891225dfcd0046083a158478"
+    },
+    {
+      "offset": "0xbc13e0",
+      "bytes": 856,
+      "sha256": "05ff02d5f4b4628c3d72728eb4a2047a15aaf002e5d1672a7098f33140ed6df9"
+    },
+    {
+      "offset": "0xbc1764",
+      "bytes": 3192,
+      "sha256": "e71e66bba88c89c18ad8d2e4651dd3188ccb3aedf53484af9b30d210c8b4657e"
+    }
+  ],
+  "patch": {
+    "offset": "0xbbe9c8",
+    "expected_original_bytes": "f04f2de9",
+    "state": "ARM",
+    "replacement": "B to an appended main-module veneer: eight bytes in the single-path mode, twenty bytes when engine-full-ab.enable selects the A/B profile",
+    "veneer": "e51ff004; absolute A32 vp_engine_full_entry address",
+    "ab": {
+      "profile_global": "vp_engine_full_profile_enabled",
+      "trampoline": {
+        "location": "main island immediately after the eight-byte root veneer (island offset 8)",
+        "resume_offset": "0xbbe9cc",
+        "bytes": "e92d4ff0; e51ff004; main_base + 0xbbe9cc",
+        "size": 12,
+        "purpose": "Replay only the displaced first PUSH and jump to the untouched original body. The original function stays in place, so its internal PC-relative instructions keep their linked addresses."
+      },
+      "bridges": {
+        "enter": "0x253",
+        "leave": "0x254"
+      },
+      "control": "engine-full-mode.txt contains exactly one digit 0 through 9 plus optional trailing whitespace; polled at most every 500000 us before the root entry timestamp. Missing/invalid fails explicitly in A/B mode. Modes 0, 3, 4, 5, 6, 7 and 8 execute the same original trampoline; only 3 publishes shared preparation; 4/5/6/7/8 publish deep texture; only 5 and 6 permit resizing idle page regions before a GPU drain; only 6 admits the deferred full-colour clear boundary. Mode 7 publishes deep-large (128 MiB shared budget); mode 8 publishes deep-split (64 MiB total, CPU-only cached raw class and uncached GXM-mapped decoded class). Modes 7 and 8 never enable idle-resize or clear-defer. Default idle-resize and clear-defer remain off. Mode 9 keeps the mode-4 memory/render path and suppresses only audited normal work records before formatting; errors, refusals and measurement records remain active.",
+      "control_poll_us": 500000,
+      "modes": {
+        "0": "original",
+        "1": "native",
+        "2": "fast",
+        "3": "shared",
+        "4": "deep",
+        "5": "deep-recycle",
+        "6": "deep-clear",
+        "7": "deep-large",
+        "8": "deep-split",
+        "9": "deep-quiet"
+      },
+      "wrapper": "push {r4,lr}; bl enter (r0=context preserved, target written to ip); blx ip; bl leave; pop {r4,lr}; bx lr. Only the native C targets (modes 1 and 2) have a declared r0; modes 0, 3, 4, 5, 6, 7 and 8 execute the original root, whose callers do not consume r0."
+    },
+    "island": "The A/B island request is 20 bytes (8-byte veneer + 12-byte trampoline). Alignment, capacity, root-to-veneer branch reach and the pre-patch words are checked and logged before the site write.",
+    "abi": "Original root receives r0=context and has no consumed return value at its two direct callers (main+0xbbd8d8 and main+0xbbe714). The single-path shim preserves r4-r11, SP, d8-d15. The A/B wrapper saves r4 and the caller LR with an 8-byte-aligned stack; both host bridges preserve the complete GPR/APSR/FPSCR/VFP frame. The shim calls native C under guest TLS, returns to original LR on success and stops through host bridge service 0x252 on failure. No displaced instruction replay in single-path mode: the entire root body is replaced; A/B mode replays only the first PUSH and returns to the original body."
+  },
+  "globals": {
+    "gpu_root_got": "0x183944c",
+    "default_viewport_got": "0x183f2b0",
+    "srgb_config_got": "0x1838db0"
+  },
+  "original_calls_retained": [
+    {
+      "offset": "0xb03d98",
+      "abi": "resource(record+8,cmd), void"
+    },
+    {
+      "offset": "0xb03d2c",
+      "abi": "resource(record+8,cmd), void"
+    },
+    {
+      "offset": "0x13efd7c",
+      "import": "__aeabi_memclr4",
+      "got": "0x1838018"
+    },
+    {
+      "offset": "0x13efdc4",
+      "import": "__aeabi_memclr8",
+      "got": "0x1838030"
+    },
+    {
+      "offset": "0x13f0ea4",
+      "import": "pow",
+      "got": "0x18385d0"
+    }
+  ],
+  "nvn_abi": {
+    "slots": "config/graphics/nvn-slots-1.4.0.tsv",
+    "call_bytes": 80,
+    "core_offset": 8,
+    "stack_offset": 24,
+    "float_offset": 60,
+    "stack_words": 8,
+    "float_words": 4,
+    "queries": "Real r0/r1 64-bit query results; never fabricate handles or GPU addresses."
+  },
+  "scope": "Experimental replacement of the common queue consumer and three preparation bodies. Original game queue producers, assets, resource creation, NVN encoders, command parsing and GXM backend remain. This contract is not evidence of runtime correctness or speedup.",
+  "fast_marker": "ux0:data/mhgu-vita-port/engine-full-fast.enable",
+  "ab_diagnostic_build_exclusive": [
+    "VITA_PORT_ENGINE_CAPTURE"
+  ],
+  "fast_queries": {
+    "buffer": "Fresh buffer+0xC pool, pool vtable+0x1C must identify SDK+0x32708C. Then return live pool+0x28 u64 plus unsigned buffer+0x10. Other getters use the original SDK.",
+    "texture_handle": "Exact SDK+0x318888 bit expression including sign extension of low 32 bits.",
+    "lifetime": "No cached address or handle; descriptors and resource payloads remain original."
+  }
+}
