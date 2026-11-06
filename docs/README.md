@@ -35,6 +35,7 @@
 18. [原游戏内存、纹理生命周期与日志三项验证](18-resource-lifecycle-and-capacity.md)
 19. [点阵字体、Alpha8 与原生读取接入](19-pixel-fonts.md)
 20. [按实际字号选原生字模并对应屏幕像素](20-native-pixel-fonts.md)
+21. [性能分支成果与最终组合复测](21-performance-consolidation.md)
 
 ## 参考
 
@@ -84,3 +85,4 @@
 - [0032 原游戏 rTexture 生命周期取证](decisions/0032-original-texture-lifecycle-probe.md)
 - [0033 点阵字体与单通道上传](decisions/0033-pixel-fonts-and-alpha8.md)
 - [0034 原生字模与最终屏幕像素网格](decisions/0034-native-font-screen-grid.md)
+- [0035 正常启动优化组合与统一配置](decisions/0035-performance-profiles.md)

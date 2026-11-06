@@ -10,8 +10,11 @@ Marker 是 `ux0:data/mhgu-vita-port/` 下的空文件或短文本文件。运行
 | `engine-full.enable` | 实验：替换公共队列、program／材质资源及状态准备；与 engine-layout／engine-submit-probe 互斥；默认关闭，restart 修正后村庄采样画面恢复，见 ADR 0019–0020 |
 | `engine-full-fast.enable` | 实验：启用已核对的纯查询直接计算、减少准备开销；存在时启用完整接管，默认关闭，见 ADR 0022 |
 | `engine-full-ab.enable` | 实验：同进程交替运行完整接管的原入口与 C 路径。存在时即使没有 `engine-full.enable` 也启用完整接管；与 engine-layout／engine-submit-probe 互斥；`VITA_PORT_ENGINE_CAPTURE` 诊断构建显式拒绝；见 ADR 0021、0023 |
-| `engine-full-mode.txt` | A/B 控制文件（不是 marker）：内容必须是一个 `0`–`8`，允许尾部空白。`0`=原 root，`1`=基础 C，`2`=优化 C，`3`=shared（原 root + 下游共享准备），`4`=deep（原 root + 独立深纹理管线），`5`=deep-recycle（同 4，允许先回收空闲的异尺寸纹理页），`6`=deep-clear（同 5，另允许符合准入的全通道颜色 clear 延迟到消费点并延后同步；depth/stencil、部分通道、资源不匹配及诊断/capture 仍走原同步路径），`7`=deep-large（同 4，仅把 raw+decoded 合计逻辑与底层物理 budget 扩到 128 MiB，128 槽不变），`8`=deep-split（同 4，合计 64 MiB；raw 改用 cached `USER_RW`、不 GXM map，decoded 仍 uncached + GXM READ map，raw/decoded 不共用 chunk）。仅 `engine-full-ab.enable` 存在时读取；补丁阶段先校验，运行时每 500 ms 轮询，缺失或非法时显式失败，不回退。`0`／`3`／`4`／`5`／`6`／`7`／`8` 使用同一原游戏 trampoline；只有 `3` 发布 shared 开关，`4`–`8` 发布纹理管线开关，`5`／`6` 允许空闲页回收，只有 `6` 发布 clear 延迟开关；`7`／`8` 不启用 idle resize 或 clear defer。见 ADR 0025、0026、0029 |
+| `engine-full-mode.txt` | A/B 控制文件，允许 `0`–`12` 和尾部空白；拒绝前导空白、前导零、多余字符和超过 16 字节。`0` 原 root，`1/2` C 接管，`3` shared，`4` deep 64，`5` deep+idle，`6` deep+idle+clear-defer，`7` deep 128，`8` split raw，`9` deep+quiet，`10` deep 64+idle+quiet，`11` deep 128+idle+quiet，`12` deep 128+quiet。只有 `1/2` 替换 root；其余保留原 root。仅 AB marker 存在时读取，非法显式失败。完整位图见 ADR 0035 |
 | `texture-pipeline.disable` | 退出当前分支默认启用的深纹理管线。存在 A/B 控制时由 `engine-full-mode.txt` 决定，本 marker 不覆盖。切换在 GPU submission 边界 drain 后应用，不改变 draw 内控制流 |
+| `texture-pool-128.enable` | 无 AB 时启动一次读取，把 deep 统一 raw+decoded 预算设为 128 MiB；不保证实际已分配齐。与 texture-pipeline.disable 冲突则拒绝启动。见 ADR 0035 |
+| `texture-idle-recycle.enable` | 无 AB 时启动一次读取，允许先回收空闲的异尺寸纹理页；活资源、pin 与真实 GPU 完成条件不变。要求 deep。见 ADR 0035 |
+| `work-log-reduce.enable` | 无 AB 时启动一次读取，在格式化前省去已审计的正常工作记录；错误、拒绝和证据记录保留。不依赖 deep。见 ADR 0030/0035 |
 | `play.enable` | 进入可玩路径；runner 默认写入 |
 | `display-bridge.enable` | 启用显示桥 |
 | `display-bridge.disable` | 显式关闭显示桥 |
@@ -72,8 +75,9 @@ Marker 是 `ux0:data/mhgu-vita-port/` 下的空文件或短文本文件。运行
 
 mode 8 的 cached raw 最终实现来自现有 C 堆，并逐块核对 USER_RW 类型；不新建 cached
 内核块、不扩大 C 堆、不做 uncached 回退。启动即启用已观察到加载失败，当前只完成
-进村后切换的稳态对照，未证明提速。mode 7 实际分配也未达到 128 MiB；见
-[纹理内存验证](../17-texture-memory-validation.md)。两项均默认关闭。
+进村后切换的稳态对照，未证明提速。mode 7 早期因原游戏大堆挤占未取得完整 128 MiB；缩小原子堆后已取得完整 backing，
+见[原游戏内存验证](../18-resource-lifecycle-and-capacity.md)。是否在新字体下保留大池，
+以[组合复测](../21-performance-consolidation.md)为准；split raw 仍关闭。
 
 ## 4. 输入
 

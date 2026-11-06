@@ -25,10 +25,15 @@ ELAPSED = {
     "deep-clear": [87, 97, 107, 117, 127, 137, 147, 157, 167, 177],
     "deep-large": [91, 101, 111, 121, 131, 141, 151, 161, 171, 181],
     "deep-split": [93, 103, 113, 123, 133, 143, 153, 163, 173, 183],
+    "deep-compact": [86, 96, 106, 116, 126, 136, 146, 156, 166, 176],
+    "deep-expanded": [84, 94, 104, 114, 124, 134, 144, 154, 164, 174],
+    "deep-large-quiet": [82, 92, 102, 112, 122, 132, 142, 152, 162, 172],
 }
 ENCODED = {"original": 100, "native": 200, "fast": 150, "shared": 120,
            "deep": 110, "deep-recycle": 110, "deep-clear": 110,
-           "deep-large": 110, "deep-split": 110}
+           "deep-large": 110, "deep-split": 110,
+           "deep-compact": 110, "deep-expanded": 110,
+           "deep-large-quiet": 110}
 
 
 def prepare_line(mode, entry_us, elapsed_us, encoded, growth, presents):
@@ -255,6 +260,21 @@ class PrepareAbTests(unittest.TestCase):
         self.assertIn("deep-split", report["aggregate"])
         self.assertEqual(report["delta"]["comparison_mode"], "deep-split")
         self.assertEqual(report["phases"][1]["samples"], 10)
+
+    def test_normal_startup_combination_mode_names_are_accepted(self):
+        phases = [dict(p, mode="deep-compact" if i % 2 == 0 else "deep-expanded")
+                  for i, p in enumerate(PHASES)]
+        sdk, gxm = build_case(phases)
+        report = analyze_logs(sdk, gxm, phases, warmup_seconds=1.0)
+        self.assertIn("deep-compact", report["aggregate"])
+        self.assertIn("deep-expanded", report["aggregate"])
+        self.assertEqual(report["delta"]["comparison_mode"], "deep-expanded")
+        phases = [dict(p, mode="deep-expanded" if i % 2 == 0 else "deep-large-quiet")
+                  for i, p in enumerate(PHASES)]
+        sdk, gxm = build_case(phases)
+        report = analyze_logs(sdk, gxm, phases, warmup_seconds=1.0)
+        self.assertIn("deep-large-quiet", report["aggregate"])
+        self.assertEqual(report["delta"]["comparison_mode"], "deep-large-quiet")
 
     def test_unknown_mode_and_bad_elapsed_rejected(self):
         sdk, gxm = build_case(PHASES)

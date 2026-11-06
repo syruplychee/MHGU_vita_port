@@ -12,19 +12,23 @@ PlayStation Vita 上的移植工程。
 > 本项目不附带、也不得提交任何游戏文件、密钥、固件、存档或游戏派生二进制。
 > 使用者必须自行合法拥有对应游戏与更新。
 
-## 当前状态（2026-11-01 快照）
+## 当前状态（2026-11-06 快照）
 
 | 能力 | 状态 |
 |---|---|
 | 原生加载器 / 四模块重定位 / TLS / SVC / SDK DSO | 在 Vita3K OpenGL 下可用 |
 | 真实存档加载、写入、跨进程读回 | 已验证（受保护测试流程） |
 | 中文界面与对话 | 已验证 |
-| 村庄场景渲染 | 可进入；540p 下约 5–7 FPS（Vita3K，单次运行范围） |
+| 村庄场景渲染 | 固定村长对话有效对照 7.18→12.34 FPS，帧时间下降 41.8%（Vita3K L3）；全玩法/真机未验证 |
 | 任务/住宅场景 | 有修复，仍待完整人工复测 |
 | 视频播放（原 guest 管线） | 可解码；约 8 内容事件/秒（Vita3K，单次运行） |
 | 视频播放（原生播片，`native-movie.enable`） | 完整片头 29.974 fps（5278 帧/176.085 秒，L3）；视频-only、无音频；真机未验证 |
 | 音频 | 服务与混音可用；诊断运行使用 SDL 音频 |
 | PS Vita 真机 | **未验证**；映射、缓存、内存、性能均待真机 |
+
+当前推荐组合为 deep 64 MiB、正常日志减负、Alpha8 原生点阵字体；128 MiB 和 idle
+回收在新工作集下没有稳定收益，关闭。完整配置、无效基线排除、逐窗口数据与备份见
+[性能整理](docs/21-performance-consolidation.md)。
 
 完整范围与证据边界见 [当前状态](docs/09-status.md)。历史研究记录保留在旧工作区，
 不作为本仓库的验收依据。
@@ -55,6 +59,11 @@ $env:MHGU_PYTHON = "C:\Python312\python.exe"
 # 5. 启动（自动备份存档）
 .\scripts\play.ps1
 ```
+
+已有配套 `font-native/` 包时，可以先运行
+`scripts/set-performance-profile.ps1 -Profile recommended` 应用受测组合；缺少字体包时
+脚本会明确拒绝，准备方法见[原生字模](docs/20-native-pixel-fonts.md)。普通 `play.ps1`
+默认开启 batch，有类型的自定义参数用 `-RunnerOptions @{ ... }` 传入。
 
 Linux/macOS 使用 `scripts/build.sh`，环境变量同名。宿主测试使用
 `scripts/host-tests.ps1`。

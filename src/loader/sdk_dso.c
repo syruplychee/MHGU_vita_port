@@ -567,34 +567,47 @@ static int engine_layout_patch(FILE *log,VPNativeModule modules[4]) {
     return rc;
 }
 
-/* The A/B control file is host state, never guest memory. Exactly one '0',
- * '1', '2', '3', '4', '5', '6', '7' or '8' is required; trailing whitespace
- * is accepted and any other byte is invalid. Missing and malformed files are
- * distinct so the caller can report the actual failure instead of falling
- * back to a path. */
+/* The A/B control file is host state, never guest memory. Modes 0..9 are one
+ * digit and modes 10..12 are two digits without a leading zero; trailing
+ * whitespace is accepted. The loader reads a bounded prefix and hands the
+ * complete token to the same pure parser the host test exercises. Missing and
+ * malformed files are distinct so the caller can report the actual failure
+ * instead of falling back to a path. */
 static int engine_ab_read_control(uint32_t *mode) {
+    char text[VP_ENGINE_AB_CONTROL_MAX_BYTES+1u];
     FILE *f=fopen(VP_ENGINE_AB_CONTROL_PATH,"rb");
     if (!f) return 1;
-    int first=fgetc(f),rc=0;
-    if (!vp_engine_ab_control_digit_valid(first)) rc=2;
-    if (!rc) {
-        int c;
-        while ((c=fgetc(f))!=EOF) {
-            if (c!=' ' && c!='\t' && c!='\n' && c!='\v' && c!='\f' && c!='\r') {
-                rc=2;break;
-            }
-        }
-    }
-    if (ferror(f)) rc=2;
+    size_t length=fread(text,1,sizeof(text),f);
+    int extra=fgetc(f),failed=ferror(f);
     fclose(f);
-    if (!rc) *mode=(uint32_t)(first-'0');
-    return rc;
+    unsigned parsed=0;
+    if (failed || extra!=EOF || vp_engine_ab_control_parse(text,length,&parsed))
+        return 2;
+    *mode=parsed;
+    return 0;
+}
+static int engine_marker_present(const char *path) {
+    FILE *marker=fopen(path,"rb");
+    if (marker) fclose(marker);
+    return marker!=NULL;
 }
 static int engine_texture_pipeline_marker(void) {
-    FILE *marker=fopen("ux0:data/mhgu-vita-port/texture-pipeline.disable","rb");
-    int enabled=marker==NULL;
-    if (marker) fclose(marker);
-    return enabled;
+    return !engine_marker_present("ux0:data/mhgu-vita-port/texture-pipeline.disable");
+}
+
+/* One startup record proving the complete texture/log configuration that was
+ * actually published. Values are read back atomically so the line cannot mix
+ * a pre-publish and post-publish state. */
+static void engine_log_texture_config(FILE *log,const char *source) {
+    fprintf(log,"ENGINE_TEXTURE_CONFIG source=%s deep=%u memory=%u idle=%u quiet=%u "
+        "shared=%u clear=%u\n",source,
+        __atomic_load_n(&vp_engine_texture_pipeline_enabled,__ATOMIC_ACQUIRE),
+        __atomic_load_n(&vp_engine_texture_memory_mode,__ATOMIC_ACQUIRE),
+        __atomic_load_n(&vp_engine_texture_idle_resize_enabled,__ATOMIC_ACQUIRE),
+        __atomic_load_n(&vp_engine_work_log_reduce_enabled,__ATOMIC_ACQUIRE),
+        __atomic_load_n(&vp_engine_shared_prepare_enabled,__ATOMIC_ACQUIRE),
+        __atomic_load_n(&vp_engine_clear_defer_enabled,__ATOMIC_ACQUIRE));
+    fflush(log);
 }
 
 /* Publish the complete texture memory configuration as one atomic value.
@@ -636,11 +649,33 @@ static int engine_full_patch(FILE *log,VPNativeModule *m) {
     __atomic_store_n(&vp_engine_work_log_reduce_enabled,0u,__ATOMIC_RELEASE);
     if (!ab) {
         int texture_pipeline=engine_texture_pipeline_marker();
-        /* Ordinary startup never reads the mode experiment file and keeps the
-         * original 64 MiB unified configuration. */
-        __atomic_store_n(&vp_engine_texture_memory_mode,0u,__ATOMIC_RELEASE);
+        int pool128=engine_marker_present(
+            "ux0:data/mhgu-vita-port/texture-pool-128.enable");
+        int idle=engine_marker_present(
+            "ux0:data/mhgu-vita-port/texture-idle-recycle.enable");
+        int quiet=engine_marker_present(
+            "ux0:data/mhgu-vita-port/work-log-reduce.enable");
+        /* Ordinary startup never reads the mode experiment file. The three
+         * independent markers are read exactly once here. The 128 MiB budget
+         * and idle page recycle only exist inside the deep pipeline; asking
+         * for either while texture-pipeline.disable is present is refused
+         * instead of being silently ignored or downgraded. */
+        if (!vp_engine_startup_texture_valid(texture_pipeline,pool128,idle)) {
+            fprintf(log,"ENGINE_TEXTURE_CONFIG_ERROR reason=deep-required "
+                "pipeline=0 pool128=%d idle=%d quiet=%d\n",
+                pool128,idle,quiet);
+            fflush(log);
+            return VP_PATCH_ARGUMENT;
+        }
+        __atomic_store_n(&vp_engine_texture_memory_mode,
+            pool128?1u:0u,__ATOMIC_RELEASE);
         __atomic_store_n(&vp_engine_texture_pipeline_enabled,
             texture_pipeline?1u:0u,__ATOMIC_RELEASE);
+        __atomic_store_n(&vp_engine_texture_idle_resize_enabled,
+            idle?1u:0u,__ATOMIC_RELEASE);
+        __atomic_store_n(&vp_engine_work_log_reduce_enabled,
+            quiet?1u:0u,__ATOMIC_RELEASE);
+        engine_log_texture_config(log,"startup-markers");
     }
     fprintf(log,"ENGINE_FULL_MODE enabled=%d ab=%d\n",enabled,ab);
     if (!enabled) {
@@ -692,12 +727,13 @@ static int engine_full_patch(FILE *log,VPNativeModule *m) {
         fprintf(log,"ENGINE_FULL_AB_MODE control=%s initial=%s\n",
             VP_ENGINE_AB_CONTROL_PATH,vp_engine_ab_mode_name(initial));
         __atomic_store_n(&vp_engine_shared_prepare_enabled,
-            initial==3u?1u:0u,__ATOMIC_RELEASE);
+            vp_engine_ab_mode_uses_shared_prepare(initial)?1u:0u,__ATOMIC_RELEASE);
         engine_publish_texture_mode(initial);
         __atomic_store_n(&vp_engine_texture_idle_resize_enabled,
             vp_engine_ab_mode_uses_idle_resize(initial)?1u:0u,__ATOMIC_RELEASE);
         __atomic_store_n(&vp_engine_clear_defer_enabled,
             vp_engine_ab_mode_uses_clear_defer(initial)?1u:0u,__ATOMIC_RELEASE);
+        engine_log_texture_config(log,"ab-mode");
     }
     if (m->island_offset>m->capacity || m->island_bytes>m->capacity-m->island_offset)
         return VP_PATCH_RANGE;
@@ -1417,7 +1453,7 @@ static int engine_prepare_ab_poll(Session *s,uint64_t now) {
     /* Publish before the root timestamp so this call's downstream draws and
      * the elapsed_us interval see the same mode decision. */
     __atomic_store_n(&vp_engine_shared_prepare_enabled,
-        mode==3u?1u:0u,__ATOMIC_RELEASE);
+        vp_engine_ab_mode_uses_shared_prepare(mode)?1u:0u,__ATOMIC_RELEASE);
     engine_publish_texture_mode(mode);
     __atomic_store_n(&vp_engine_texture_idle_resize_enabled,
         vp_engine_ab_mode_uses_idle_resize(mode)?1u:0u,__ATOMIC_RELEASE);
@@ -1474,13 +1510,16 @@ static int engine_prepare_ab_service(Session *s,VPExecutor *e,VPBridgeFrame *f) 
             return VP_BRIDGE_ARGUMENT;
         }
         uint32_t mode=s->engine_ab_mode;
-        /* Modes 0, 3, 4, 5, 6, 7 and 8 execute the original root trampoline.
-         * Mode 3 enables shared preparation; 4/5/6/7/8 enable the deep texture
-         * pipeline; 5 and 6 enable idle page resizing before a GPU drain, and
-         * only 6 defers the full-colour clear boundary. Modes 7 and 8 change
-         * only the texture memory budget/class published atomically above. */
-        uint32_t target=mode==2u?(uint32_t)(uintptr_t)vp_engine_full_run_fast:
-            mode==1u?(uint32_t)(uintptr_t)vp_engine_full_run:engine_full_ab_trampoline;
+        /* Only modes 1 and 2 use the native C bodies. Every other valid mode,
+         * including 3, 4..9 and the 10..12 combinations, executes the original
+         * root trampoline. Mode 3 enables shared preparation; 4..12 enable the
+         * deep texture pipeline; 5/6/10/11 enable idle page resizing before a
+         * GPU drain, and only 6 defers the full-colour clear boundary. Modes
+         * 7/11/12 publish the 128 MiB budget; only 8 publishes split raw. */
+        uint32_t target=vp_engine_ab_mode_uses_fast_c(mode)?
+            (uint32_t)(uintptr_t)vp_engine_full_run_fast:
+            vp_engine_ab_mode_uses_native_c(mode)?
+            (uint32_t)(uintptr_t)vp_engine_full_run:engine_full_ab_trampoline;
         if (!s->engine_ab_mode_valid || !vp_engine_ab_mode_valid(mode) || !target) {
             fprintf(s->log,"ENGINE_PREPARE_ENTER_ERROR slot=%u thread=0x%x reason=target mode=%u target=0x%08x\n",
                 slot,s->svc.current_thread_handle,mode,target);
@@ -1507,9 +1546,10 @@ static int engine_prepare_ab_service(Session *s,VPExecutor *e,VPBridgeFrame *f) 
         return VP_BRIDGE_ARGUMENT;
     }
     /* Only the native C bodies (modes 1 and 2) declare a result. The original
-     * root trampoline is used by modes 0, 3, 4, 5, 6, 7 and 8; its callers do
-     * not consume r0, so any value is valid there. */
-    if ((t->mode==1u || t->mode==2u) && f->regs[0]) {
+     * root trampoline is used by every other mode; its callers do not consume
+     * r0, so any value is valid there. */
+    if ((vp_engine_ab_mode_uses_native_c(t->mode) ||
+         vp_engine_ab_mode_uses_fast_c(t->mode)) && f->regs[0]) {
         fprintf(s->log,"ENGINE_FULL_FATAL rc=%d\n",(int32_t)f->regs[0]);
         vp_engine_full_report(s->log);
         fflush(s->log);

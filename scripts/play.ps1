@@ -1,6 +1,7 @@
 param(
     [string]$Pref = "",
     [switch]$RestoreAfter,
+    [hashtable]$RunnerOptions = @{},
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$RunnerArgs = @()
 )
@@ -24,8 +25,14 @@ if (Test-Path -LiteralPath $savedata -PathType Container) {
 
 $exit = 0
 try {
-    & (Join-Path $Root "tools/runtime/run_gui_play.ps1") @RunnerArgs
-    $exit = $LASTEXITCODE
+    # The normal play entry uses the measured batching path. A hashtable keeps
+    # PowerShell switch/array values typed when forwarding runner options.
+    if (-not $RunnerOptions.ContainsKey("BoundedBatch")) {
+        $RunnerOptions["BoundedBatch"] = $true
+    }
+    & (Join-Path $Root "tools/runtime/run_gui_play.ps1") @RunnerOptions @RunnerArgs
+    # The PowerShell runner throws on failure; LASTEXITCODE may belong to an
+    # earlier native command rather than this successful script invocation.
 } finally {
     if ($RestoreAfter -and $backupPath) {
         Write-Host "Restoring savedata from: $backupPath"

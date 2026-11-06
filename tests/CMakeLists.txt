@@ -199,6 +199,9 @@ if(WIN32)
     find_program(VP_TEST_POWERSHELL NAMES pwsh powershell REQUIRED)
     add_test(NAME runtime_main_window COMMAND "${VP_TEST_POWERSHELL}"
         -NoProfile -File "${CMAKE_CURRENT_SOURCE_DIR}/runtime_main_window.ps1")
+    add_test(NAME performance_profile COMMAND "${VP_TEST_POWERSHELL}"
+        -NoProfile -File "${CMAKE_CURRENT_SOURCE_DIR}/performance_profile.ps1")
+    set_tests_properties(performance_profile PROPERTIES TIMEOUT 180)
 endif()
 
 # These two use POSIX-only memory and pthread facilities; CI runs them on Linux.
